@@ -63,6 +63,9 @@ const specMag = [
 ];
 const stamp = (l: string) => l.replace(/^H\|.*\|\d{8,14}$/, (m) => m.replace(/\|\d{8,14}$/, '|<ts>'));
 eq('records', mag.map(stamp), specMag.map(stamp));
+// The Snibe spec and all three captured logs stamp H field 14 with an 8-digit
+// DATE — the atellica dialect keeps the full YYYYMMDDHHMMSS.
+eq('H stamp is an 8-digit date', mag[0]!.split('|').pop()!.length, 8);
 for (const l of mag) console.log('      ' + l);
 
 console.log('\n[6] ORDER DOWNLOAD — atellica dialect must be byte-identical to before');
@@ -76,6 +79,7 @@ eq('records', atl.map(stamp), [
   'O|1|LAB-2026-0000016||^^^GluH_3^^^1\\^^^NA^^^1|R|||||||O|||Serum',
   'L|1|N',
 ].map(stamp));
+eq('H stamp keeps full datetime', atl[0]!.split('|').pop()!.length, 14);
 
 console.log('\n[7] Maglumi order with demographics (sendDemographics=true)');
 const magP = buildOrderMessage(

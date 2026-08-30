@@ -196,6 +196,13 @@ export interface OrderFormat {
   fullOrderRecord: boolean;
   /** Trailing empty fields on a P record when demographics are suppressed. */
   emptyPatientFields: number;
+  /**
+   * H field 14 granularity. The Atellica exchanges a full YYYYMMDDHHMMSS. Every
+   * Maglumi header in the Snibe spec and in all three captured wire logs carries
+   * an 8-digit DATE ("20100319") — the only field where our download still
+   * differed from the vendor's own examples, so we match them.
+   */
+  timestamp: 'date' | 'datetime';
 }
 
 export const ORDER_FORMATS = {
@@ -207,6 +214,7 @@ export const ORDER_FORMATS = {
     orderPerTest: false,
     fullOrderRecord: true,
     emptyPatientFields: 7,
+    timestamp: 'datetime',
   },
   /** Snibe Maglumi — "Chapter 16: Host Result Management", §16.4.2. */
   maglumi: {
@@ -216,6 +224,7 @@ export const ORDER_FORMATS = {
     orderPerTest: true,
     fullOrderRecord: false,
     emptyPatientFields: 0,
+    timestamp: 'date',
   },
 } as const satisfies Record<string, OrderFormat>;
 
@@ -238,7 +247,7 @@ export function buildOrderMessage(
 
   // H|\^&||<password>|<sender>|||||<receiver>||P|<version>|<ts>
   lines.push(
-    ['H', `${d.repeat}${d.component}${d.escape}`, '', fmt.password, opts.senderId, '', '', '', '', opts.receiverId, '', 'P', fmt.version, astmTimestamp()].join(F),
+    ['H', `${d.repeat}${d.component}${d.escape}`, '', fmt.password, opts.senderId, '', '', '', '', opts.receiverId, '', 'P', fmt.version, headerStamp(fmt)].join(F),
   );
 
   /** "^^^CODE" or "^^^CODE^^^1", per dialect. */
@@ -275,6 +284,12 @@ export function buildOrderMessage(
   // L|1|N
   lines.push(['L', '1', 'N'].join(F));
   return lines;
+}
+
+/** H field 14, at the granularity this dialect's own headers use. */
+function headerStamp(fmt: OrderFormat, dt = new Date()): string {
+  const ts = astmTimestamp(dt);
+  return fmt.timestamp === 'date' ? ts.slice(0, 8) : ts;
 }
 
 /** ASTM timestamp YYYYMMDDHHMMSS in local time. */

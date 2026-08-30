@@ -37,7 +37,7 @@ lost.
 | Mapping | `src/mapping/mapper.ts` | QC detection, group-by-sample, idempotency key |
 | HMIS client | `src/hmis/client.ts` | signed REST calls to the HMIS |
 | Store-and-forward | `src/queue/spool.ts` | durable, retrying delivery queue |
-| Admin | `src/admin/` | sign-in + local dashboard (connection, wire log, queue) |
+| Admin | `src/admin/` | local dashboard (connection, wire log, queue) |
 
 Swapping ASTM ↔ HL7 is a new codec in `src/codec/` + a case in
 `src/codec/index.ts` — nothing else changes.
@@ -57,6 +57,7 @@ or rejects an order it cannot parse. Pick one per analyzer with
 | O fields 12 + 16 | report type `O` + specimen descriptor | **omitted** |
 | P record (no demographics) | `P\|1\|\|\|\|\|\|\|` | `P\|1` |
 | H version / password | `LIS2-A2` / *(empty)* | `E1394-97` / `PSWD` |
+| H timestamp | `YYYYMMDDHHMMSS` | **`YYYYMMDD`** (date only) |
 
 ```
 atellica   O|1|1234567||^^^CA125^^^1\^^^CA153^^^1|R|||||||O|||Serum
@@ -120,46 +121,13 @@ Open the local dashboard at **http://127.0.0.1:7070** (`admin.host` / `admin.por
 to watch connection state, the live wire log, and the upload queue (with manual
 retry for parked items).
 
-## Dashboard sign-in
+## Dashboard access
 
-The console is behind a session login — the lab PC is often unattended and the
-wire log carries patient barcodes and results.
-
-| | |
-|---|---|
-| Commissioning username | `Adminx` |
-| Commissioning password | `Admin@380054` |
-| Credential file | `admin.authFile` (default `./admin-auth.json`, gitignored) |
-
-The credential file is **seeded on first start** with the pair above plus a
-random **recovery key**, which is written to the log exactly once:
-
-```
-WARN: admin credential seeded — record the recovery key now, it is not shown again
-      recoveryKey: "3EFJ-…"
-```
-
-File that key with the lab runbook. Override the seeded pair with
-`ADMIN_USERNAME` / `ADMIN_PASSWORD` (read only when the file is created) and the
-file location with `ADMIN_AUTH_FILE`.
-
-Only a salted **scrypt hash** of the password and of the recovery key is stored —
-nothing is written in the clear.
-
-### Resetting the password
-
-- **Signed in** — *Change password* in the header: current password → new password.
-- **Locked out** — *Forgot password?* on the sign-in page: username + **current
-  password or recovery key** → new password.
-- **Both lost** — delete `admin-auth.json` and restart; the commissioning pair is
-  re-seeded with a fresh recovery key.
-
-New passwords need ≥10 characters using three of: lowercase, uppercase, digits,
-symbols. Every password change invalidates all existing sessions. Sign-ins are
-throttled — 5 failures from one address parks it for 60 seconds — and sessions
-last 8 hours and are held in memory, so a restart signs everyone out.
-
-**Change the password before go-live.** The dashboard shows a banner until you do.
+There is no sign-in. The console is reachable by anyone who can open
+`admin.host:admin.port`, so the default **127.0.0.1** bind is the only thing
+keeping the wire log — which carries patient barcodes and results — off the
+network. If you move `admin.host` off loopback, put an authenticating reverse
+proxy in front of it.
 
 ### Run as a Windows service
 

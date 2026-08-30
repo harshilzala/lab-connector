@@ -21,7 +21,11 @@ import type {
 // =============================================================================
 
 const SAMPLE_KEYS = ['sampleID', 'sampleId', 'sampleid', 'sample_id', 'barcode', 'accessionNo', 'accessionNumber'];
-const TEST_KEYS = ['identifier', 'testCode', 'test_code', 'code', 'parameterCode', 'instrumentCode', 'shortName'];
+// `eqIdntifier` (sic — the gateway misspells it) is the live column carrying the
+// analyzer's own assay code: RBC, WBC, HGB, ESR... `serviceCode` is deliberately
+// NOT a fallback here — it is the HMIS service/billing code (HEM0000114) and the
+// analyzer would reject it as an unknown test.
+const TEST_KEYS = ['identifier', 'eqIdntifier', 'testCode', 'test_code', 'code', 'parameterCode', 'instrumentCode', 'shortName'];
 const EQ_CODE_KEYS = ['eqCode', 'equipmentCode', 'equipment_code', 'machineCode', 'equipmentName'];
 const SPECIMEN_KEYS = ['specimenType', 'sampleType', 'specimen', 'specimenName', 'sampleTypeName', 'containerType'];
 const PRIORITY_KEYS = ['priority', 'isStat', 'stat', 'urgent', 'isUrgent', 'isEmergency'];
@@ -128,10 +132,26 @@ export function normalizePending(body: unknown, opts: NormalizeOptions): Pending
 
 // ---- helpers ---------------------------------------------------------------
 
-/** First key present with a non-null, non-empty value. */
+/** First key present with a non-null, non-empty value.
+ *
+ *  Column CASING is not stable across deployments — the live gateway sends
+ *  `SampleID`, `FName`, `LName`, `MName` and `Gender` where the alias lists
+ *  spell them `sampleId`, `fname`, `lname`, `mname` and `gender`. So try an
+ *  exact pass first (alias order is the priority order, and an exact hit must
+ *  win over a case-folded one), then fall back to a case-insensitive pass.
+ *  Spelling still has to match — only the casing is forgiven. */
 function pick(row: Record<string, unknown>, keys: string[]): unknown {
   for (const key of keys) {
     const v = row[key];
+    if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+  }
+  const folded = new Map<string, unknown>();
+  for (const [k, v] of Object.entries(row)) {
+    const lk = k.toLowerCase();
+    if (!folded.has(lk)) folded.set(lk, v); // first spelling wins, as above
+  }
+  for (const key of keys) {
+    const v = folded.get(key.toLowerCase());
     if (v !== undefined && v !== null && String(v).trim() !== '') return v;
   }
   return null;
@@ -173,9 +193,7 @@ function extractPatient(row: Record<string, unknown>): PatientDemographics | nul
     }
   }
 
-  const sexRaw = pick(row, SEX_KEYS);
-  const sexChar = sexRaw === null ? null : String(sexRaw).trim().charAt(0).toUpperCase();
-  const sex = sexChar === 'M' || sexChar === 'F' ? (sexChar as 'M' | 'F') : sexChar ? 'O' : null;
+  const sex = normalizeSex(pick(row, SEX_KEYS));
 
   const birthDate = toAstmDate(pick(row, DOB_KEYS));
 
@@ -188,6 +206,17 @@ function extractPatient(row: Record<string, unknown>): PatientDemographics | nul
     sex,
     birthDate,
   };
+}
+
+/** 'M'/'F'/'Male'/'Female', or the numeric 1/2 the HMIS gateway actually sends. */
+function normalizeSex(v: unknown): 'M' | 'F' | 'O' | null {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  if (s === '1') return 'M';
+  if (s === '2') return 'F';
+  const c = s.charAt(0).toUpperCase();
+  return c === 'M' || c === 'F' ? c : 'O';
 }
 
 /** dd-MM-yyyy (the API's own date format), dd/MM/yyyy or ISO → ASTM YYYYMMDD. */

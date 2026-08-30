@@ -15,7 +15,6 @@ data/
 
 # Local dashboard credential (scrypt hash + recovery key hash). Seeded on
 # first start — never commit.
-admin-auth.json
 
 
 # Local code-graph index (tokensave). Machine-local SQLite state — never commit.
