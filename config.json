@@ -1,0 +1,83 @@
+{
+  
+  "logLevel": "info",
+  "spoolDir": "./spool",
+
+  "hmis": {
+    "baseUrl": "http://127.0.0.1:8088",
+    "pendingPath": "/mirth/pending",
+    "acknowledgePath": "/mirth/acknowledge",
+    "resultsPath": "/mirth/results",
+    "timeoutMs": 15000,
+    "tlsRejectUnauthorized": true
+  },
+
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 7071,
+    "authFile": "./admin-auth.json"
+  },
+
+  "analyzers": [
+    {
+      "id": "eq1",
+      "equipmentCode": "eq1",
+      "equipmentId": 1001,
+
+      "protocol": "astm",
+
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "0.0.0.0",
+        "port": 3010
+      },
+
+      "sendDemographics": true,
+      "hostQuery": true,
+
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL"],
+        "sampleIdRegex": null
+      },
+
+      "astm": {
+        "ackTimeoutMs": 15000,
+        "frameMaxData": 240,
+        "senderId": "HMIS-LIS",
+        "receiverId": "EQID",
+        "dialect": "atellica"
+      }
+    },
+    {
+      "id": "eq02",
+      "equipmentCode": "eq2",
+      "equipmentId": 1002,
+
+      "protocol": "astm",
+
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "0.0.0.0",
+        "port": 3011
+      },
+
+      "sendDemographics": true,
+      "hostQuery": true,
+
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL"],
+        "sampleIdRegex": null
+      },
+
+      "astm": {
+        "ackTimeoutMs": 15000,
+        "frameMaxData": 240,
+        "senderId": "HMIS-LIS",
+        "receiverId": "eq",
+        "dialect": "atellica"
+      }
+    }
+  ]
+}

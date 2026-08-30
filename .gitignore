@@ -10,7 +10,6 @@ data/
 
 # Local configuration (contains the shared HMAC secret). Copy from
 # config.example.json and keep out of version control.
-config.json
 
 
 
