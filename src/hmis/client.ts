@@ -1,5 +1,5 @@
 import type { Logger } from '../logger.js';
-import type { MirthAcknowledgeItem, HmisResultUpload, HmisResultUploadResponse } from '../types.js';
+import type { MirthAcknowledgeItem, LisInboundResultRow, HmisResultUploadResponse } from '../types.js';
 
 // =============================================================================
 // HMIS REST client — the three `/mirth/*` endpoints.
@@ -77,20 +77,36 @@ export class HmisClient {
     await this.request('POST', this.opts.acknowledgePath, JSON.stringify(items));
   }
 
-  /** Upload analyzer results. Idempotent on messageId server-side. */
-  async postResults(body: HmisResultUpload): Promise<HmisResultUploadResponse> {
-    const res = await this.request('POST', this.opts.resultsPath, JSON.stringify(body));
+  /**
+   * Upload analyzer results as the BARE ARRAY the gateway expects.
+   *
+   * The gateway answers HTTP 200 for everything — a Gson bind failure, an
+   * unmatched row and a real save all come back 200 — so the HTTP status alone
+   * says nothing. Throw unless `status` is "success", and treat an empty
+   * `successData` for a non-empty request as a failure too: that is what a
+   * silently-ignored (mis-keyed or unmatched) row looks like, and swallowing it
+   * would drop a patient result on the floor while reporting it as filed.
+   */
+  async postResults(rows: LisInboundResultRow[]): Promise<HmisResultUploadResponse> {
+    if (rows.length === 0) return { status: 'success', message: 'nothing to send', successData: [], filed: 0 };
+
+    const res = await this.request('POST', this.opts.resultsPath, JSON.stringify(rows));
     const parsed = (await this.readJson(res, this.opts.resultsPath)) as Partial<HmisResultUploadResponse> | null;
 
-    // A Mirth channel commonly answers 200 with an empty body or a bare "OK".
-    // Treat any 2xx as filed — the request already threw on a non-2xx — and
-    // only believe richer fields when the server actually sends them.
-    return {
-      ok: parsed?.ok ?? true,
-      filed: parsed?.filed ?? body.results.length,
-      unmatched: parsed?.unmatched ?? [],
-      ...(parsed?.sampleStatus !== undefined ? { sampleStatus: parsed.sampleStatus } : {}),
-    };
+    const status = String(parsed?.status ?? '').toLowerCase();
+    const message = String(parsed?.message ?? '');
+    const successData = Array.isArray(parsed?.successData) ? parsed.successData : [];
+
+    if (status !== 'success') {
+      throw new Error(`HMIS ${this.opts.resultsPath} rejected the upload: ${message || 'status=' + status}`);
+    }
+    if (successData.length === 0) {
+      throw new Error(
+        `HMIS ${this.opts.resultsPath} accepted 0 of ${rows.length} row(s) — the server matched nothing. ${message}`,
+      );
+    }
+
+    return { status: 'success', message, successData, filed: successData.length };
   }
 
   // ---------------------------------------------------------------------------

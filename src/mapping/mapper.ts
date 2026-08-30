@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { AnalyzerConfig } from '../config.js';
-import type { HmisResultUpload, ParsedMessage } from '../types.js';
+import type { HmisResultUpload, LisInboundResultRow, MirthAcknowledgeItem, ParsedMessage } from '../types.js';
 
 // =============================================================================
 // Mapper — connector-side shaping only.
@@ -78,4 +78,54 @@ function deterministicMessageId(equipmentCode: string, sampleId: string, results
     .digest('hex')
     .slice(0, 24);
   return `${sampleId}-${h}`;
+}
+
+// -----------------------------------------------------------------------------
+// Result upload → wire rows.
+//
+// The results endpoint files against `labResultId`, which only the PENDING ROW
+// carries — the analyzer knows nothing about it. So an upload is joined back to
+// the order rows for its barcode on the analyzer's own assay code (the pending
+// row's `eqIdntifier`, carried here as `identifier`). A result whose code has no
+// pending row cannot be filed and is returned as `unmatched` rather than sent
+// with a null id, which the server would silently drop.
+// -----------------------------------------------------------------------------
+export function toLisResultRows(
+  upload: HmisResultUpload,
+  orderRows: MirthAcknowledgeItem[],
+): { rows: LisInboundResultRow[]; unmatched: string[] } {
+  // Analyzers are inconsistent about case and padding on assay codes; the
+  // pending row is authoritative for the spelling actually sent on the wire.
+  const byCode = new Map<string, MirthAcknowledgeItem>();
+  for (const row of orderRows) {
+    const key = (row.identifier || '').trim().toUpperCase();
+    if (key && !byCode.has(key)) byCode.set(key, row); // first row wins
+  }
+
+  const rows: LisInboundResultRow[] = [];
+  const unmatched: string[] = [];
+
+  for (const r of upload.results) {
+    const ctx = byCode.get((r.testCode || '').trim().toUpperCase());
+    if (!ctx) {
+      unmatched.push(r.testCode);
+      continue;
+    }
+    rows.push({
+      sampleId: upload.barcode,
+      labServiceId: ctx.labServiceId,
+      labResultId: ctx.labResultId,
+      equipmentId: ctx.equipmentId ?? upload.equipmentId,
+      ipAddress: ctx.ipAddress,
+      portNo: ctx.portNo,
+      identifier: ctx.identifier,
+      resultValue: r.value,
+      // The server sets this when it loads the value; we always report false.
+      isLoaded: false,
+      uniqueIdentifier: ctx.identifier,
+      parameterId: ctx.parameterId,
+    });
+  }
+
+  return { rows, unmatched };
 }

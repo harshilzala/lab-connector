@@ -7,7 +7,7 @@
     "baseUrl": "https://hims.zhhrpl.in/live/portal",
     "pendingPath": "/mirth/pending",
     "acknowledgePath": "/mirth/acknowledge",
-    "resultsPath": "/mirth/results",
+    "resultsPath": "/mirth/labresult",
     "timeoutMs": 15000,
     "tlsRejectUnauthorized": true
   },

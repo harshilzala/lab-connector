@@ -50,6 +50,11 @@ export interface NormalizeOptions {
   equipmentId?: string | number | null;
   ipAddress?: string;
   portNo?: string;
+  /** Keep rows the server has already flagged as transmitted. Off for an order
+   *  download (never hand the analyzer the same work twice), ON when resolving
+   *  the labResultId for an incoming RESULT — by then the row has been
+   *  acknowledged, and dropping it would leave the result unfilable. */
+  includeTransmitted?: boolean;
 }
 
 /** Pull the row array out of whatever envelope the server wrapped it in. */
@@ -73,7 +78,7 @@ export function normalizePending(body: unknown, opts: NormalizeOptions): Pending
 
   const rows = unwrapRows(body).filter((row) => {
     // Already downloaded to an analyzer — do not send it twice.
-    if (row.isTransmitted === true) return false;
+    if (row.isTransmitted === true && !opts.includeTransmitted) return false;
     // The server treats every query param as optional, so it may ignore
     // sampleId/eqCode and return more than we asked for. Filter defensively,
     // but only on rows that actually carry the column.

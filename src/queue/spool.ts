@@ -30,6 +30,8 @@ export class SpoolQueue<T> {
   private readonly failedDir: string;
   private timer: NodeJS.Timeout | null = null;
   private draining = false;
+  /** Ids discarded mid-delivery; drain must not write them back out. */
+  private readonly discarded = new Set<string>();
   private handler: Handler<T> | null = null;
 
   constructor(private readonly baseDir: string, private readonly logger: Logger) {
@@ -88,6 +90,18 @@ export class SpoolQueue<T> {
     }
   }
 
+  /** Drop an item from the queue entirely (admin "remove" action).
+   *
+   *  Deleting the file is not enough on its own: the drain worker may already
+   *  be awaiting delivery of this very item, and a failure there would write
+   *  the envelope back out and resurrect what the operator just discarded.
+   *  Record the id so drain knows to let it go. */
+  discard(id: string): boolean {
+    const existed = this.remove(this.pendingDir, id) || this.remove(this.failedDir, id);
+    if (existed && this.draining) this.discarded.add(id);
+    return existed;
+  }
+
   private async drain(): Promise<void> {
     if (this.draining || !this.handler) return;
     this.draining = true;
@@ -97,8 +111,14 @@ export class SpoolQueue<T> {
         if (!env) continue;
         try {
           await this.handler(env.payload, env);
+          this.discarded.delete(id);
           this.remove(this.pendingDir, id);
         } catch (err) {
+          // Discarded by the operator while this attempt was in flight — let it go.
+          if (this.discarded.delete(id)) {
+            this.remove(this.pendingDir, id);
+            continue;
+          }
           env.attempts += 1;
           env.lastError = err instanceof Error ? err.message : String(err);
           if (env.attempts >= MAX_ATTEMPTS) {
@@ -139,11 +159,13 @@ export class SpoolQueue<T> {
     renameSync(tmp, join(dir, `${id}.json`));
   }
 
-  private remove(dir: string, id: string): void {
+  /** Deletes the file; returns whether it was there to delete. */
+  private remove(dir: string, id: string): boolean {
     try {
       unlinkSync(join(dir, `${id}.json`));
+      return true;
     } catch {
-      /* already gone */
+      return false; /* already gone */
     }
   }
 }

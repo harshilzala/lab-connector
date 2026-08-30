@@ -153,9 +153,43 @@ export interface HmisResultUpload {
   messageId: string;
 }
 
+/**
+ * One element of the POST {resultsPath} body — the wire shape the HMIS gateway
+ * deserializes into `java.util.List<com.his.lab.domain.LisInboundResults>`.
+ *
+ * The endpoint takes a BARE ARRAY of these; there is no wrapper object. Every
+ * identifier except `resultValue` comes from the pending row the order was
+ * downloaded from, NOT from the analyzer — `labResultId` is what the server
+ * files against, so a result with no matching pending row cannot be uploaded.
+ */
+export interface LisInboundResultRow {
+  sampleId: string;
+  labServiceId: number | null;
+  labResultId: number | null;
+  equipmentId: string | number | null;
+  ipAddress: string;
+  portNo: string;
+  /** The analyzer's own assay code, from the pending row's `eqIdntifier`. */
+  identifier: string;
+  /** The measured value, as text, exactly as the analyzer reported it. */
+  resultValue: string;
+  isLoaded: boolean;
+  uniqueIdentifier: string;
+  parameterId: number | null;
+}
+
+/** The gateway's envelope. NOTE: it answers HTTP 200 even on failure — the
+ *  `status` field is the only reliable indicator, so callers must check it. */
 export interface HmisResultUploadResponse {
-  ok: boolean;
+  status: string; // "success" | "failure"
+  message: string;
+  /** The rows the server accepted; empty when nothing matched. */
+  successData: Array<{
+    sampleId?: string;
+    labServiceId?: number;
+    labResultId?: number;
+    equipmentId?: number;
+  }>;
+  /** Convenience: `successData.length`. */
   filed: number;
-  unmatched: string[]; // test codes with no mapping
-  sampleStatus?: string;
 }

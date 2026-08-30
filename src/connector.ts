@@ -94,4 +94,15 @@ export class Connector implements AdminBackend {
   retry(id: string, msgId: string) {
     return this.runtimes.get(id)?.retryFailed(msgId) ?? false;
   }
+
+  clearWire(id: string) {
+    const rt = this.runtimes.get(id);
+    if (!rt) return false;
+    rt.clearWire();
+    return true;
+  }
+
+  remove(id: string, msgId: string) {
+    return this.runtimes.get(id)?.discardSpooled(msgId) ?? false;
+  }
 }

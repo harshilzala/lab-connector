@@ -91,6 +91,12 @@ main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40
 .panel { border:1px solid var(--line); border-radius:10px; background:#fbfbfc; max-height:320px; overflow:auto; }
 .panel .empty { padding:26px 16px; text-align:center; color:var(--mut); font-size:13px; }
 
+.panel-tools { display:flex; align-items:center; gap:8px; margin:0 0 8px; }
+.panel-tools .note { flex:1; min-width:0; font-size:12px; color:var(--mut); }
+.btn.btn-danger { color:var(--bad); }
+.btn.btn-danger:hover { background:rgba(199,58,58,.08); }
+.btn[disabled] { opacity:.45; cursor:not-allowed; }
+
 .wire { margin:0; padding:0; list-style:none; }
 .wire li { padding:9px 12px; border-bottom:1px solid var(--line); }
 .wire li:last-child { border-bottom:0; }
@@ -284,6 +290,7 @@ function renderCards(analyzers) {
           <button type="button" data-a="\${esc(a.id)}" data-t="spool"
                   class="\${state.open === a.id && state.tab === 'spool' ? 'active' : ''}">Upload queue</button>
         </div>
+        <div id="tools-\${esc(a.id)}"></div>
         <div class="panel" id="panel-\${esc(a.id)}">
           <div class="empty">Pick a view above.</div>
         </div>
@@ -305,10 +312,25 @@ function renderCards(analyzers) {
 async function renderPanel(id) {
   const el = document.getElementById('panel-' + id);
   if (!el) return;
+  const tools = document.getElementById('tools-' + id);
 
   if (state.tab === 'wire') {
     const { wire } = await j('/api/analyzers/' + encodeURIComponent(id) + '/wire');
     const rows = (wire || []).slice(-30).reverse();
+    // Refresh pulls the log on demand — the 5s poll can lag a live exchange —
+    // and Clear empties it so the next exchange can be read on its own.
+    if (tools) {
+      tools.innerHTML =
+        '<div class="panel-tools"><span class="note">' +
+        (rows.length ? 'latest ' + rows.length + ' frame(s)' : 'no frames') + '</span>' +
+        '<button class="btn btn-ghost btn-sm" type="button" data-wire-refresh="1">Refresh</button>' +
+        '<button class="btn btn-ghost btn-sm btn-danger" type="button" data-wire-clear="1"' +
+        (rows.length ? '' : ' disabled') + '>Clear</button></div>';
+      const r = tools.querySelector('[data-wire-refresh]');
+      if (r) r.onclick = () => renderPanel(id);
+      const c = tools.querySelector('[data-wire-clear]');
+      if (c) c.onclick = () => clearWire(id);
+    }
     el.innerHTML = rows.length
       ? '<ul class="wire">' + rows.map(w =>
           '<li><div class="head"><span class="dir ' + esc(w.direction) + '">' + esc(w.direction) + '</span>' +
@@ -317,23 +339,48 @@ async function renderPanel(id) {
     return;
   }
 
+  if (tools) tools.innerHTML = '';
   const s = await j('/api/analyzers/' + encodeURIComponent(id) + '/spool');
+  // Ids and barcodes ride in attributes, so they go through esc() here too.
+  const removeBtn = (env) =>
+    '<button class="btn btn-ghost btn-sm btn-danger" type="button" data-q-remove="' + esc(env.id) +
+    '" data-q-barcode="' + esc(env.payload.barcode) + '">Remove</button>';
   const failed = (s.failed || []).map(f =>
     '<li><div class="grow"><div class="barcode">' + esc(f.payload.barcode) + '</div>' +
     '<div class="err">' + esc(f.lastError || 'delivery failed') + '</div></div>' +
     '<span class="pill bad">' + f.attempts + ' tries</span>' +
-    '<button class="btn btn-ghost btn-sm" type="button" onclick="retry(\\'' + id + '\\',\\'' + f.id + '\\')">Retry</button></li>').join('');
+    '<button class="btn btn-ghost btn-sm" type="button" data-q-retry="' + esc(f.id) + '">Retry</button>' +
+    removeBtn(f) + '</li>').join('');
   const pending = (s.pending || []).map(p =>
     '<li><div class="grow"><div class="barcode">' + esc(p.payload.barcode) + '</div></div>' +
-    '<span class="pill warn">queued</span></li>').join('');
+    '<span class="pill warn">queued</span>' + removeBtn(p) + '</li>').join('');
 
   el.innerHTML = (failed || pending)
     ? '<ul class="q">' + failed + pending + '</ul>'
     : '<div class="empty">Upload queue is empty &mdash; everything has reached the HMIS.</div>';
+
+  el.querySelectorAll('[data-q-retry]').forEach(b => { b.onclick = () => retry(id, b.dataset.qRetry); });
+  el.querySelectorAll('[data-q-remove]').forEach(b => {
+    b.onclick = () => removeQueued(id, b.dataset.qRemove, b.dataset.qBarcode);
+  });
 }
 
 async function retry(id, msgId) {
   await j('/api/analyzers/' + encodeURIComponent(id) + '/retry/' + encodeURIComponent(msgId), { method: 'POST' });
+  renderPanel(id);
+}
+
+// Dropping a sample means its results never reach the HMIS — name the barcode
+// in the prompt so the operator sees exactly what they are discarding.
+async function removeQueued(id, msgId, barcode) {
+  if (!confirm('Remove sample ' + barcode + ' from the upload queue?\\n\\nIts results will not be sent to the HMIS.')) return;
+  await j('/api/analyzers/' + encodeURIComponent(id) + '/queue/' + encodeURIComponent(msgId), { method: 'DELETE' });
+  refresh(); // the queue counts on the tiles and the card pill move too
+}
+
+async function clearWire(id) {
+  if (!confirm('Clear the wire log for this analyzer?\\n\\nThe on-disk log keeps the full record.')) return;
+  await j('/api/analyzers/' + encodeURIComponent(id) + '/wire', { method: 'DELETE' });
   renderPanel(id);
 }
 

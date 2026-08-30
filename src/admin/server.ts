@@ -20,6 +20,8 @@ export interface AdminBackend {
   wire(id: string): WireLogEntry[] | null;
   spool(id: string): { pending: SpoolEnvelope<HmisResultUpload>[]; failed: SpoolEnvelope<HmisResultUpload>[] } | null;
   retry(id: string, msgId: string): boolean;
+  clearWire(id: string): boolean;
+  remove(id: string, msgId: string): boolean;
 }
 
 /** Plenty for a login form; anything larger is not a request we serve. */
@@ -141,11 +143,29 @@ export class AdminServer {
         return s ? this.json(res, s) : this.json(res, { error: 'unknown analyzer' }, 404);
       }
 
+      const clearWireMatch = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/wire$/);
+      if (method === 'DELETE' && clearWireMatch) {
+        if (!this.sameOrigin(req)) return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        const ok = this.backend.clearWire(clearWireMatch[1]!);
+        return this.json(res, ok ? { ok } : { error: 'unknown analyzer' }, ok ? 200 : 404);
+      }
+
       const retryMatch = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/retry\/(.+)$/);
       if (method === 'POST' && retryMatch) {
         if (!this.sameOrigin(req)) return this.json(res, { error: 'cross-origin request rejected' }, 403);
         const ok = this.backend.retry(retryMatch[1]!, decodeURIComponent(retryMatch[2]!));
         return this.json(res, { ok }, ok ? 200 : 404);
+      }
+
+      // Discards a sample so it is never filed. Guarded by same-origin like the
+      // other mutating routes; the log records who dropped what.
+      const removeMatch = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/queue\/(.+)$/);
+      if (method === 'DELETE' && removeMatch) {
+        if (!this.sameOrigin(req)) return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        const msgId = decodeURIComponent(removeMatch[2]!);
+        const ok = this.backend.remove(removeMatch[1]!, msgId);
+        if (ok) this.logger.warn({ analyzer: removeMatch[1], msgId }, 'queued sample removed from the admin console');
+        return this.json(res, ok ? { ok } : { error: 'unknown queue item' }, ok ? 200 : 404);
       }
 
       this.json(res, { error: 'not found' }, 404);

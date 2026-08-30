@@ -2,14 +2,17 @@ import { join } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { AnalyzerConfig } from '../config.js';
 import type { HmisClient } from '../hmis/client.js';
-import type { HmisResultUpload, OrderDownload, ParsedMessage } from '../types.js';
+import type { HmisResultUpload, MirthAcknowledgeItem, OrderDownload, ParsedMessage, PendingOrders } from '../types.js';
 import type { ProtocolLink, WireEvent } from '../codec/types.js';
 import { createTransport } from '../transport/index.js';
 import type { Transport } from '../transport/types.js';
 import { createProtocolLink } from '../codec/index.js';
 import { SpoolQueue } from '../queue/spool.js';
-import { normalizeBarcode, toResultUploads } from '../mapping/mapper.js';
+import { normalizeBarcode, toLisResultRows, toResultUploads } from '../mapping/mapper.js';
 import { formatApiDate, normalizePending } from '../hmis/pending.js';
+
+/** Barcodes retained for result-time labResultId lookup. */
+const ORDER_ROW_CACHE_MAX = 500;
 
 export interface WireLogEntry {
   at: string;
@@ -43,6 +46,10 @@ export class AnalyzerRuntime {
   private readonly log: Logger;
   private readonly wireLog: WireLogEntry[] = [];
   private lastMessageAt: string | null = null;
+  /** Order rows seen during an order download, keyed by canonical barcode, so
+   *  the result that arrives later can be joined to its labResultId without a
+   *  second round-trip. Bounded — this is a cache, never the source of truth. */
+  private readonly orderRowCache = new Map<string, MirthAcknowledgeItem[]>();
 
   constructor(
     private readonly cfg: AnalyzerConfig,
@@ -63,11 +70,30 @@ export class AnalyzerRuntime {
   async start(): Promise<void> {
     // Deliver spooled results to HMIS; a throw here keeps the item queued.
     this.spool.start(async (payload) => {
-      const res = await this.hmis.postResults(payload);
-      if (res.unmatched?.length) {
-        this.log.warn({ barcode: payload.barcode, unmatched: res.unmatched }, 'some test codes had no HMIS mapping');
+      // The results endpoint files against labResultId, which only the order
+      // row carries — so join the analyzer's values back to the pending rows
+      // for this barcode before sending. Done HERE, at delivery time, so a
+      // lookup failure is retried by the spool rather than losing the result.
+      const orderRows = await this.resolveOrderRows(payload.barcode);
+      const { rows, unmatched } = toLisResultRows(payload, orderRows);
+
+      if (unmatched.length) {
+        this.log.warn(
+          { barcode: payload.barcode, unmatched, known: orderRows.map((r) => r.identifier) },
+          'no pending order row for these assay codes — they cannot be filed',
+        );
       }
-      this.log.info({ barcode: payload.barcode, filed: res.filed, status: res.sampleStatus }, 'results filed to HMIS');
+      if (rows.length === 0) {
+        // Throwing keeps the item spooled: the order may simply not be raised
+        // in HMIS yet. It parks in failed/ once attempts run out.
+        throw new Error(`no order rows matched barcode ${payload.barcode} — nothing to file`);
+      }
+
+      const res = await this.hmis.postResults(rows);
+      this.log.info(
+        { barcode: payload.barcode, filed: res.filed, sent: rows.length, message: res.message },
+        'results filed to HMIS',
+      );
     });
     await this.link.start();
     this.log.info({ endpoint: this.cfg.transport.type }, 'analyzer runtime started');
@@ -94,6 +120,12 @@ export class AnalyzerRuntime {
     return this.wireLog.slice(-limit);
   }
 
+  /** Empties the in-memory wire log so the operator can watch one exchange in
+   *  isolation. The rolling file log keeps the full record either way. */
+  clearWire(): void {
+    this.wireLog.length = 0;
+  }
+
   spoolPending(limit = 100) {
     return this.spool.listPending(limit);
   }
@@ -104,6 +136,13 @@ export class AnalyzerRuntime {
 
   retryFailed(id: string): boolean {
     return this.spool.requeueFailed(id);
+  }
+
+  /** Drops a queued or parked sample — it will never be sent to the HMIS. */
+  discardSpooled(id: string): boolean {
+    const dropped = this.spool.discard(id);
+    if (dropped) this.log.warn({ id }, 'spool item removed from the queue by an operator');
+    return dropped;
   }
 
   // ---------------------------------------------------------------------------
@@ -134,25 +173,13 @@ export class AnalyzerRuntime {
     // uppercase form so a lowercase-entered sample still resolves its order.
     const lookup = normalizeBarcode(barcode);
     try {
-      const body = await this.hmis.getPending({
-        sampleId: lookup,
-        eqCode: this.cfg.equipmentCode,
-        siteId: this.cfg.siteId,
-        showCulture: this.cfg.showCulture,
-        // Off by default: an order raised yesterday for a tube run today would
-        // otherwise not be found.
-        date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
-      });
-
       // One row per pending test — collapse the rows for this barcode into a
       // single order, keeping each row so it can be acknowledged afterwards.
-      const pending = normalizePending(body, {
-        sampleId: lookup,
-        eqCode: this.cfg.equipmentCode,
-        equipmentId: this.cfg.equipmentId ?? null,
-        ipAddress: this.ackIpAddress,
-        portNo: this.ackPortNo,
-      });
+      const pending = await this.fetchPending(lookup);
+
+      // Remember the rows: the result comes back in a LATER message and needs
+      // their labResultId to be filable.
+      if (pending.ackItems.length) this.rememberOrderRows(lookup, pending.ackItems);
 
       if (!pending.found) {
         this.log.info({ barcode, lookup }, 'no pending orders — sending empty download');
@@ -188,6 +215,55 @@ export class AnalyzerRuntime {
     } catch (err) {
       this.log.error({ barcode, err: err instanceof Error ? err.message : String(err) }, 'host-query failed');
     }
+  }
+
+  /** Load and normalise the pending rows for one barcode. */
+  private async fetchPending(lookup: string, includeTransmitted = false): Promise<PendingOrders> {
+    const body = await this.hmis.getPending({
+      sampleId: lookup,
+      eqCode: this.cfg.equipmentCode,
+      siteId: this.cfg.siteId,
+      showCulture: this.cfg.showCulture,
+      // Off by default: an order raised yesterday for a tube run today would
+      // otherwise not be found.
+      date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
+    });
+    return normalizePending(body, {
+      sampleId: lookup,
+      eqCode: this.cfg.equipmentCode,
+      equipmentId: this.cfg.equipmentId ?? null,
+      ipAddress: this.ackIpAddress,
+      portNo: this.ackPortNo,
+      includeTransmitted,
+    });
+  }
+
+  private rememberOrderRows(lookup: string, rows: MirthAcknowledgeItem[]): void {
+    this.orderRowCache.delete(lookup); // re-insert so it counts as most recent
+    this.orderRowCache.set(lookup, rows);
+    while (this.orderRowCache.size > ORDER_ROW_CACHE_MAX) {
+      const oldest = this.orderRowCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.orderRowCache.delete(oldest);
+    }
+  }
+
+  /**
+   * Order rows for a barcode, for joining an incoming result to its
+   * labResultId. Prefers the rows captured during the order download; falls
+   * back to a live lookup, which is the normal path when the connector was
+   * restarted, or when the analyzer runs without a host query at all.
+   */
+  private async resolveOrderRows(barcode: string): Promise<MirthAcknowledgeItem[]> {
+    const lookup = normalizeBarcode(barcode);
+    const cached = this.orderRowCache.get(lookup);
+    if (cached?.length) return cached;
+
+    // includeTransmitted: the rows were acknowledged at download time, so the
+    // server may now be flagging them as transmitted.
+    const pending = await this.fetchPending(lookup, true);
+    if (pending.ackItems.length) this.rememberOrderRows(lookup, pending.ackItems);
+    return pending.ackItems;
   }
 
   /** Reported in the acknowledge body; derived from a TCP transport when the
