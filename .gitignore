@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.log
+logs/
+
+# Runtime state — durable store-and-forward spool + local message log.
+# NEVER commit: may contain patient result data.
+spool/
+data/
+
+# Local configuration (contains the shared HMAC secret). Copy from
+# config.example.json and keep out of version control.
+config.json
+
+
+
+# Local dashboard credential (scrypt hash + recovery key hash). Seeded on
+# first start — never commit.
+admin-auth.json
+
