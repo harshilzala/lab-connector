@@ -18,3 +18,6 @@ config.json
 # first start — never commit.
 admin-auth.json
 
+
+# Local code-graph index (tokensave). Machine-local SQLite state — never commit.
+.tokensave/
