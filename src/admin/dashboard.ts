@@ -2,7 +2,17 @@ import { BASE_CSS, FONT_LINK } from './theme.js';
 
 // Operations dashboard, styled to the Zydus Hospitals brand (teal #00a5a5 /
 // plum #aa55a0 on white, Nunito Sans). Self-contained apart from the webfont.
-// Served at GET / with no sign-in in front of it.
+// Served at GET / to an authenticated session only.
+
+export interface DashboardOptions {
+  username: string;
+  /** Raises a nudge banner while the commissioning password is still in place. */
+  usingDefaultPassword: boolean;
+}
+
+function esc(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+}
 
 const PAGE_CSS = `
 body { display:flex; flex-direction:column; min-height:100vh; }
@@ -120,7 +130,16 @@ footer.pagefoot { padding:16px 24px 28px; text-align:center; font-size:12.5px; c
 }
 `;
 
-export function renderDashboard(): string {
+export function renderDashboard(o: DashboardOptions): string {
+  const initial = esc((o.username[0] ?? 'A').toUpperCase());
+  const defaultPwBanner = o.usingDefaultPassword
+    ? `<div class="msg info" role="status" style="margin-bottom:22px">
+         <strong>Commissioning password still active.</strong>
+         Set a private password before this connector goes live &mdash;
+         <a href="#" onclick="openPw();return false;">change it now</a>.
+       </div>`
+    : '';
+
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -147,11 +166,17 @@ ${FONT_LINK}
     <div class="spacer"></div>
     <div class="tools">
       <span class="clock" id="clock"></span>
+      <span class="who"><span class="avatar">${initial}</span>${esc(o.username)}</span>
+      <button class="btn btn-ghost btn-sm" type="button" onclick="openPw()">Change password</button>
+      <form method="post" action="/logout" style="margin:0">
+        <button class="btn btn-ghost btn-sm" type="submit">Sign out</button>
+      </form>
     </div>
   </div>
 </header>
 
 <main>
+  ${defaultPwBanner}
   <div id="alert"></div>
   <section class="stats" id="stats"></section>
   <div class="section-head">
@@ -163,14 +188,40 @@ ${FONT_LINK}
 
 <footer class="pagefoot">Zydus Hospitals &middot; HMIS Lab Connector &middot; local console</footer>
 
+<div class="backdrop" id="pwBackdrop" role="dialog" aria-modal="true" aria-labelledby="pwTitle">
+  <div class="modal">
+    <h2 id="pwTitle">Change password</h2>
+    <p class="lead">Signed in as <strong>${esc(o.username)}</strong>. All other sessions are signed out.</p>
+    <div id="pwMsg"></div>
+    <div class="field">
+      <label for="pwCurrent">Current password</label>
+      <input id="pwCurrent" type="password" autocomplete="current-password" />
+    </div>
+    <div class="field">
+      <label for="pwNew">New password</label>
+      <input id="pwNew" type="password" autocomplete="new-password" />
+    </div>
+    <div class="field">
+      <label for="pwConfirm">Confirm new password</label>
+      <input id="pwConfirm" type="password" autocomplete="new-password" />
+    </div>
+    <div class="row">
+      <button class="btn btn-ghost" type="button" onclick="closePw()">Cancel</button>
+      <button class="btn btn-primary" type="button" id="pwSubmit" onclick="submitPw()">Update</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const state = { open: null, tab: 'wire' };
 
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function time(iso) { return iso ? new Date(iso).toLocaleTimeString() : '\u2014'; }
 
+// Any 401 means the session lapsed while the page sat open — bounce to sign-in.
 async function j(url, opts) {
   const r = await fetch(url, opts);
+  if (r.status === 401) { location.href = '/login'; throw new Error('signed out'); }
   return r.json();
 }
 
@@ -299,6 +350,43 @@ async function refresh() {
       '<div class="msg error">Lost contact with the connector service. Retrying\\u2026</div>';
   }
   document.getElementById('clock').textContent = new Date().toLocaleString();
+}
+
+// ---- change password ----
+function openPw() {
+  document.getElementById('pwMsg').innerHTML = '';
+  ['pwCurrent', 'pwNew', 'pwConfirm'].forEach(id => { document.getElementById(id).value = ''; });
+  document.getElementById('pwBackdrop').classList.add('open');
+  document.getElementById('pwCurrent').focus();
+}
+function closePw() { document.getElementById('pwBackdrop').classList.remove('open'); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePw(); });
+
+async function submitPw() {
+  const msg = document.getElementById('pwMsg');
+  const btn = document.getElementById('pwSubmit');
+  const body = {
+    current: document.getElementById('pwCurrent').value,
+    password: document.getElementById('pwNew').value,
+    confirm: document.getElementById('pwConfirm').value,
+  };
+  btn.disabled = true;
+  try {
+    const r = await j('/api/password', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (r.ok) {
+      msg.innerHTML = '<div class="msg ok">Password updated. Signing you back in\\u2026</div>';
+      setTimeout(() => { location.href = '/login'; }, 1200);
+      return;
+    }
+    msg.innerHTML = '<div class="msg error">' + esc(r.error || 'Could not update the password.') + '</div>';
+  } catch (err) {
+    msg.innerHTML = '<div class="msg error">Request failed. Is the connector still running?</div>';
+  }
+  btn.disabled = false;
 }
 
 refresh();

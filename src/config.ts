@@ -122,8 +122,11 @@ const ConfigSchema = z.object({
     .object({
       host: z.string().default('127.0.0.1'),
       port: z.number().int().positive().default(7070),
+      /** Where the dashboard credential + recovery key hash live. Seeded on
+       *  first start; see src/admin/auth.ts. Keep it out of version control. */
+      authFile: z.string().default('./admin-auth.json'),
     })
-    .default({ host: '127.0.0.1', port: 7070 }),
+    .default({ host: '127.0.0.1', port: 7070, authFile: './admin-auth.json' }),
   analyzers: z.array(AnalyzerSchema).min(1),
 });
 
@@ -135,6 +138,7 @@ function applyEnvOverrides(raw: any): any {
   const cfg = structuredClone(raw);
   if (process.env.LOG_LEVEL) cfg.logLevel = process.env.LOG_LEVEL;
   if (process.env.HMIS_BASE_URL) cfg.hmis = { ...cfg.hmis, baseUrl: process.env.HMIS_BASE_URL };
+  if (process.env.ADMIN_AUTH_FILE) cfg.admin = { ...cfg.admin, authFile: process.env.ADMIN_AUTH_FILE };
   return cfg;
 }
 

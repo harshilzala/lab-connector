@@ -11,7 +11,8 @@
   },
   "admin": {
     "host": "127.0.0.1",
-    "port": 7071
+    "port": 7071,
+    "authFile": "./admin-auth.json"
   },
   "analyzers": [
     {

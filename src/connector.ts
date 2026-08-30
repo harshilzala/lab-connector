@@ -4,6 +4,7 @@ import type { Logger } from './logger.js';
 import { HmisClient } from './hmis/client.js';
 import { AnalyzerRuntime } from './session/orchestrator.js';
 import { AdminServer, type AdminBackend } from './admin/server.js';
+import { AuthStore } from './admin/auth.js';
 
 // Top-level app: one HMIS client, one AnalyzerRuntime per configured analyzer,
 // and the local admin server. Implements AdminBackend so the dashboard can read
@@ -12,6 +13,7 @@ export class Connector implements AdminBackend {
   private readonly runtimes = new Map<string, AnalyzerRuntime>();
   private readonly hmis: HmisClient;
   private readonly admin: AdminServer;
+  private readonly auth: AuthStore;
 
   constructor(private readonly cfg: AppConfig, private readonly logger: Logger) {
     this.hmis = new HmisClient({
@@ -29,7 +31,14 @@ export class Connector implements AdminBackend {
       this.runtimes.set(a.id, new AnalyzerRuntime(a, this.hmis, spoolRoot, logger));
     }
 
-    this.admin = new AdminServer(this, cfg.admin.host, cfg.admin.port, logger.child({ mod: 'admin' }));
+    this.auth = new AuthStore(cfg.admin.authFile);
+    this.admin = new AdminServer(
+      this,
+      cfg.admin.host,
+      cfg.admin.port,
+      logger.child({ mod: 'admin' }),
+      this.auth,
+    );
   }
 
   async start(): Promise<void> {
@@ -43,6 +52,15 @@ export class Connector implements AdminBackend {
       this.logger.warn(
         { baseUrl: this.cfg.hmis.baseUrl },
         'HMIS base URL points at this machine — results will queue in the spool until it is set to the real gateway',
+      );
+    }
+
+    // Printed exactly once, on the start that seeds the auth file. File it with
+    // the lab runbook: it is the only way back in if the password is lost.
+    if (this.auth.seededRecoveryKey) {
+      this.logger.warn(
+        { username: this.auth.username, recoveryKey: this.auth.seededRecoveryKey, authFile: this.cfg.admin.authFile },
+        'admin credential seeded — record the recovery key now, it is not shown again',
       );
     }
 

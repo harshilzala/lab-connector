@@ -15,7 +15,11 @@ data/
 
 # Local dashboard credential (scrypt hash + recovery key hash). Seeded on
 # first start — never commit.
+admin-auth.json
 
 
 # Local code-graph index (tokensave). Machine-local SQLite state — never commit.
 .tokensave/
+
+# curl cookie jar from dashboard testing — carries a live session id.
+cookies.txt
