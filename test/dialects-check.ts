@@ -1,4 +1,4 @@
-import { buildOrderMessage, parseMessage } from '../src/codec/astm/records.js';
+import { buildOrderMessage, parseMessage, ASTM_DIALECT_NAMES } from '../src/codec/astm/records.js';
 
 // Replays the real Snibe Maglumi wire logs (g:\doc) through the codec.
 const G = '\x1b[32m✓\x1b[0m';
@@ -89,4 +89,73 @@ const magP = buildOrderMessage(
   { senderId: 'Maglumi 1000', receiverId: 'Lis', sendDemographics: true, dialect: 'maglumi' },
 );
 for (const l of magP) console.log('      ' + l);
+console.log('');
+
+
+// =============================================================================
+// [8]-[11]  VITROS ECi / ECiQ — golden tests replayed from the PRODUCTION wire
+// log of the lab's existing integration (E:\API_Integration\Devices\ECiQ,
+// Logs/2026-08-31/ASTM.log). These are bytes the analyzer has actually
+// accepted, not a shape inferred from a datasheet — treat any diff here as a
+// regression in the dialect, not a reason to edit the expectation.
+// =============================================================================
+
+console.log('\n[8] VITROS ECiQ ORDER DOWNLOAD — byte-identical to the production log');
+const vit = buildOrderMessage(
+  [{
+    sampleId: 'SF2608310003',
+    testCodes: ['075', '035', '032', '074'],
+    priority: 'R',
+    patient: { patientId: '10062026002906', lastName: 'JIGISHBHATT', firstName: null, middleName: null, sex: 'M', birthDate: null },
+    specimenType: 'Serum',
+  }],
+  { senderId: 'HOST', receiverId: '', sendDemographics: true, dialect: 'vitros-eciq' },
+);
+eq('records', vit.map(stamp), [
+  'H|\\^&|||HOST|||||||||<ts>',
+  'P|1|10062026002906|||JIGISHBHATT^^|||M|||||||||||||||||||||||||||',
+  'O|1|SF2608310003||^^^1.0+075+1\\035+1\\032+1\\074+1|R||||||N||||4||||||||||O||||||',
+  'L|1|N',
+].map(stamp));
+eq('H carries no receiver, no processing id and no version', vit[0]!.split('|').slice(5, 13).join(''), '');
+for (const l of vit) console.log('      ' + l);
+
+console.log('\n[9] VITROS ECiQ RESULT UPLOAD — the assay code is the middle "+" group');
+const vr = parseMessage(
+  [
+    'H|\\^&|||VITROS|||||||||20260831103026',
+    'P|1',
+    'O|1|240683^02^0||^^^1.000000+032+1\\038+1\\075+1\\074+1\\035+1|R||||||N||||4||||||||||F',
+    'R|1|^^^1.000000+032+1|356|pg/mL||^0^||V|||20260831100701|20260831103018|',
+    'R|2|^^^1.000000+038+1|28.2|U/mL||^0^||V|||20260831093141|20260831100838|',
+    'R|3|^^^1.000000+075+1|3.15|ng/mL||^0^||V|||20260831093221|20260831095538|',
+    'L|1|N',
+  ],
+  'raw',
+  'vitros-eciq',
+);
+eq('sender', vr.sender, 'VITROS');
+// The analyzer echoes a DIFFERENT manual dilution ("1.000000") than the "1.0"
+// we send, so the decoder must not key off the value it wrote.
+eq('results', vr.results.map((x) => [x.sampleId, x.testCode, x.value, x.unit, x.abnormalFlag, x.status, x.completedAt]), [
+  ['240683', '032', '356', 'pg/mL', '^0^', 'V', '20260831103018'],
+  ['240683', '038', '28.2', 'U/mL', '^0^', 'V', '20260831100838'],
+  ['240683', '075', '3.15', 'ng/mL', '^0^', 'V', '20260831095538'],
+]);
+
+console.log('\n[10] A dialect must not leak into another dialect\'s decoding');
+// The same "1.000000+032+1" under the atellica dialect stays whole — proof the
+// VITROS unwrapping is dialect-scoped and not a global rule.
+const cross = parseMessage(['H|\\^&|||X', 'O|1|S1||^^^x', 'R|1|^^^1.000000+032+1|5||||||||||', 'L|1|N'], 'raw', 'atellica');
+eq('atellica keeps the whole component', cross.results.map((x) => x.testCode), ['1.000000+032+1']);
+
+console.log('\n[11] Every dialect in the library builds a well-formed message');
+for (const name of ASTM_DIALECT_NAMES) {
+  const out = buildOrderMessage(
+    [{ sampleId: 'S1', testCodes: ['A', 'B'], priority: 'R', patient: null, specimenType: 'Serum' }],
+    { senderId: 'HOST', receiverId: 'ANALYZER', sendDemographics: false, dialect: name },
+  );
+  const ok = out[0]!.startsWith('H|') && out[out.length - 1] === 'L|1|N' && out.some((l) => l.startsWith('O|'));
+  eq(`${name}: H … O … L`, ok, true);
+}
 console.log('');

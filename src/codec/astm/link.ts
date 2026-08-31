@@ -185,7 +185,7 @@ export class AstmLink extends EventEmitter implements ProtocolLink {
     const raw = records.join('\r\n');
     this.emit('wire', { direction: 'IN', text: raw });
     try {
-      const msg = parseMessage(records, raw);
+      const msg = parseMessage(records, raw, this.opts.dialect);
       this.emit('message', msg);
     } catch (err) {
       this.emit('error', err instanceof Error ? err : new Error(String(err)));

@@ -93,23 +93,62 @@ function deterministicMessageId(equipmentCode: string, sampleId: string, results
 export function toLisResultRows(
   upload: HmisResultUpload,
   orderRows: MirthAcknowledgeItem[],
-): { rows: LisInboundResultRow[]; unmatched: string[] } {
+  /**
+   * Reduce an assay identifier to the key both sides agree on. Needed because
+   * the two sides do not always spell it the same way: HMIS stores the VITROS
+   * `eqIdntifier` as the full Universal Test ID ("1.000000+032+1") while the
+   * codec reports the assay it measured as "032". Defaults to identity, so
+   * analyzers whose codes already match are unaffected.
+   */
+  canonicalCode: (identifier: string) => string = (id) => id,
+  /**
+   * Analyzer assay code → the HMIS `eqIdntifier` that means the same analyte,
+   * for the cases where the two genuinely differ in NAME rather than spelling:
+   * the Erba H360 reports "HGB" and "LYM%" where ZHFC03's CBC parameters are
+   * registered as "HAEMOGLOBIN" and "Lymphocytes". Applied at delivery time, so
+   * correcting a mapping repairs results already sitting in the spool.
+   *
+   * Prefer fixing the Identifier column in HMIS — that keeps one source of
+   * truth. This is for the analytes HMIS names after the report line rather
+   * than after the instrument. Matching is case-insensitive.
+   */
+  aliases: Record<string, string> = {},
+): { rows: LisInboundResultRow[]; unmatched: string[]; matched: MirthAcknowledgeItem[] } {
   // Analyzers are inconsistent about case and padding on assay codes; the
   // pending row is authoritative for the spelling actually sent on the wire.
+  const key = (id: string) => canonicalCode((id || '').trim()).trim().toUpperCase();
+
+  const aliasOf = new Map<string, string>();
+  for (const [from, to] of Object.entries(aliases)) {
+    const k = key(from);
+    if (k) aliasOf.set(k, key(to));
+  }
+
   const byCode = new Map<string, MirthAcknowledgeItem>();
   for (const row of orderRows) {
-    const key = (row.identifier || '').trim().toUpperCase();
-    if (key && !byCode.has(key)) byCode.set(key, row); // first row wins
+    const k = key(row.identifier);
+    if (k && !byCode.has(k)) byCode.set(k, row); // first row wins
   }
 
   const rows: LisInboundResultRow[] = [];
   const unmatched: string[] = [];
+  // The pending rows these results were filed against — what the acknowledge
+  // body must echo once the upload has actually succeeded.
+  const matched: MirthAcknowledgeItem[] = [];
+  const seen = new Set<MirthAcknowledgeItem>();
 
   for (const r of upload.results) {
-    const ctx = byCode.get((r.testCode || '').trim().toUpperCase());
+    const own = key(r.testCode);
+    // Try the analyzer's own code first: an alias must never shadow a code that
+    // already matches a pending row.
+    const ctx = byCode.get(own) ?? (aliasOf.has(own) ? byCode.get(aliasOf.get(own)!) : undefined);
     if (!ctx) {
       unmatched.push(r.testCode);
       continue;
+    }
+    if (!seen.has(ctx)) {
+      seen.add(ctx);
+      matched.push(ctx);
     }
     rows.push({
       sampleId: upload.barcode,
@@ -127,5 +166,5 @@ export function toLisResultRows(
     });
   }
 
-  return { rows, unmatched };
+  return { rows, unmatched, matched };
 }

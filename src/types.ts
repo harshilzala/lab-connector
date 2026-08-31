@@ -8,7 +8,7 @@
 // =============================================================================
 
 export type Direction = 'IN' | 'OUT';
-export type ProtocolName = 'astm' | 'hl7' | 'advia2120i' | 'clinitek-advantus';
+export type ProtocolName = 'astm' | 'hl7' | 'kermit' | 'advia2120i' | 'clinitek-advantus';
 
 // ---- Analyzer → connector: a request for what to run on a sample -----------
 // (ASTM "Q" query record, or an order-less result upload that implies query.)

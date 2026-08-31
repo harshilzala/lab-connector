@@ -5,6 +5,16 @@ import type {
   PatientDemographics,
   HostQuery,
 } from '../../types.js';
+import { dialect, renderRecord, type AstmDialect } from './dialects.js';
+
+export {
+  assayKey,
+  ASTM_DIALECT_LIBRARY,
+  ASTM_DIALECT_NAMES,
+  DEFAULT_DIALECT,
+  type AstmDialect,
+  type DialectProfile,
+} from './dialects.js';
 
 // =============================================================================
 // ASTM E1394 (LIS2-A2) record layer — pure text ⇄ structured conversion.
@@ -13,10 +23,10 @@ import type {
 // Field delimiter defaults to '|', component '^', repeat '\', escape '&'.
 // The H record's second field redefines them, so we read them from there.
 //
-// ⚠️  FIELD POSITIONS BELOW FOLLOW THE ASTM STANDARD. The exact component that
-//     carries the assay code, and any Siemens-specific fields, MUST be verified
-//     against the Atellica "Host Interface / LIS Interface Specification" for
-//     your unit. Search for "VERIFY-SPEC" to find every position to confirm.
+// Record POSITIONS here follow the ASTM standard and read every analyzer we
+// have logs for. Everything a vendor does differently — the order-download
+// field maps and the Universal Test ID's inner shape — lives in the dialect
+// library, ./dialects.ts. Add a machine there, not here.
 // =============================================================================
 
 export interface Delimiters {
@@ -51,19 +61,28 @@ function detectDelims(lines: string[]): Delimiters {
 const comps = (v: string | undefined, d: Delimiters) => (v ?? '').split(d.component);
 const reps = (v: string | undefined, d: Delimiters) => (v ?? '').split(d.repeat).filter((x) => x !== '');
 
-/** Pick the assay code out of a Universal Test ID field ("^^^CODE^Name"). */
-function testCodeFromUniversalId(field: string | undefined, d: Delimiters): string {
+/**
+ * Pick the assay code out of a Universal Test ID field ("^^^CODE^Name").
+ *
+ * ASTM places the code in the 4th component (index 3), but what that component
+ * CONTAINS is vendor-specific — a VITROS wraps the code in a dilution pair
+ * ("1.000000+032+1"), so the dialect's own decoder unpacks it. Getting this
+ * wrong does not fail loudly: real results simply get filed under a garbage
+ * assay code.
+ */
+function testCodeFromUniversalId(field: string | undefined, d: Delimiters, name?: AstmDialect): string {
   const c = comps(field, d);
-  // VERIFY-SPEC: ASTM places the code in the 4th component (index 3). Some
-  // analyzers use the 1st. Fall back to the first non-empty component.
-  if (c[3] && c[3].trim()) return c[3].trim();
-  return c.find((x) => x.trim())?.trim() ?? '';
+  const raw = c[3] && c[3].trim() ? c[3].trim() : (c.find((x) => x.trim())?.trim() ?? '');
+  return raw ? dialect(name).tests.decode(raw) : '';
 }
 
 // -----------------------------------------------------------------------------
 // Parse a whole inbound message (record lines, control chars already stripped).
+//
+// Record POSITIONS here are vendor-neutral — they read every analyzer we have
+// logs for. Only the Universal Test ID's inner shape needs the dialect.
 // -----------------------------------------------------------------------------
-export function parseMessage(recordLines: string[], raw: string): ParsedMessage {
+export function parseMessage(recordLines: string[], raw: string, name?: AstmDialect): ParsedMessage {
   // Records may arrive one-per-frame OR packed several-per-frame separated by CR
   // (the CareTech/Atellica host puts H/Q/L in a single ETX-terminated frame).
   // Split on CR/LF so every ASTM record is parsed regardless of framing style.
@@ -130,7 +149,7 @@ export function parseMessage(recordLines: string[], raw: string): ParsedMessage 
 
         const result: InstrumentResult = {
           sampleId: currentSampleId,
-          testCode: testCodeFromUniversalId(f[2], d),
+          testCode: testCodeFromUniversalId(f[2], d, name),
           value: (f[3] || '').trim(),
           unit: (f[4] || '').trim() || null,
           referenceRange: (f[5] || '').trim() || null,
@@ -159,81 +178,13 @@ function normaliseSex(v: string | undefined): 'M' | 'F' | 'O' | null {
   if (!s) return null;
   return 'O';
 }
-
-// =============================================================================
-// Instrument dialects for the ORDER DOWNLOAD.
-//
-// Everything above is vendor-neutral — the Q/O/R positions read every analyzer
-// we have logs for. The download is not: vendors disagree on how to express
-// "run these assays on this tube", and an analyzer quietly ignores or rejects
-// an order it cannot parse. Each entry below is one vendor's shape, taken from
-// that vendor's spec and confirmed against its wire log — `npm run dialects`
-// replays them and diffs the generated download.
-//
-// Adding a machine means adding an entry here: the config enum derives from
-// this table, so nothing else changes.
-// =============================================================================
-export interface OrderFormat {
-  /** H field 12 — the ASTM version the analyzer announces and expects back. */
-  version: string;
-  /** H field 4 — access password. Snibe expects the literal "PSWD". */
-  password: string;
-  /**
-   * Universal Test ID components AFTER the code. The Atellica needs a rank /
-   * dilution "1" ("^^^A1c_E^^^1") — the bare code is rejected as UNKNOWN_TEST
-   * even when the assay is configured, because it does not resolve to a
-   * runnable assay (confirmed against the CareTech host wire log). Snibe wants
-   * the bare "^^^CA125" and treats trailing components as a malformed record.
-   */
-  testIdTail: readonly string[];
-  /** One O record per assay (Snibe) vs one O carrying every assay (Siemens). */
-  orderPerTest: boolean;
-  /**
-   * Keep O fields 12 (report type "O") and 16 (specimen descriptor). The
-   * Atellica/CareTech host rejects an empty field 16 with "invalid specimen
-   * type"; the Maglumi stops reading the record after the priority field.
-   */
-  fullOrderRecord: boolean;
-  /** Trailing empty fields on a P record when demographics are suppressed. */
-  emptyPatientFields: number;
-  /**
-   * H field 14 granularity. The Atellica exchanges a full YYYYMMDDHHMMSS. Every
-   * Maglumi header in the Snibe spec and in all three captured wire logs carries
-   * an 8-digit DATE ("20100319") — the only field where our download still
-   * differed from the vendor's own examples, so we match them.
-   */
-  timestamp: 'date' | 'datetime';
-}
-
-export const ORDER_FORMATS = {
-  /** Siemens Atellica CI, via the CareTech host. */
-  atellica: {
-    version: 'LIS2-A2',
-    password: '',
-    testIdTail: ['', '', '1'],
-    orderPerTest: false,
-    fullOrderRecord: true,
-    emptyPatientFields: 7,
-    timestamp: 'datetime',
-  },
-  /** Snibe Maglumi — "Chapter 16: Host Result Management", §16.4.2. */
-  maglumi: {
-    version: 'E1394-97',
-    password: 'PSWD',
-    testIdTail: [],
-    orderPerTest: true,
-    fullOrderRecord: false,
-    emptyPatientFields: 0,
-    timestamp: 'date',
-  },
-} as const satisfies Record<string, OrderFormat>;
-
-export type AstmDialect = keyof typeof ORDER_FORMATS;
-
-export const DEFAULT_DIALECT: AstmDialect = 'atellica';
-
 // -----------------------------------------------------------------------------
 // Build an order-download message (host-query reply / broadcast download).
+//
+// Every vendor difference lives in the dialect library (./dialects.ts) — this
+// function only fills placeholders into that dialect's field maps. Supporting a
+// new analyzer means adding one entry there, not editing this code.
+//
 // Returns record strings WITHOUT frame numbers/checksums — the link frames them.
 // -----------------------------------------------------------------------------
 export function buildOrderMessage(
@@ -241,56 +192,59 @@ export function buildOrderMessage(
   opts: { senderId: string; receiverId: string; sendDemographics: boolean; dialect?: AstmDialect },
   d: Delimiters = DEFAULT_DELIMS,
 ): string[] {
-  const F = d.field;
-  const fmt: OrderFormat = ORDER_FORMATS[opts.dialect ?? DEFAULT_DIALECT];
+  const fmt = dialect(opts.dialect);
   const lines: string[] = [];
 
-  // H|\^&||<password>|<sender>|||||<receiver>||P|<version>|<ts>
+  const stamp = astmTimestamp();
   lines.push(
-    ['H', `${d.repeat}${d.component}${d.escape}`, '', fmt.password, opts.senderId, '', '', '', '', opts.receiverId, '', 'P', fmt.version, headerStamp(fmt)].join(F),
+    renderRecord(fmt.header, {
+      $delims: `${d.repeat}${d.component}${d.escape}`,
+      $sender: opts.senderId,
+      $receiver: opts.receiverId,
+      $stamp: fmt.timestamp === 'date' ? stamp.slice(0, 8) : stamp,
+    }, d),
   );
-
-  /** "^^^CODE" or "^^^CODE^^^1", per dialect. */
-  const universalId = (code: string) => ['', '', '', code, ...fmt.testIdTail].join(d.component);
-
-  // O|<seq>|<specimenId>||<universal>|<priority>[|||||||O|||<specimenType>]
-  const orderRecord = (seq: number, o: OrderDownload, universal: string): string =>
-    fmt.fullOrderRecord
-      ? ['O', String(seq), o.sampleId, '', universal, o.priority ?? 'R', '', '', '', '', '', '', 'O', '', '', o.specimenType ?? ''].join(F)
-      : ['O', String(seq), o.sampleId, '', universal, o.priority ?? 'R'].join(F);
 
   orders.forEach((o, i) => {
     const seq = i + 1;
 
     if (opts.sendDemographics && o.patient) {
       const p = o.patient;
-      const name = [p.lastName ?? '', p.firstName ?? '', p.middleName ?? ''].join(d.component);
-      // P|<seq>|<practicePID>|<labPID>||<name>||<birth>|<sex>
-      lines.push(['P', String(seq), p.patientId ?? '', '', '', name, '', p.birthDate ?? '', p.sex ?? ''].join(F));
+      lines.push(
+        renderRecord(fmt.patient, {
+          $seq: String(seq),
+          $patientId: p.patientId ?? '',
+          $name: [p.lastName ?? '', p.firstName ?? '', p.middleName ?? ''].join(d.component),
+          $birth: p.birthDate ?? '',
+          $sex: p.sex ?? '',
+        }, d),
+      );
     } else {
-      lines.push(['P', String(seq), ...Array<string>(fmt.emptyPatientFields).fill('')].join(F));
+      lines.push(renderRecord(fmt.patientAnonymous, { $seq: String(seq) }, d));
     }
+
+    const orderRecord = (n: number, codes: readonly string[]) =>
+      renderRecord(fmt.order, {
+        $seq: String(n),
+        $sample: o.sampleId,
+        $tests: fmt.tests.encode(codes, d),
+        $priority: o.priority ?? 'R',
+        $specimen: o.specimenType ?? '',
+      }, d);
 
     if (fmt.orderPerTest) {
       // ASTM restarts the sequence number for each new parent record, so the O
-      // records count 1..n within this patient — matching the Snibe example.
-      o.testCodes.forEach((code, k) => lines.push(orderRecord(k + 1, o, universalId(code))));
+      // records count 1..n within this patient.
+      o.testCodes.forEach((code, k) => lines.push(orderRecord(k + 1, [code])));
     } else {
-      // Assays repeat-delimited into one O, e.g. "^^^GluH_3^^^1\^^^NA^^^1".
-      lines.push(orderRecord(seq, o, o.testCodes.map(universalId).join(d.repeat)));
+      lines.push(orderRecord(seq, o.testCodes));
     }
   });
 
-  // L|1|N
-  lines.push(['L', '1', 'N'].join(F));
+  lines.push(renderRecord(fmt.terminator, {}, d));
   return lines;
 }
 
-/** H field 14, at the granularity this dialect's own headers use. */
-function headerStamp(fmt: OrderFormat, dt = new Date()): string {
-  const ts = astmTimestamp(dt);
-  return fmt.timestamp === 'date' ? ts.slice(0, 8) : ts;
-}
 
 /** ASTM timestamp YYYYMMDDHHMMSS in local time. */
 export function astmTimestamp(dt = new Date()): string {

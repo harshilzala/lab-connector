@@ -10,6 +10,7 @@ import { createProtocolLink } from '../codec/index.js';
 import { SpoolQueue } from '../queue/spool.js';
 import { normalizeBarcode, toLisResultRows, toResultUploads } from '../mapping/mapper.js';
 import { formatApiDate, normalizePending } from '../hmis/pending.js';
+import { assayKey } from '../codec/astm/records.js';
 
 /** Barcodes retained for result-time labResultId lookup. */
 const ORDER_ROW_CACHE_MAX = 500;
@@ -35,9 +36,15 @@ export interface AnalyzerStatus {
 // protocol link, host-query order-download, and durable result upload.
 //
 //   inbound query   → GET  {pendingPath} → sendOrders() back to the analyzer
-//                                        → POST {acknowledgePath}
 //   inbound results → spool.enqueue      → worker POSTs {resultsPath}
+//                                        → POST {acknowledgePath}
 //                                          (durable store-and-forward)
+//
+// The acknowledge is the LAST step, not part of the download. A pending row is
+// retired when its RESULT is filed, not when the order is handed to the
+// analyzer — so an order that is downloaded and then never resulted stays
+// pending and is offered again, rather than being silently retired with no
+// value against it.
 // =============================================================================
 export class AnalyzerRuntime {
   private readonly link: ProtocolLink;
@@ -75,7 +82,15 @@ export class AnalyzerRuntime {
       // for this barcode before sending. Done HERE, at delivery time, so a
       // lookup failure is retried by the spool rather than losing the result.
       const orderRows = await this.resolveOrderRows(payload.barcode);
-      const { rows, unmatched } = toLisResultRows(payload, orderRows);
+      // HMIS spells the assay identifier the way the ANALYZER does, which for a
+      // VITROS is the full "1.000000+032+1" rather than the "032" the codec
+      // reports. Join on the dialect's canonical key so the two meet.
+      const { rows, unmatched, matched } = toLisResultRows(
+        payload,
+        orderRows,
+        this.cfg.protocol === 'astm' ? assayKey(this.cfg.astm.dialect) : undefined,
+        this.cfg.testCodeAliases,
+      );
 
       if (unmatched.length) {
         this.log.warn(
@@ -94,6 +109,26 @@ export class AnalyzerRuntime {
         { barcode: payload.barcode, filed: res.filed, sent: rows.length, message: res.message },
         'results filed to HMIS',
       );
+
+      // Acknowledge LAST — only rows whose result the server has actually
+      // filed are marked transmitted. A row stays pending until its value is
+      // in, so an order that is downloaded but never resulted (analyzer error,
+      // sample recollected, connector restarted mid-run) is still offered on
+      // the next host query instead of being silently retired.
+      //
+      // Deliberately NOT fatal: the results are already saved, so throwing
+      // would requeue the item and re-POST them. The cost of a failure here is
+      // that the rows stay pending and may be downloaded again — the same cost
+      // the acknowledge has always had, and much cheaper than a double file.
+      try {
+        await this.hmis.acknowledge(matched);
+        this.log.info({ barcode: payload.barcode, rows: matched.length }, 'pending rows acknowledged after filing');
+      } catch (err) {
+        this.log.error(
+          { barcode: payload.barcode, rows: matched.length, err: err instanceof Error ? err.message : String(err) },
+          'acknowledge failed AFTER results were filed — rows stay pending and may be downloaded again',
+        );
+      }
     });
     await this.link.start();
     this.log.info({ endpoint: this.cfg.transport.type }, 'analyzer runtime started');
@@ -198,20 +233,10 @@ export class AnalyzerRuntime {
       await this.link.sendOrders([order]);
       this.log.info({ barcode, tests: pending.testCodes }, 'order download sent to analyzer');
 
-      // Acknowledge only now that the analyzer has the work. A failed download
-      // must leave the rows pending so the next host query offers them again.
-      try {
-        await this.hmis.acknowledge(pending.ackItems);
-        this.log.info({ barcode, rows: pending.ackItems.length }, 'pending rows acknowledged');
-      } catch (err) {
-        // The analyzer already holds the order, so this is not fatal — the rows
-        // are simply offered again. Loud, because a persistent failure here is
-        // what produces duplicate downloads.
-        this.log.error(
-          { barcode, rows: pending.ackItems.length, err: err instanceof Error ? err.message : String(err) },
-          'acknowledge failed — rows stay pending and may be downloaded again',
-        );
-      }
+      // NOT acknowledged here. A downloaded order is not finished work — the
+      // row is retired only once its result has been filed, in the spool
+      // handler. Until then it stays pending, so re-querying the same barcode
+      // simply downloads it again, which is harmless and self-healing.
     } catch (err) {
       this.log.error({ barcode, err: err instanceof Error ? err.message : String(err) }, 'host-query failed');
     }
@@ -259,8 +284,8 @@ export class AnalyzerRuntime {
     const cached = this.orderRowCache.get(lookup);
     if (cached?.length) return cached;
 
-    // includeTransmitted: the rows were acknowledged at download time, so the
-    // server may now be flagging them as transmitted.
+    // includeTransmitted: a re-sent or corrected result must still find its
+    // rows after a previous upload already acknowledged them.
     const pending = await this.fetchPending(lookup, true);
     if (pending.ackItems.length) this.rememberOrderRows(lookup, pending.ackItems);
     return pending.ackItems;
