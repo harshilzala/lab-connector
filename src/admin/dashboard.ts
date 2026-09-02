@@ -80,6 +80,20 @@ main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40
 .kv .v { color:var(--ink); font-weight:600; }
 .card-body { padding:14px 18px 18px; }
 
+/* ---- maximize: one machine fills the view, the rest step aside ---- */
+.card-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+.btn-max {
+  border:1px solid var(--line); background:#fff; color:var(--mut); cursor:pointer;
+  font:700 12px/1 var(--font); padding:6px 10px; border-radius:7px; white-space:nowrap;
+  transition:background .15s,color .15s,border-color .15s;
+}
+.btn-max:hover { color:var(--teal-700); border-color:var(--teal-700); background:#fbfbfc; }
+.grid.has-max { grid-template-columns:1fr; }
+.grid.has-max .card:not(.is-max) { display:none; }
+/* The whole point of maximizing is to read the wire log, so give the panel the
+   height the grid layout could not. */
+.card.is-max .panel { max-height:calc(100vh - 360px); min-height:420px; }
+
 .tabs { display:flex; gap:6px; margin:0 0 12px; background:#f2f0f1; padding:4px; border-radius:10px; }
 .tabs button {
   flex:1; border:0; background:transparent; color:var(--mut); cursor:pointer;
@@ -219,7 +233,9 @@ ${FONT_LINK}
 </div>
 
 <script>
-const state = { open: null, tab: 'wire' };
+// state.max is the id of the maximized machine, or null for the normal grid.
+// state.analyzers caches the last poll so toggling repaints without a fetch.
+const state = { open: null, tab: 'wire', max: null, analyzers: [] };
 
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function time(iso) { return iso ? new Date(iso).toLocaleTimeString() : '\u2014'; }
@@ -266,15 +282,28 @@ function renderStats(analyzers) {
 }
 
 function renderCards(analyzers) {
-  document.getElementById('cards').innerHTML = analyzers.map(a => \`
-    <article class="card">
+  state.analyzers = analyzers;
+  // An analyzer dropped from the config must not leave the grid stuck on a
+  // card that no longer renders.
+  if (state.max && !analyzers.some(a => a.id === state.max)) state.max = null;
+
+  const grid = document.getElementById('cards');
+  grid.classList.toggle('has-max', !!state.max);
+  grid.innerHTML = analyzers.map(a => \`
+    <article class="card \${state.max === a.id ? 'is-max' : ''}">
       <div class="card-top">
         <div class="card-title">
           <div>
             <h3>\${esc(a.equipmentCode)}</h3>
             <div class="id">\${esc(a.id)}</div>
           </div>
-          \${statusPill(a)}
+          <div class="card-actions">
+            \${statusPill(a)}
+            <button class="btn-max" type="button" data-max="\${esc(a.id)}"
+                    title="\${state.max === a.id ? 'Back to all machines (Esc)' : 'Show only this machine'}">
+              \${state.max === a.id ? '&#8600; Normal view' : '&#8599; Maximize'}
+            </button>
+          </div>
         </div>
         <div class="meta">
           <span class="tag">\${esc(a.protocol.toUpperCase())}</span>
@@ -297,6 +326,10 @@ function renderCards(analyzers) {
       </div>
     </article>\`).join('');
 
+  document.querySelectorAll('button[data-max]').forEach(b => {
+    b.onclick = () => setMax(state.max === b.dataset.max ? null : b.dataset.max);
+  });
+
   document.querySelectorAll('button[data-a]').forEach(b => {
     b.onclick = () => {
       state.open = b.dataset.a;
@@ -308,6 +341,21 @@ function renderCards(analyzers) {
     };
   });
 }
+
+/** Switch between the grid and a single maximized machine. */
+function setMax(id) {
+  state.max = id;
+  // Maximizing is always "I want to watch this one", so open its panel rather
+  // than leaving the card showing "Pick a view above".
+  if (id) state.open = id;
+  renderCards(state.analyzers);
+  if (state.open) renderPanel(state.open);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && state.max) setMax(null);
+});
 
 async function renderPanel(id) {
   const el = document.getElementById('panel-' + id);

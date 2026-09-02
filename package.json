@@ -37,7 +37,7 @@
     "replay": "tsx test/replay-message.ts",
     "h360:join": "tsx test/h360-hmis-join.test.ts",
     "ack": "tsx test/ack-after-file.test.ts",
-    "pm2:logrotate": "pm2 install pm2-logrotate && pm2 set pm2-logrotate:max_size 10M && pm2 set pm2-logrotate:retain 7 && pm2 set pm2-logrotate:compress true && pm2 set pm2-logrotate:rotateInterval \"0 0 * * *\" && pm2 set pm2-logrotate:dateFormat YYYY-MM-DD_HH-mm-ss && pm2 set pm2-logrotate:rotateModule true && pm2 set pm2-logrotate:workerInterval 30"
+    "pm2:logrotate": "node scripts/setup-logrotate.mjs"
   },
   "dependencies": {
     "pino": "^9.5.0",

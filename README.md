@@ -200,6 +200,12 @@ That sets daily rotation, `retain 7` and gzip — a 7-day window matching
 `retention.days`, with a 10 MB size cap so a log storm rotates early. Rotated
 files stop being written, so the sweeper then expires them as a backstop.
 
+The script (`scripts/setup-logrotate.mjs`) is idempotent: it reads the current
+module config and writes only the keys that differ, so a re-run on a configured
+machine prints "nothing to do" and restarts nothing. Do NOT chain `pm2 set`
+calls by hand — each one restarts the module and re-prints its whole config,
+which looks alarmingly like a stuck loop.
+
 Verify with `pm2 conf pm2-logrotate`.
 
 ## ⚠️ Confirm against the vendor spec before go-live
