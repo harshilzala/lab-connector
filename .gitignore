@@ -23,3 +23,11 @@ admin-auth.json
 
 # curl cookie jar from dashboard testing — carries a live session id.
 cookies.txt
+
+# wire captures from npm run sniff / sniff:tcp
+captures/
+
+# throwaway scratch files (scripts, staged samples) — never committed
+.scratch/
+
+config.json

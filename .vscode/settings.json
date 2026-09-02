@@ -1,0 +1,8 @@
+{
+  // config.json is read as JSONC (see src/config.ts) so it can carry a
+  // commented-out COM-mode transport beside the live TCP one. Tell the editor
+  // that too, or it flags every one of those lines as a JSON syntax error.
+  "files.associations": {
+    "config.json": "jsonc"
+  }
+}
