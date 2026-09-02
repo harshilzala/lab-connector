@@ -16,7 +16,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "simulator": "tsx test/analyzer-simulator.ts",
-    "dialects": "tsx test/maglumi-check.ts",
+    "dialects": "tsx test/dialects-check.ts",
     "sniff": "tsx test/serial-sniff.ts",
     "ping": "tsx test/ping-server.ts",
     "install-service": "node dist/index.js --install-service",
@@ -27,7 +27,16 @@
     "pm2:delete": "pm2 delete ecosystem.config.cjs",
     "pm2:logs": "pm2 logs lab-connector",
     "pm2:status": "pm2 status",
-    "pm2:save": "pm2 save"
+    "pm2:save": "pm2 save",
+    "sniff:tcp": "tsx test/tcp-sniff.ts",
+    "kermit": "tsx test/kermit-check.ts",
+    "kermit:corpus": "tsx test/kermit-corpus.ts",
+    "h360": "tsx test/hl7-h360.test.ts",
+    "h360:corpus": "tsx test/h360-corpus.ts",
+    "config": "tsx test/config-jsonc.test.ts",
+    "replay": "tsx test/replay-message.ts",
+    "h360:join": "tsx test/h360-hmis-join.test.ts",
+    "ack": "tsx test/ack-after-file.test.ts"
   },
   "dependencies": {
     "pino": "^9.5.0",

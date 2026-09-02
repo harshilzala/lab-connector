@@ -21,8 +21,8 @@
   "analyzers": [
     {
       "id": "meglumi",
-      "equipmentCode": "EC011",
-      "equipmentId": 17754021,
+      "equipmentCode": "MGAPI1000",
+      "equipmentId": 222127293,
 
       "protocol": "astm",
 

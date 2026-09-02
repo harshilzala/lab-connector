@@ -1,5 +1,4 @@
-[
-  {
+{
   "logLevel": "info",
   "spoolDir": "./spool",
   "hmis": {
@@ -78,59 +77,3 @@
     }
   ]
 }
-
-,
-{
-  
-  "logLevel": "info",
-  "spoolDir": "./spool",
-
-  "hmis": {
-    "baseUrl": "https://hims.zhhrpl.in/live/portal",
-    "pendingPath": "/mirth/pending",
-    "acknowledgePath": "/mirth/acknowledge",
-    "resultsPath": "/mirth/labresult",
-    "timeoutMs": 15000,
-    "tlsRejectUnauthorized": true
-  },
-
-  "admin": {
-    "host": "127.0.0.1",
-    "port": 7071,
-    "authFile": "./admin-auth.json"
-  },
-
-  "analyzers": [
-    {
-      "id": "meglumi",
-      "equipmentCode": "EC011",
-      "equipmentId": 17754021,
-
-      "protocol": "astm",
-
-      "transport": {
-        "type": "tcp",
-        "mode": "server",
-        "host": "10.11.100.101",
-        "port": 2807
-      },
-
-      "sendDemographics": false,
-      "hostQuery": true,
-
-      "qc": {
-        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
-        "sampleIdRegex": null
-      },
-
-      "astm": {
-        "ackTimeoutMs": 15000,
-        "frameMaxData": 240,
-        "senderId": "HMIS-LIS",
-        "receiverId": "Lis",
-        "dialect": "maglumi"
-      }
-    }
-  ]
-}
-]

@@ -5,9 +5,10 @@ import type { ProtocolLink } from './types.js';
 import { AstmLink } from './astm/link.js';
 import { Advia2120Link } from './advia/link.js';
 import { ClinitekAdvantusLink } from './clinitek/link.js';
+import { KermitLink } from './kermit/link.js';
+import { Hl7Link } from './hl7/link.js';
 
-// Factory for the pluggable protocol layer. Add HL7 here when needed:
-//   case 'hl7': return new Hl7Link(transport, { ...mllp opts });
+// Factory for the pluggable protocol layer.
 export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transport, logger: Logger): ProtocolLink {
   switch (analyzer.protocol) {
     case 'astm':
@@ -27,7 +28,26 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
     case 'clinitek-advantus':
       return new ClinitekAdvantusLink(transport, { logger: logger.child({ codec: 'clinitek-advantus' }) });
     case 'hl7':
-      throw new Error('HL7 codec not implemented yet — set protocol to "astm" or add Hl7Link.');
+      // HL7 v2 over MLLP — the Erba H360 hematology analyzer. See src/codec/hl7/.
+      return new Hl7Link(transport, {
+        sendingApp: analyzer.hl7.sendingApp,
+        sendingFacility: analyzer.hl7.sendingFacility,
+        charset: analyzer.hl7.charset,
+        ack: analyzer.hl7.ack,
+        valueTypes: analyzer.hl7.valueTypes,
+        encoding: analyzer.hl7.encoding,
+        idleFlushMs: analyzer.hl7.idleFlushMs,
+        logger: logger.child({ codec: 'hl7' }),
+      });
+    case 'kermit':
+      // The VITROS 250/350 chemistry systems do NOT speak ASTM on this link —
+      // they exchange sample programs as Kermit file transfers, so this is a
+      // separate protocol rather than an ASTM dialect.
+      return new KermitLink(transport, {
+        ackTimeoutMs: analyzer.kermit.ackTimeoutMs,
+        maxRetries: analyzer.kermit.maxRetries,
+        logger: logger.child({ codec: 'kermit' }),
+      });
     default:
       throw new Error(`Unknown protocol: ${analyzer.protocol}`);
   }
