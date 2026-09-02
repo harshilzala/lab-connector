@@ -14,8 +14,9 @@ import type {
 // afterwards.
 //
 // Field naming is only pinned down for the columns the /mirth/acknowledge body
-// echoes (sampleID, equipmentId, identifier, ipAddress, isTransmitted,
-// labResultId, labServiceId, portNo, parameterId). Patient and specimen columns
+// carries (sampleID, equipmentId, identifier, ipAddress, isTransmitted,
+// labResultId, labServiceId, portNo, parameterId). All are echoed from the
+// pending row except isTransmitted, which the connector asserts as true. Patient and specimen columns
 // vary per deployment, so every lookup goes through `pick()` with a list of
 // aliases and anything unmatched is simply left null — never guessed.
 // =============================================================================
@@ -106,9 +107,13 @@ export function normalizePending(body: unknown, opts: NormalizeOptions): Pending
       equipmentId: (row.equipmentId as number | string | undefined) ?? opts.equipmentId ?? null,
       identifier: testCode,
       ipAddress: String(row.ipAddress ?? opts.ipAddress ?? ''),
-      // Echo the row's own flag (false on a fresh pending row) — the server is
-      // what flips it, we only report which rows we handed to the analyzer.
-      isTransmitted: row.isTransmitted === true,
+      // ASSERTED, not echoed. This body is only ever sent once the analyzer
+      // has the work and its result has been filed, so the row genuinely is
+      // transmitted. Echoing the pending row's own flag sent `false` — which
+      // the gateway wrote straight back, making the acknowledge a no-op: the
+      // result filed correctly while the order sat in the pending queue and
+      // was re-downloaded on every subsequent host query.
+      isTransmitted: true,
       labResultId: toNumber(row.labResultId),
       labServiceId: toNumber(row.labServiceId),
       portNo: String(row.portNo ?? opts.portNo ?? ''),

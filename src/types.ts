@@ -108,6 +108,8 @@ export interface MirthAcknowledgeItem {
   equipmentId: string | number | null;
   identifier: string;
   ipAddress: string;
+  /** Always true: the connector only acknowledges rows it has actually
+   *  downloaded and filed. It is an assertion to the gateway, not an echo. */
   isTransmitted: boolean;
   labResultId: number | null;
   labServiceId: number | null;

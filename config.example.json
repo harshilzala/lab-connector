@@ -2,13 +2,21 @@
   {
   "logLevel": "info",
   "spoolDir": "./spool",
+
+  "retention": {
+    "days": 7,
+    "sweepIntervalHours": 6,
+    "logDir": "./logs",
+    "includeSpoolPending": true
+  },
   "hmis": {
     "baseUrl": "https://hmis.your-hospital.com",
     "pendingPath": "/mirth/pending",
     "acknowledgePath": "/mirth/acknowledge",
     "resultsPath": "/mirth/results",
     "timeoutMs": 15000,
-    "tlsRejectUnauthorized": true
+    "tlsRejectUnauthorized": true,
+    "auditLog": "./logs/hmis.log"
   },
   "admin": {
     "host": "127.0.0.1",
@@ -83,13 +91,21 @@
   "logLevel": "info",
   "spoolDir": "./spool",
 
+  "retention": {
+    "days": 7,
+    "sweepIntervalHours": 6,
+    "logDir": "./logs",
+    "includeSpoolPending": true
+  },
+
   "hmis": {
     "baseUrl": "https://hims.zhhrpl.in/live/portal",
     "pendingPath": "/mirth/pending",
     "acknowledgePath": "/mirth/acknowledge",
     "resultsPath": "/mirth/labresult",
     "timeoutMs": 15000,
-    "tlsRejectUnauthorized": true
+    "tlsRejectUnauthorized": true,
+    "auditLog": "./logs/hmis.log"
   },
 
   "admin": {

@@ -154,7 +154,28 @@ const ConfigSchema = z.object({
     resultsPath: z.string().default('/mirth/results'),
     timeoutMs: z.number().int().positive().default(15000),
     tlsRejectUnauthorized: z.boolean().default(true),
+    /** Line-delimited JSON record of every gateway call: the query for a
+     *  sample and whether orders came back, and each result upload with the
+     *  response it got. Set to null to switch the file off. */
+    auditLog: z.string().nullable().default('./logs/hmis.log'),
+    /** Rotate to <file>.1 past this size; one generation is kept. */
+    auditMaxBytes: z.number().int().positive().default(10 * 1024 * 1024),
   }),
+  /** Housekeeping: how long logs and unfiled spool items are kept on disk. */
+  retention: z
+    .object({
+      /** Keep-window in days; older files are deleted. 0 disables the sweep. */
+      days: z.number().int().nonnegative().default(7),
+      /** Swept at startup and then on this interval. */
+      sweepIntervalHours: z.number().positive().default(6),
+      /** Directory holding the application and HMIS logs. */
+      logDir: z.string().default('./logs'),
+      /** Sweep spool/<id>/pending too. Both buckets hold results that never
+       *  reached HMIS, so either way a deletion loses one — set false to keep
+       *  undelivered work indefinitely and clear only failed/. */
+      includeSpoolPending: z.boolean().default(true),
+    })
+    .default({ days: 7, sweepIntervalHours: 6, logDir: './logs', includeSpoolPending: true }),
   admin: z
     .object({
       host: z.string().default('127.0.0.1'),
