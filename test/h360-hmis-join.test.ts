@@ -127,4 +127,25 @@ for (const r of rows) {
 }
 console.log('✓ every filed row carries labResultId / labServiceId / parameterId');
 
+// equipmentId names the machine that produced the value, so it comes from
+// config.json — NOT from the pending row, which carries whichever equipment the
+// order happened to be raised against.
+{
+  assert.ok(analyzer.equipmentId, 'the H360 config sets an equipmentId');
+  for (const r of rows) {
+    assert.equal(r.equipmentId, analyzer.equipmentId, `${r.identifier} must report the configured equipmentId`);
+  }
+  // Pending rows saying something else must not win.
+  const otherEq = orderRows.map((o) => ({ ...o, equipmentId: 999999999 }));
+  const viaOther = toLisResultRows(upload, otherEq, undefined, analyzer.testCodeAliases);
+  for (const r of viaOther.rows) {
+    assert.equal(r.equipmentId, analyzer.equipmentId, 'config wins over the pending row');
+  }
+  // …but a config with no id still falls back rather than sending null.
+  const noId = toResultUploads({ ...analyzer, equipmentId: undefined } as never, parsed)[0]!;
+  const viaFallback = toLisResultRows(noId, otherEq, undefined, analyzer.testCodeAliases);
+  assert.equal(viaFallback.rows[0]!.equipmentId, 999999999, 'falls back to the pending row when config omits it');
+  console.log(`✓ equipmentId comes from config.json (${analyzer.equipmentId}), with the pending row as fallback`);
+}
+
 console.log('\nALL H360 → ZHFC03 JOIN TESTS PASSED');

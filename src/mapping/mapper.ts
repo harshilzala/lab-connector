@@ -154,7 +154,12 @@ export function toLisResultRows(
       sampleId: upload.barcode,
       labServiceId: ctx.labServiceId,
       labResultId: ctx.labResultId,
-      equipmentId: ctx.equipmentId ?? upload.equipmentId,
+      // The analyzer's OWN equipmentId, from config.json, is authoritative: it
+      // names the machine that actually produced the value. The pending row's
+      // equipmentId names whichever equipment the order was raised against,
+      // which is not necessarily the same machine, and is only a fallback for
+      // an analyzer whose config omits the id.
+      equipmentId: upload.equipmentId ?? ctx.equipmentId,
       ipAddress: ctx.ipAddress,
       portNo: ctx.portNo,
       identifier: ctx.identifier,

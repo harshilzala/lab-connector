@@ -158,14 +158,18 @@ export interface HmisResultUpload {
  * deserializes into `java.util.List<com.his.lab.domain.LisInboundResults>`.
  *
  * The endpoint takes a BARE ARRAY of these; there is no wrapper object. Every
- * identifier except `resultValue` comes from the pending row the order was
- * downloaded from, NOT from the analyzer — `labResultId` is what the server
- * files against, so a result with no matching pending row cannot be uploaded.
+ * identifier except `resultValue` and `equipmentId` comes from the pending row
+ * the order was downloaded from, NOT from the analyzer — `labResultId` is what
+ * the server files against, so a result with no matching pending row cannot be
+ * uploaded.
  */
 export interface LisInboundResultRow {
   sampleId: string;
   labServiceId: number | null;
   labResultId: number | null;
+  /** The analyzer's configured `equipmentId` (config.json), identifying the
+   *  machine that produced the value. Falls back to the pending row's id only
+   *  when the analyzer config omits one. */
   equipmentId: string | number | null;
   ipAddress: string;
   portNo: string;
