@@ -1,96 +1,23 @@
-[
-  {
-  "logLevel": "info",
-  "spoolDir": "./spool",
-
-  "retention": {
-    "days": 7,
-    "sweepIntervalHours": 6,
-    "logDir": "./logs",
-    "includeSpoolPending": true
-  },
-  "hmis": {
-    "baseUrl": "https://hmis.your-hospital.com",
-    "pendingPath": "/mirth/pending",
-    "acknowledgePath": "/mirth/acknowledge",
-    "resultsPath": "/mirth/results",
-    "timeoutMs": 15000,
-    "tlsRejectUnauthorized": true,
-    "auditLog": "./logs/hmis.log"
-  },
-  "admin": {
-    "host": "127.0.0.1",
-    "port": 7071,
-    "authFile": "./admin-auth.json"
-  },
-  "analyzers": [
-    {
-      "id": "eq1",
-      "equipmentCode": "eq1",
-      "equipmentId": 1001,
-      "protocol": "astm",
-      "transport": {
-        "type": "tcp",
-        "mode": "server",
-        "host": "0.0.0.0",
-        "port": 3010
-      },
-      "sendDemographics": true,
-      "hostQuery": true,
-      "qc": {
-        "sampleIdPrefixes": [
-          "QC",
-          "QC-",
-          "CTRL",
-          "CONTROL"
-        ],
-        "sampleIdRegex": null
-      },
-      "astm": {
-        "ackTimeoutMs": 15000,
-        "frameMaxData": 240,
-        "senderId": "HMIS-LIS",
-        "receiverId": "EQID",
-        "dialect": "atellica"
-      }
-    },
-    {
-      "id": "eq02",
-      "equipmentCode": "eq2",
-      "equipmentId": 1002,
-      "protocol": "astm",
-      "transport": {
-        "type": "tcp",
-        "mode": "server",
-        "host": "0.0.0.0",
-        "port": 3011
-      },
-      "sendDemographics": true,
-      "hostQuery": true,
-      "qc": {
-        "sampleIdPrefixes": [
-          "QC",
-          "QC-",
-          "CTRL",
-          "CONTROL"
-        ],
-        "sampleIdRegex": null
-      },
-      "astm": {
-        "ackTimeoutMs": 15000,
-        "frameMaxData": 240,
-        "senderId": "HMIS-LIS",
-        "receiverId": "eq",
-        "dialect": "atellica"
-      }
-    }
-  ]
-},
 {
-  
+  // ===========================================================================
+  // Template for config.json. Copy it and fill in the real values:
+  //
+  //     cp config.example.json config.json
+  //
+  // config.json is gitignored, so the live values (site IPs, HMIS equipment
+  // codes) stay out of version control and THIS file is the only committed
+  // record of the shape. Keep it in step when the schema changes — and keep
+  // real hosts, equipment codes and the production HMIS URL OUT of it.
+  //
+  // Read as JSONC: `//` and `/* */` comments and trailing commas are allowed,
+  // so an alternative transport can be parked beside the live one instead of
+  // being deleted (see the commented serial blocks below).
+  // ===========================================================================
+
   "logLevel": "info",
   "spoolDir": "./spool",
 
+  // Housekeeping for the rolling logs and the delivered-result spool.
   "retention": {
     "days": 7,
     "sweepIntervalHours": 6,
@@ -98,8 +25,12 @@
     "includeSpoolPending": true
   },
 
+  // The three /mirth/* endpoints. UNAUTHENTICATED — the analyzer is identified
+  // only by the `eqCode` query parameter, so keep the connector on the lab VLAN.
+  // resultsPath differs per deployment ("/mirth/results" vs "/mirth/labresult");
+  // confirm it against the gateway before going live.
   "hmis": {
-    "baseUrl": "https://hims.zhhrpl.in/live/portal",
+    "baseUrl": "https://hmis.example-hospital.local/live/portal",
     "pendingPath": "/mirth/pending",
     "acknowledgePath": "/mirth/acknowledge",
     "resultsPath": "/mirth/labresult",
@@ -116,21 +47,45 @@
 
   "analyzers": [
     {
-      "id": "meglumi",
-      "equipmentCode": "EC011",
-      "equipmentId": 17754021,
+      // ---------------------------------------------------------------------
+      // ASTM E1381/E1394 — e.g. VITROS ECi/ECiQ immunodiagnostic.
+      //
+      // `dialect` selects the vendor's record layout from the dialect library
+      // (src/codec/astm/dialects.ts). An analyzer SILENTLY IGNORES an order it
+      // cannot parse, so the wrong dialect looks exactly like a dead cable.
+      // Entries today: "atellica", "maglumi", "vitros-eciq".
+      // ---------------------------------------------------------------------
+      "id": "example-astm",
+      "equipmentCode": "EQCODE01",
+      "equipmentId": 100000001,
 
       "protocol": "astm",
 
+      // Serial alternative — an analyzer cabled straight to this PC, or one
+      // behind a Moxa NPort left in Real COM mode.
+      // "transport": {
+      //   "type": "serial",
+      //   "path": "COM3",
+      //   "baudRate": 9600,
+      //   "dataBits": 8,
+      //   "stopBits": 1,
+      //   "parity": "none",
+      //   "dtr": true,
+      //   "rts": true
+      // },
+
+      // Through a Moxa NPort in TCP Server mode. "client" means WE dial it.
+      // A one-port NPort 5110 exposes serial port 1 on 4001 (NOT 4002); in
+      // Real COM mode it listens on 950/966 instead and 4001 is closed.
       "transport": {
         "type": "tcp",
-        "mode": "server",
-        "host": "0.0.0.0",
-        "port": 2807
+        "mode": "client",
+        "host": "10.0.0.10",
+        "port": 4001
       },
 
-      "sendDemographics": false,
-      "hostQuery": true,
+      "sendDemographics": true,
+      "hostQuery": false,
 
       "qc": {
         "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
@@ -140,11 +95,108 @@
       "astm": {
         "ackTimeoutMs": 15000,
         "frameMaxData": 240,
-        "senderId": "HMIS-LIS",
-        "receiverId": "Lis",
-        "dialect": "maglumi"
+        // Match what the analyzer's own header carries. A VITROS ECiQ sends
+        // sender "HOST" with NO receiver id, processing id or version.
+        "senderId": "HOST",
+        "receiverId": "",
+        "dialect": "vitros-eciq"
+      }
+    },
+    {
+      // ---------------------------------------------------------------------
+      // KERMIT — the VITROS 250/350 chemistry systems. These do NOT speak ASTM:
+      // sample programs and results move as named FILE TRANSFERS (SFILEn.D
+      // outbound, R00000nn inbound). A separate protocol, not an ASTM dialect,
+      // so there is no `dialect` key here.
+      // ---------------------------------------------------------------------
+      "id": "example-kermit",
+      "equipmentCode": "EQCODE02",
+      "equipmentId": 100000002,
+
+      "protocol": "kermit",
+
+      // "transport": {
+      //   "type": "serial",
+      //   "path": "COM2",
+      //   "baudRate": 9600,
+      //   "dataBits": 8,
+      //   "stopBits": 1,
+      //   "parity": "none",
+      //   "dtr": true,
+      //   "rts": true
+      // },
+
+      "transport": {
+        "type": "tcp",
+        "mode": "client",
+        "host": "10.0.0.11",
+        "port": 4001
+      },
+
+      "sendDemographics": true,
+      "hostQuery": false,
+
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+
+      "kermit": {
+        "ackTimeoutMs": 10000,
+        "maxRetries": 5
+      }
+    },
+    {
+      // ---------------------------------------------------------------------
+      // HL7 v2 over MLLP — e.g. Erba H360 haematology (CBC). The analyzer dials
+      // US, so this side listens: mode "server", host = this PC's own address
+      // on the lab VLAN.
+      // ---------------------------------------------------------------------
+      "id": "example-hl7",
+      "equipmentCode": "EQCODE03",
+      "machineId": 2002,
+
+      "protocol": "hl7",
+
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "10.0.0.5",
+        "port": 3010
+      },
+
+      // Echoed in the acknowledge body; derived from the transport when unset.
+      "ipAddress": "10.0.0.5",
+      "portNo": "3010",
+
+      "sendDemographics": false,
+      "hostQuery": false,
+
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+
+      // Analyzer assay code -> the HMIS `eqIdntifier` naming the same analyte,
+      // for cases where the two differ in NAME rather than spelling. Prefer
+      // fixing the Identifier column in HMIS so there is one source of truth;
+      // use this only for analytes HMIS names after the report line.
+      "testCodeAliases": {
+        // "HGB": "HAEMOGLOBIN",
+        // "LYM%": "Lymphocytes"
+      },
+
+      "hl7": {
+        "sendingApp": "LIS",
+        "sendingFacility": "",
+        "charset": "UNICODE",
+        "ack": true,
+        // OBX-2 value types that become filable results. ["NM"] keeps the
+        // numeric analytes and drops IS-typed run modes, remarks and flags.
+        "valueTypes": ["NM"],
+        "encoding": "utf8",
+        "idleFlushMs": 0
       }
     }
   ]
 }
-]
