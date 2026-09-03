@@ -25,6 +25,33 @@ export type Handler<T> = (payload: T, env: SpoolEnvelope<T>) => Promise<void>;
 
 const MAX_ATTEMPTS = 50;
 
+/**
+ * Fold an id into something the filesystem will actually accept.
+ *
+ * The spool id doubles as the filename stem — `listIds` reads it back out of
+ * readdir — so this must be applied at enqueue, not at write time, or the
+ * write and the subsequent read/remove would disagree on the path.
+ *
+ * Result ids are `<barcode>-<hash>`, and the barcode comes straight off the
+ * analyzer, so it is fully untrusted text: a Maglumi QC record arrived as
+ * `KN TG 2 <0.02` and Windows rejects `<` with ENOENT, which killed the write
+ * and dropped the result. Windows also bans > : " / \ | ? * and control
+ * characters, silently strips trailing dots and spaces, and reserves the old
+ * DOS device names.
+ *
+ * The 24-hex-char hash that makes a result id unique sits at the END, so an
+ * over-long id is trimmed from the front — trimming the tail would collide
+ * every message for one sample onto a single file.
+ */
+const RESERVED_DEVICE_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+export function safeSpoolId(id: string): string {
+  let s = id.replace(/[<>:"\/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/, '');
+  if (s.length > 120) s = s.slice(-120);
+  if (!s || RESERVED_DEVICE_NAME.test(s)) s = `id_${s}`;
+  return s;
+}
+
 export class SpoolQueue<T> {
   private readonly pendingDir: string;
   private readonly failedDir: string;
@@ -43,11 +70,16 @@ export class SpoolQueue<T> {
 
   /** Persist a payload durably. Returns the assigned id. */
   enqueue(payload: T, id = `${Date.now()}-${randomUUID()}`): string {
-    const env: SpoolEnvelope<T> = { id, createdAt: new Date().toISOString(), attempts: 0, payload };
-    this.writeAtomic(this.pendingDir, id, env);
+    const safeId = safeSpoolId(id);
+    if (safeId !== id) {
+      // Keeps the mapping visible when hunting for an item by barcode.
+      this.logger.warn({ id, safeId }, 'spool id contained characters the filesystem rejects — stored under a folded name');
+    }
+    const env: SpoolEnvelope<T> = { id: safeId, createdAt: new Date().toISOString(), attempts: 0, payload };
+    this.writeAtomic(this.pendingDir, safeId, env);
     // Kick the worker so delivery is near-immediate when online.
     queueMicrotask(() => this.drain());
-    return id;
+    return safeId;
   }
 
   start(handler: Handler<T>, intervalMs = 15_000): void {

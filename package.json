@@ -36,7 +36,8 @@
     "config": "tsx test/config-jsonc.test.ts",
     "replay": "tsx test/replay-message.ts",
     "h360:join": "tsx test/h360-hmis-join.test.ts",
-    "ack": "tsx test/ack-after-file.test.ts"
+    "ack": "tsx test/ack-after-file.test.ts",
+    "pm2:logrotate": "node scripts/setup-logrotate.mjs"
   },
   "dependencies": {
     "pino": "^9.5.0",

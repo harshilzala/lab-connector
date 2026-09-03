@@ -141,6 +141,73 @@ nssm set HmisLabConnector AppStderr "C:\lab-connector\logs\err.log"
 nssm start HmisLabConnector
 ```
 
+## Log & spool retention
+
+Three things grow on disk. Each is bounded, but by a different mechanism.
+
+| What | Where | Bounded by |
+|---|---|---|
+| HMIS transaction log | `logs/hmis.log` | self-rotates at `hmis.auditMaxBytes` (10 MB), keeps one generation |
+| PM2 stdout/stderr | `logs/lab-connector.{out,err}.log` | `pm2-logrotate` — see below |
+| Unfiled results | `spool/<analyzer>/{pending,failed}` | the retention sweeper |
+
+### The sweeper
+
+`src/maintenance/retention.ts` runs at startup and every `sweepIntervalHours`,
+deleting anything older than `retention.days` from `logDir` and from every
+analyzer's spool:
+
+```json
+"retention": {
+  "days": 7,
+  "sweepIntervalHours": 6,
+  "logDir": "./logs",
+  "includeSpoolPending": true
+}
+```
+
+Set `days: 0` to switch it off entirely.
+
+Spool age is read from the envelope's `createdAt`, not the file's mtime — a
+retry rewrites the file to bump `attempts`, and an item failing every 15s would
+otherwise look permanently fresh and never expire.
+
+**A spool item is a patient result that never reached HMIS.** Items are deleted
+the moment they file successfully, so anything still in `pending/` or `failed/`
+is unfiled work, and removing it discards it for good. Every such deletion is
+logged at warn with its barcode *before* the file goes:
+
+```
+warn discarding an unfiled result past the retention window
+  {"analyzer":"meglumi","bucket":"failed","id":"OLD001-aaa",
+   "barcode":"OLD001","results":1,"attempts":50,"days":7}
+```
+
+Set `includeSpoolPending: false` to keep undelivered work indefinitely and clear
+only `failed/`.
+
+### PM2 logs
+
+PM2 appends to `lab-connector.out.log` / `.err.log` forever and never rotates
+them. The sweeper cannot help: their mtime is always current, so they are never
+"old". Install the rotation module once per machine:
+
+```
+npm run pm2:logrotate
+```
+
+That sets daily rotation, `retain 7` and gzip — a 7-day window matching
+`retention.days`, with a 10 MB size cap so a log storm rotates early. Rotated
+files stop being written, so the sweeper then expires them as a backstop.
+
+The script (`scripts/setup-logrotate.mjs`) is idempotent: it reads the current
+module config and writes only the keys that differ, so a re-run on a configured
+machine prints "nothing to do" and restarts nothing. Do NOT chain `pm2 set`
+calls by hand — each one restarts the module and re-prints its whole config,
+which looks alarmingly like a stuck loop.
+
+Verify with `pm2 conf pm2-logrotate`.
+
 ## ⚠️ Confirm against the vendor spec before go-live
 
 The record field positions follow the **ASTM standard**, but the exact component
