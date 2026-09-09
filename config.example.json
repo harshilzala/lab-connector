@@ -144,13 +144,7 @@
 
       "kermit": {
         "ackTimeoutMs": 10000,
-        "maxRetries": 5,
-        // Pace the link like the vendor's own host does. The VITROS answers a
-        // packet faster than it can act on it, and a transfer sent flat out —
-        // or begun immediately after the previous one — is answered with
-        // "0005 INVALID PACKET USAGE". 1000ms matches the legacy VitrosDelayTime.
-        "interPacketDelayMs": 1000,
-        "interTransferDelayMs": 1000
+        "maxRetries": 5
       }
     },
     {
