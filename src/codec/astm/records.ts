@@ -82,7 +82,14 @@ function testCodeFromUniversalId(field: string | undefined, d: Delimiters, name?
 // Record POSITIONS here are vendor-neutral — they read every analyzer we have
 // logs for. Only the Universal Test ID's inner shape needs the dialect.
 // -----------------------------------------------------------------------------
-export function parseMessage(recordLines: string[], raw: string, name?: AstmDialect): ParsedMessage {
+export function parseMessage(
+  recordLines: string[],
+  raw: string,
+  name?: AstmDialect,
+  /** Which record carries the barcode HMIS keys on. See `sampleIdFrom` in
+   *  src/config.ts — "order" (the ASTM norm) for every analyzer but the ABL9. */
+  opts?: { sampleIdFrom?: 'order' | 'patient' },
+): ParsedMessage {
   // Records may arrive one-per-frame OR packed several-per-frame separated by CR
   // (the CareTech/Atellica host puts H/Q/L in a single ETX-terminated frame).
   // Split on CR/LF so every ASTM record is parsed regardless of framing style.
@@ -120,6 +127,13 @@ export function parseMessage(recordLines: string[], raw: string, name?: AstmDial
       }
       case 'O': {
         // 3 = specimen ID (the tube barcode / accession).
+        //
+        // Not every analyzer puts the barcode here. The Radiometer ABL9 either
+        // leaves it empty, keeping only its own run counter in the next field
+        // ("O|1||Sample #^5696|..."), or fills it with the patient's MRN
+        // ("O|1|10032022012933|Sample #^5696|..."). Either way its ZC tube
+        // barcode is on the P record — which is why that analyzer is configured
+        // sampleIdFrom:"patient"; see where the R record is built.
         currentSampleId = comps(f[2], d)[0]?.trim() || (f[2] || '').trim();
         break;
       }
@@ -148,7 +162,36 @@ export function parseMessage(recordLines: string[], raw: string, name?: AstmDial
         if (resultType && NON_REPORTABLE_RESULT_TYPES.has(resultType)) break;
 
         const result: InstrumentResult = {
-          sampleId: currentSampleId,
+          // WHICH FIELD IS THE BARCODE — the two orders, and why both exist.
+          //
+          // "order" (the default, and the ASTM norm): the specimen id on the O
+          // record, falling back to the P-record id when the O record named no
+          // specimen. Atellica and the VITROS family fill O-2 and never reach
+          // the fallback.
+          //
+          // "patient": the P-record id first. The Radiometer ABL9 needs this
+          // because it fills the two fields the other way round — the ZC tube
+          // barcode goes in the P record's laboratory-assigned patient id, and
+          // the patient's 14-digit MRN goes in the O record's specimen id:
+          //
+          //   P|1||ZC2608030162||paresh
+          //   O|1|10032022012933|Sample #^5696|...
+          //
+          // Measured over a month of ABL9 traffic (414 messages): 130 carry
+          // BOTH, and taking the O one there would file against an MRN HMIS
+          // never matches. The legacy integration filed the P value for exactly
+          // those samples — verified against its own InsertData_Param.txt.
+          //
+          // Where the chosen id is not a barcode HMIS knows, the result finds
+          // no pending row and waits visibly in the upload queue — the same
+          // outcome as any unmatched barcode, and a strictly better one than
+          // vanishing silently. It cannot cross-file onto another patient: the
+          // results endpoint writes against the labResultId carried by the
+          // matched pending row, never against this.
+          sampleId:
+            opts?.sampleIdFrom === 'patient'
+              ? currentPatient?.patientId || currentSampleId || ''
+              : currentSampleId || currentPatient?.patientId || '',
           testCode: testCodeFromUniversalId(f[2], d, name),
           value: (f[3] || '').trim(),
           unit: (f[4] || '').trim() || null,

@@ -100,12 +100,18 @@ for (const [i, block] of parked.entries()) {
   );
 }
 
-// The COM ports and line settings the legacy middleware ran on
-// (E:\API_Integration\Devices\{ECiQ,250}\*.exe.config: ComVal, .NET SerialPort
-// defaults of 9600 8-N-1). A sample that drifts from these is not a sample.
+// The COM ports and line settings the legacy middleware ran on (ComVal in
+// *.exe.config, with the .NET SerialPort defaults of 9600 8-N-1). A sample that
+// drifts from these is not a sample.
+//
+//   Nashik  E:\API_Integration\Devices\{ECiQ,250}   COM3 (ECiQ), COM2 (250)
+//   Cancer  D:\API Integration\Devices_Cancer\…     COM1 (ECiQ), COM2 (250)
+//
+// Both sites are listed because the parked block is the bench engineer's record
+// of the known-good cabling for whichever site this checkout is deployed to.
 const ports = parked.map((b) => /"path"\s*:\s*"([^"]+)"/.exec(b)?.[1]).filter(Boolean);
 for (const port of ports) {
-  assert.ok(['COM2', 'COM3'].includes(port!), `${port} is not a COM port the reference config used`);
+  assert.ok(['COM1', 'COM2', 'COM3'].includes(port!), `${port} is not a COM port the reference config used`);
 }
 if (ports.length) console.log(`✓ parked ports match the legacy reference: ${ports.join(', ')}`);
 

@@ -25,7 +25,7 @@
     "pm2:restart": "npm run build && pm2 restart ecosystem.config.cjs --update-env",
     "pm2:stop": "pm2 stop ecosystem.config.cjs",
     "pm2:delete": "pm2 delete ecosystem.config.cjs",
-    "pm2:logs": "pm2 logs lab-connector",
+    "pm2:logs": "pm2 logs Lab-Interface",
     "pm2:status": "pm2 status",
     "pm2:save": "pm2 save",
     "sniff:tcp": "tsx test/tcp-sniff.ts",
@@ -37,7 +37,18 @@
     "replay": "tsx test/replay-message.ts",
     "h360:join": "tsx test/h360-hmis-join.test.ts",
     "ack": "tsx test/ack-after-file.test.ts",
-    "pm2:logrotate": "node scripts/setup-logrotate.mjs"
+    "bc6000:allow": "tsx test/bc6000-allow-codes.test.ts",
+    "abl9:allow": "tsx test/abl9-allow-codes.test.ts",
+    "staged": "tsx test/staged-results.test.ts",
+    "orders": "tsx test/order-store.test.ts",
+    "import:old-orders": "tsx scripts/import-old-interface-orders.ts",
+    "connector-tool": "tsx test/connector-tool.test.ts",
+    "pm2:logrotate": "node scripts/setup-logrotate.mjs",
+    "bc6000": "tsx test/bc6000-ignore-codes.test.ts",
+    "vitros:pacing": "tsx test/vitros250-pacing.test.ts",
+    "prefixes": "tsx test/download-prefixes.test.ts",
+    "params": "tsx test/parameter-catalogue.test.ts",
+    "replay:0028": "tsx test/ch2609080028-replay.ts"
   },
   "dependencies": {
     "pino": "^9.5.0",

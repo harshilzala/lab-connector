@@ -1,0 +1,871 @@
+{
+  // ===========================================================================
+  // Lab-Interface / HMIS Lab Connector — CANCER SITE
+  //
+  // Equipment and communication settings mirror the retired .NET interface in
+  // E:\Devices_Cancer (originally D:\API Integration\Devices_Cancer on the
+  // Cancer PC). Each analyzer block records where its numbers came from.
+  //
+  // Legacy .exe.config -> this file:
+  //
+  //   folder            legacy app           legacy comms        MachineID
+  //   ----------------  -------------------  ------------------  ---------
+  //   ABL9              Lab Integration.exe  TCP listen :6080         523
+  //   Mindray_BC_6000   Lab Integration.exe  TCP listen :6060         624
+  //   ECiQ              Vitros_ECiQ.exe      serial COM1             2000
+  //   Vitros250         Vitros250.exe        serial COM2             2001
+  //
+  // ---------------------------------------------------------------------------
+  // EQUIPMENT CODES — locally defined, see the standard below.
+  //
+  // HMIS has ONE registration covering all four analyzers:
+  //
+  //   Equipment Code : EQ004
+  //   Equipment Name : API_Integration_Cancer Hospital
+  //   IP Address     : 10.12.19.43
+  //
+  // That is the middleware PC, not the instruments. This connector requires one
+  // code per analyzer — two machines sharing a code is refused outright
+  // (src/config.ts:365), because eqCode is the only thing separating machines
+  // on this API: sharing it would have one instrument acknowledging another's
+  // order rows and being programmed with another's tests.
+  //
+  // So the codes below are taken from what the site itself already records —
+  // the MachineName in each device's own .exe.config under E:\Devices_Cancer,
+  // verbatim:
+  //
+  //   ABL9\Lab Integration.exe.config             MachineName=Cancer_ABL9
+  //   Mindray_BC_6000\Lab Integration.exe.config  MachineName=Cancer_BC6000
+  //   ECiQ\Vitros_ECiQ.exe.config                 MachineName=VitrosECIQ
+  //   Vitros250\Vitros250.exe.config              MachineName=Vitros250
+  //
+  // These are the identities the Cancer Centre already uses for these four
+  // machines, they are unique per instrument, and they are not invented — which
+  // is why they are preferred over anything derived from EQ004. The matching
+  // numeric MachineID stays on each analyzer as `machineId`.
+  //
+  // ✔ VERIFIED 2026-09-07 — these codes ARE registered in HMIS and the gateway
+  //   DOES filter on them. A bulk pending poll per code returns that machine's
+  //   own rows only, each carrying its own equipmentId and IP:
+  //
+  //       ZCCEQ001  eqId 28394616  10.12.19.42   ECiQ        (TSH rows only)
+  //       ZCCEQ003  eqId 29688657  10.12.19.41   VITROS 250  (chemistry only)
+  //       ZCCEQ005  eqId 28746509  10.11.100.59  ABL9        (ABG only)
+  //       ZCCEQ004  eqId 30285205  10.12.19.43   ⚠ see below
+  //
+  //   ⚠ ZCCEQ004 is NOT the BC-6000. Its IP is 10.12.19.43 — the middleware PC,
+  //     i.e. the EQ004 "API_Integration_Cancer Hospital" aggregate — and it
+  //     returns EVERY machine's rows at once (CBC + TSH + chemistry, 28 rows in
+  //     one poll). Results-up on the BC-6000 still works because HMIS keys the
+  //     file on SampleID, but this code must never be given a worklist download:
+  //     it would program TSH and Calcium onto a haematology analyzer. Ask HMIS
+  //     for the BC-6000's own LabEquipment row and swap it in here.
+  //
+  // ---------------------------------------------------------------------------
+  // STILL OPEN BEFORE GO-LIVE:
+  //
+  //   1. Order download is now ON for the ECiQ and the VITROS 250 — the two
+  //      instruments that accept a worklist — because the eqCode check above
+  //      came back clean: each poll returns only that machine's rows.
+  //      It stays OFF on the ABL9 (accepts no worklist at all) and on the
+  //      BC-6000 (its code ZCCEQ004 is the middleware aggregate, and its HL7
+  //      link would answer a query with ORM^O01 where the analyzer expects
+  //      ORR^O02 — a code change, not a config flip).
+  //
+  //   2. transport.host on the two VITROS ("TODO-NPORT-..."). They are serial
+  //      instruments reached through Moxa NPort serial-device servers in TCP
+  //      server mode. Put the NPort IPs here. The known-good direct-COM
+  //      settings are parked in the commented block beside each one.
+  //
+  //   3. The analyzers' own host settings. ABL9 and BC-6000 are still pointed
+  //      at 10.11.100.101 (the old Cancer PC) and must be repointed at this
+  //      server, 10.12.100.172, with the subnets routing to each other.
+  //
+  //      The HMIS side needs nothing: it is the same HMIS, reached outbound at
+  //      hmis.baseUrl, and this server's own address works for it — the
+  //      10.12.19.43 on the EQ004 registration is not a constraint. The
+  //      ipAddress reported in the acknowledge body is this host.
+  //
+  //   4. siteId — omitted deliberately, and it must STAY omitted. These four
+  //      analyzers serve three HMIS sites, not one, and the barcode prefix says
+  //      which:
+  //
+  //          3562087  ZYDUS CANCER HOSPITAL        ZC*, CH*
+  //          2        ZYDUS HOSPITAL AHMEDABAD     LB*
+  //          9246332  ZYDUS FAMILY CLINIC - SHELA  SF*
+  //
+  //      Pinning siteId=3562087 was tried on 2026-09-07 and silently starved
+  //      the VITROS 250: measured 8 and 5 pending rows per day without it,
+  //      0 and 0 with it, because every sample that analyzer runs is LB or SF.
+  //      The ECiQ dropped from 7/6 rows to 2/1 for the same reason.
+  //
+  //      The fear it was added to answer is real but does not apply: a pending
+  //      call with NO eqCode does return the group-wide list (measured 555 rows
+  //      across ZYDUS CANCER, AHMEDABAD and ANAND on 07-09-2026). But the
+  //      connector never makes that call — pollOrders always sends eqCode, and
+  //      with it the gateway narrows correctly on its own: ZCCEQ003 -> 7 rows
+  //      (LB only), ZCCEQ001 -> 6, ZCCEQ005 -> 2. eqCode is the guard; siteId
+  //      is a second, tighter filter that throws away real work.
+  // ===========================================================================
+
+  "logLevel": "info",
+  "spoolDir": "./spool",
+
+  "hmis": {
+    "baseUrl": "https://hims.zhhrpl.in/live/portal",
+    "pendingPath": "/mirth/pending",
+    "acknowledgePath": "/mirth/acknowledge",
+    "resultsPath": "/mirth/labresult",
+    "timeoutMs": 15000,
+    "tlsRejectUnauthorized": true,
+    // HMIS sync log — every pending poll, acknowledge and result upload, with
+    // the full request payload and the gateway's response. This is the BASE
+    // name: one file per day is written beside it, logs\hmis-YYYY-MM-DD.log.
+    // A day that grows past auditMaxBytes continues in hmis-YYYY-MM-DD.1.log;
+    // nothing is thrown away by size, only by age (retention.logDays).
+    "auditLog": "./logs/hmis.log",
+    "auditMaxBytes": 10485760
+  },
+
+  "retention": {
+    // Unfiled spool items (results HMIS never accepted) are discarded after
+    // this many days.
+    "days": 7,
+    // Logs — logs\hmis-YYYY-MM-DD.log and logs\wire-<analyzer>-YYYY-MM-DD.log
+    // (one per machine per day, every frame in and out) — are kept for this
+    // many days. The sweeper deletes anything in logDir last written before
+    // that, so the lab always has at least 30 days of wire + HMIS history to
+    // trace a sample through.
+    "logDays": 30,
+    "sweepIntervalHours": 6,
+    "logDir": "./logs",
+    "includeSpoolPending": true
+  },
+
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 7071,
+    "authFile": "./admin-auth.json"
+  },
+
+  "analyzers": [
+    {
+      // -----------------------------------------------------------------------
+      // Radiometer ABL9 blood gas — ASTM E1394 records in a SOH…EOT stream.
+      // Legacy: E:\Devices_Cancer\ABL9\Lab Integration.exe.config
+      //   Port=6080  IPAddress=10.11.100.101  MachineID=523
+      //   MachineName=Cancer_ABL9  Client=MDSOFT
+      // That exe uses TcpListener/AcceptTcpClient, so 10.11.100.101 was its own
+      // bind address and the analyzer dialled in — mode "server" here.
+      //
+      // ⚠ protocol is "abl9", NOT "astm", and that is not a cosmetic choice.
+      // This analyzer does not speak ASTM E1381. Counting control bytes over
+      // ABL9\Communi_Data.Log (950 KB, a month of production traffic):
+      //
+      //     SOH 414   EOT 414   ACK 414      STX 0   ETX 0   ENQ 0   NAK 0
+      //     CR 23114, of which only 91 are CRLF — the separator is a bare CR
+      //
+      // It sends <SOH> H|…<CR> P|…<CR> O|…<CR> R|…<CR> L|1|N<CR> <EOT>, one
+      // message per envelope, and the host answers with a single ACK byte.
+      // There is no ENQ handshake, no STX frames, no frame numbers, no
+      // checksums. AstmLink reacts only to ENQ/EOT/STX and drops everything
+      // else as stray, so pointed at "astm" this analyzer connects, streams a
+      // whole month of results into a discard branch, and files NOTHING — a
+      // healthy-looking TCP session and a permanently empty wire log. That was
+      // the real fault behind "the ABL9 is down". See src/codec/abl9/link.ts
+      // and test/abl9-protocol.test.ts, which replays all 414 envelopes.
+      //
+      // Results-only: 0 Q (query) records in that month, and the legacy host
+      // never transmitted anything but that one ACK. So hostQuery and
+      // orderPoll.download are both off, and the link's sendOrders is a no-op.
+      // -----------------------------------------------------------------------
+      "id": "cancer-abl9",
+      "equipmentCode": "ZCCEQ005", // MachineName from the ABL9 legacy config
+      "machineId": 523,
+
+      "protocol": "abl9",
+
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "10.12.100.172",
+        "port": 6090
+      },
+
+      // Reported to HMIS in the acknowledge body. Derived from the transport
+      // when unset, which would read 0.0.0.0 — so state this host explicitly.
+      // "ipAddress": "10.12.100.172",
+      // "portNo": "6090",
+
+      // Both off, matching the measurement above: this instrument accepts no
+      // worklist and the legacy host never sent it one. They were true, which
+      // contradicted this block's own comment; the abl9 link would only have
+      // logged a warning and ignored them.
+      "sendDemographics": false,
+      "hostQuery": false,
+
+      // Cache every ordered row so a result stays filable after its row was
+      // acknowledged (rerun, correction, restart). download:false — the ABL9
+      // accepts no worklist.
+      "orderPoll": {
+        "enabled": true,
+        "intervalMs": 30000,
+        "lookbackDays": 1,
+        "download": false
+      },
+
+      // STAGED filing — the retired Lab Integration.exe's model, on files:
+      // every value is stored per sample the moment it arrives
+      // (spool/cancer-abl9/results/<barcode>.json) and a filing pass joins it
+      // to whatever order rows exist now. A tube run before its order was
+      // raised files when the order appears; one sample can never hold up
+      // another; nothing is parked after 50 tries; a mistyped id (an MRN, a
+      // short number, a name) is re-keyed from the console. Waiting values
+      // expire after retention.days. Asked for by the lab on 2026-09-08.
+      "filing": {
+        "mode": "staged",
+        "passIntervalMs": 15000,
+        "recheckMs": 300000,
+        "keepFiledDays": 2
+      },
+
+      // Same 30-second row collapse as the BC-6000 (see fillMissingOrderRows
+      // in that block). Measured on 2026-09-08 over 651 ZCCEQ005 polls: 9 ABG
+      // orders lost rows exactly one poll after they appeared — ZN2609080047
+      // 18 -> 12 (sO2, pCO2, pH, pO2, ABE, HCO3- withdrawn), LB2609080312
+      // 18 -> 1 — before any result existed. The ABG service is a PARAMETER
+      // panel, so a withdrawn row can be rebuilt from its siblings the same
+      // way. Every rebuild is logged at WARN.
+      "fillMissingOrderRows": true,
+
+      // Patient barcodes here are ZC-prefixed (e.g. ZC2608030162).
+      //
+      // Measured by replaying every envelope through the abl9 link and reading
+      // the sample id the parser actually produces — NOT by grepping the log,
+      // which undercounts badly. All 414 messages, five buckets:
+      //
+      //     316   ZC2608030162…      patient tube barcodes
+      //      71   (empty)            instrument runs — "2 Point Calibration",
+      //                              operator SYSTEM, "pH^Sens" sensor values,
+      //                              carrying a bare "P|1" with no id
+      //      21   10002022335146…    14-digit MRN typed instead of the barcode
+      //       3   33059…             a short number typed instead
+      //       3   "Gulambhai",       free text: a patient name, "split",
+      //           "split",           and "Abg qc 1"
+      //           "Abg qc 1"
+      //
+      // The 71 barcode-less runs are already safe: sampleIdFrom "patient" leaves
+      // their sample id empty rather than falling back to the O record's
+      // "Cal #", and toResultUploads drops every result with no barcode. That is
+      // pinned in test/abl9-protocol.test.ts (0 uploads from all 71).
+      //
+      // ABG controls are typed on the instrument as "Abg qc 1", "ABG QC 2" and
+      // the like. The QC/CTRL/CONTROL prefixes cannot catch them (they begin
+      // "Abg", not "QC"), so each one raised a pending lookup that came back
+      // empty and then parked in failed/ — "ABG QC 2" did exactly that on
+      // 2026-09-07. The lab asked (2026-09-08) that this kind of run never be
+      // sent to HMIS, hence sampleIdRegex: it matches the word "QC" anywhere
+      // in the id, any case, with anything non-alphabetic (or nothing) on
+      // either side — "Abg qc 1", "ABG QC 2", "ABG-QC2", "abgqc" are all
+      // controls. A ZC barcode, a 14-digit MRN or a patient's name never
+      // contains that word. The explicit "ABG QC" prefixes are belt-and-braces
+      // for the same thing. Pinned in test/abl9-protocol.test.ts.
+      //
+      // No patientPrefixes allow-list, unlike the BC-6000 and both VITROS, and
+      // the asymmetry is deliberate. ["ZC"] would sweep up the 27 MRN/typed/free
+      // text ids too. None of those can file — HMIS keys on the ZC barcode — but
+      // dropped-as-QC hides an operator mis-entry that unmatched makes visible,
+      // and a missing ABG is something the lab chases. Leave them visible.
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$", "ABG QC", "ABGQC", "ABG-QC", "ABG_QC"],
+        "sampleIdRegex": "(^|[^A-Za-z])[Qq][Cc]([^A-Za-z]|$)"
+      },
+
+      // Derived indices HMIS does not register as parameters, so they can never
+      // raise a pending row and would otherwise sit in `unmatched` forever —
+      // re-queued as their own spool item, burning 50 delivery attempts and
+      // parking in failed/ once per ABG. Listed at the lab's request so the
+      // results stop showing as pending.
+      //
+      // Every one of these is a CALCULATED channel: the ABL9 marks each result
+      // ^M (measured) or ^C (calculated) in the test-id field, and all eight
+      // carry ^C. They are numbers the analyzer derives from the nine it
+      // actually measures (pH, pCO2, Hct, pO2, K+, Na+, Ca++, Cl-, Lac).
+      //
+      // ⚠ This is NOT "ignore everything calculated". The ABL9 emits 34 ^C
+      // channels and only these 8 are listed, because the others — HCO3-, ABE,
+      // tCO2(P), tCO2(B), tHb, sO2, Anion gap and the rest — DO have HMIS
+      // parameter rows and file normally. Adding a code here silences it
+      // permanently and silently, so add one only after seeing it in the
+      // `unmatched` warning for a real sample. Matching is case-insensitive and
+      // exact; these names contain "(", ")", "," and "+" but no wildcards, so
+      // they are matched literally.
+      "ignoreTestCodes": [
+        "SBE",
+        "SBC",
+        "tO2",
+        "Ca(7.4)",
+        "Anion gap (K+)",
+        "cH+",
+        "cBase(B,ox)",
+        "cBase(Ecf,ox)"
+      ],
+
+      // -----------------------------------------------------------------------
+      // The ONLY parameters this analyzer files. Taken verbatim from the HMIS
+      // equipment-parameter master for ZCCEQ005 (the lab supplied the table on
+      // 2026-09-08), whose Identifier column is spelled exactly as the ABL9
+      // spells the analyte — so no testCodeAliases are needed.
+      //
+      // Four services are registered against this machine and they share one
+      // parameter set:
+      //
+      //   Arterial Blood Gas(ABG)*   18 parameters — the full list below
+      //   Venous Blood Gas (VBG)*    17 — the same, without T
+      //   Bicarbonate(HCO3)-Serum     1 — HCO3-
+      //   Ionized Calcium*            1 — Ca++
+      //
+      // Because it is an allow-list, it is checked BEFORE ignoreTestCodes and
+      // decides everything: a code that is not named here is dropped at
+      // delivery time as `ignored` — never filed, never re-queued, and NOT
+      // counted as waiting, so a sample goes "complete" the moment its listed
+      // parameters are in. That is the point of the list. The ABL9 sends 38
+      // channels per sample; 22 of them (pH(T), pO2(A), AaDpO2, a/ApO2, RI,
+      // cBase(...), the whole temperature-corrected block) are not interfaced
+      // and used to sit in the sample's waiting set.
+      //
+      // ⚠ TWO OF THESE NEVER ARRIVE — "FIO2" and "T".
+      //
+      // They are OPERATOR-ENTERED on the ABL9, not measured, and this site does
+      // not enter them: across 414 samples in the legacy logs
+      // (E:\Devices_Cancer\ABL9\Communi_Data.Log) there is not one FIO2 or T
+      // record, and every channel derived from them arrives as the analyzer's
+      // "....." no-result placeholder. They are kept in this list because HMIS
+      // asks for them and they must file if the lab ever starts entering them.
+      //
+      // While they are not entered, HMIS keeps the ABG order open on its own
+      // side: its T row has no value, so the sample stays pending there however
+      // complete it looks here. Six ABG samples were observed in exactly that
+      // state on 7 September, T being the only row left. The connector must not
+      // paper over it — acknowledging a row with no value is what puts an empty
+      // parameter on a patient's report. Fixing it is a decision for the lab:
+      // either enter FIO2 and temperature on the analyzer, or drop those two
+      // parameters from the ABG/VBG mapping for ZCCEQ005 in HMIS.
+      //
+      // Matching is case-insensitive and exact — no wildcards, deliberately, so
+      // that "Anion gap" cannot also admit "Anion gap (K+)", which is a
+      // different HMIS parameter and is not interfaced.
+      // -----------------------------------------------------------------------
+      "allowTestCodes": [
+        "pH",
+        "pCO2",
+        "pO2",
+        "sO2",
+        "tCO2(B)",
+        "tCO2(P)",
+        "HCO3-",
+        "ABE",
+        "Anion gap",
+        "Na+",
+        "K+",
+        "Cl-",
+        "Ca++",
+        "Hct",
+        "tHb",
+        "Lac",
+        "FIO2",
+        "T"
+      ],
+
+      // Link-layer settings for protocol "abl9". Everything else about this
+      // analyzer is shared with the ASTM record parser, below.
+      "abl9": {
+        // Answer each completed SOH…EOT envelope with one ACK byte, exactly as
+        // the legacy .NET host did — Cancer_ABL9.txt logs 414 ACKs against 414
+        // messages. Turning this off would leave the instrument unacknowledged.
+        "ack": true,
+        // Abandon a partial envelope that grows past this without an EOT, so a
+        // peer that opens the socket and streams noise cannot exhaust memory.
+        // The largest real envelope measured is 2.3 KB.
+        "maxBufferBytes": 262144
+      },
+
+      // The abl9 link reuses this block: the ABL9's RECORDS are ordinary ASTM
+      // E1394, only the framing around them differs. ackTimeoutMs, frameMaxData,
+      // senderId, receiverId and dialect all shape TRANSMISSION only, and this
+      // link never transmits, so they are inert here — sampleIdFrom is the one
+      // setting that matters.
+      "astm": {
+        "ackTimeoutMs": 15000,
+        "frameMaxData": 240,
+        "senderId": "HMIS-LIS",
+        "receiverId": "ABL9",
+        "dialect": "atellica",
+
+        // The ABL9 puts the ZC tube barcode on the P record and the patient MRN
+        // in the O record specimen field — the opposite way round from every
+        // other analyzer here. 130 of 414 captured messages carry both, so
+        // reading the O one would file against an MRN HMIS never matches. The
+        // legacy app filed the P value for exactly those samples.
+        //
+        // It also keeps the 71 calibration runs out of HMIS: their P record has
+        // no id, and not falling back to the O record leaves them with an empty
+        // barcode, which toResultUploads drops.
+        "sampleIdFrom": "patient"
+      }
+    },
+    {
+      // -----------------------------------------------------------------------
+      // Mindray BC-6000 haematology — HL7 v2.3.1 over MLLP.
+      // Legacy: E:\Devices_Cancer\Mindray_BC_6000\Lab Integration.exe.config
+      //   Port=6060  IPAddress=10.11.100.101  MachineID=624
+      //   MachineName=Cancer_BC6000  Client=MDSOFT
+      // Same TcpListener exe as the ABL9 — the analyzer dials in.
+      //
+      // Wire evidence (logggg.log): 8276 inbound ORU^R01, charset UNICODE,
+      // OBX codes LOINC + 99MRC.
+      //
+      // hostQuery is OFF on purpose. The BC-6000 answers a query with ORR^O02
+      // (see the legacy SendTestOrder.log), but this connector's HL7 link
+      // replies ORM^O01 — the HL7 v2 standard QRY^Q02 -> ORM^O01 pair, see
+      // src/codec/hl7/link.ts:279. Turning hostQuery on without teaching the
+      // link to emit ORR^O02 would answer the analyzer in a dialect it does not
+      // read. Results-up works fully either way; this only affects downloading
+      // a worklist. It is a code change, not a config flip.
+      // -----------------------------------------------------------------------
+      "id": "cancer-bc6000",
+      "equipmentCode": "ZCCEQ004", // MachineName from the BC-6000 legacy config
+      "machineId": 1,
+
+      // See the note on the ABL9: without this the poll returns every Zydus
+      // site's pending rows, not just this hospital's.
+
+      "protocol": "hl7",
+
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "10.12.100.172",
+        "port": 6060
+      },
+
+      // "ipAddress": "10.12.100.172",
+      // "portNo": "6060",
+
+      "sendDemographics": false,
+      "hostQuery": false,
+
+      "orderPoll": {
+        "enabled": true,
+        "intervalMs": 30000,
+        "lookbackDays": 1,
+        "download": false
+      },
+
+      // STAGED filing — see the ABL9 block. Measured need on 2026-09-08:
+      // CH2609080001-0006 ran at 08:07-08:11 with no HMIS order yet, and the
+      // queue retried the first of them 50 times while 0007 and 0009, whose
+      // orders existed, sat behind it unfiled. With staging each sample files
+      // the moment ITS order exists, independently of the others.
+      "filing": {
+        "mode": "staged",
+        "passIntervalMs": 15000,
+        "recheckMs": 300000,
+        "keepFiledDays": 2
+      },
+
+      // BC-6000 patient barcodes are CH-prefixed (e.g. CH2608050032); samples
+      // from the other Zydus sites that run on this analyzer carry ZC, LB or SF.
+      // Every real barcode is prefixed — so a bare number is never a patient.
+      //
+      // Controls are entered on the instrument as the control LEVEL, a small
+      // integer, and they dominate the traffic. Measured over the legacy corpus
+      // (Mindray_BC_6000\logggg.log, 1220 distinct sample ids, 7951 messages):
+      //
+      //     CH-prefixed   1153 distinct   7545 messages   patients
+      //     "23"             1 distinct    217 messages   control level
+      //     "22"             1 distinct    177 messages   control level
+      //     "123" "0" "21" "20"            12 messages    control levels
+      //     QC-26070802/03                 30 messages    already caught by "QC-"
+      //
+      // A patient barcode is never reused 217 times. Those 406 bare-numeric
+      // messages are controls, and without this rule every one of them is
+      // treated as a patient: it raises a pending lookup against HMIS that can
+      // only come back empty, then burns its retry budget and parks in failed/.
+      //
+      // sampleIdRegex rather than patientPrefixes on purpose. An allow-list
+      // ("only CH is a patient") would also swallow the ZC/LB/SF samples this
+      // analyzer legitimately runs for the other sites, and swallow them
+      // SILENTLY as QC. Matching the controls directly cannot touch anything
+      // that carries a prefix. 1-4 digits covers every level seen; widen it
+      // here if the lab adds a longer control lot id.
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": "^[0-9]{1,4}$"
+      },
+
+      // One alias, taken from a real pending-row identifier list. HMIS has two
+      // CBC services for this site: HEM0000123 "CBC" (labServiceId 3141)
+      // registers the analyzer mnemonic RDW-CV, but HEM0000208 "CBC without
+      // PS" (labServiceId 11254) registers the same analyte as "RDW". Without
+      // the alias a CBC-without-PS files 21 of the 22 and RDW-CV waits forever
+      // (CH2609070006/0007/0009/0016 on 2026-09-07). The analyzer's own code is
+      // always tried first, so this can never shadow a service that spells it
+      // RDW-CV. Add further entries only against a real pending-row list.
+      "testCodeAliases": { "RDW-CV": "RDW" },
+
+      // THE INTERFACE IS SCOPED TO THESE 22 VALUES. This is the lab's decision
+      // (2026-09-07): the BC-6000 interface files exactly the 22 CBC analytes
+      // HMIS registers under the analyzer's own mnemonic, and the connector
+      // must NOT try to push the analyzer's other channels into HMIS.
+      //
+      // Measured on CH2609070001: the analyzer sent 63 NM values and HMIS
+      // filed these 22. Every other code the instrument emits is dropped at
+      // delivery time — not filed, not re-queued, not shown as unmatched —
+      // whatever pending rows HMIS may raise for it. That covers both the 28
+      // research channels / flag scores below AND the 13 reportable analytes
+      // (IMG#, IMG%, RDW-SD, PLCC, PLCR, NRBC#, NRBC%, Micro#, Micro%, Macro#,
+      // Macro%, PDW-SD, CORRECTED WBC) that HMIS registers only under a bare
+      // number: they are outside the interfaced set until the lab says so.
+      //
+      // To interface one more analyte: add its mnemonic here, exactly as the
+      // BC-6000 prints it, AND make sure HMIS carries that mnemonic in the
+      // parameter's eqIdntifier. Do not add a code on the strength of a
+      // pending row alone. Matching is exact and case-insensitive.
+      //
+      // ✔ CHECKED 2026-09-08 against the HMIS equipment-parameter master for
+      //   the CBC service (38 rows, supplied by the lab): the 22 rows whose
+      //   identifier is an analyzer mnemonic are exactly this list — nothing
+      //   missing, nothing extra. The other 16 rows carry a bare number (310,
+      //   300, 290, 280, 26, 660, 25, 460, 42, 43, 44, 414, 50, 76, 81, 101)
+      //   and name analytes the BC-6000 does not produce (LUC%, MPC, MPM,
+      //   Lobularity Index, Cellular Hb, Large Platelets …), so they can never
+      //   match anything this instrument sends. Pinned in
+      //   test/bc6000-allow-codes.test.ts.
+      "allowTestCodes": [
+        "WBC",
+        "NEU#",
+        "LYM#",
+        "MON#",
+        "EOS#",
+        "BAS#",
+        "NEU%",
+        "LYM%",
+        "MON%",
+        "EOS%",
+        "BAS%",
+        "RBC",
+        "HGB",
+        "HCT",
+        "MCV",
+        "MCH",
+        "MCHC",
+        "RDW-CV",
+        "PLT",
+        "MPV",
+        "PDW",
+        "PCT"
+      ],
+
+      // Codes the BC-6000 interleaves with the CBC that are NOT reportable
+      // results, so HMIS will never raise a pending row for them. With the
+      // allow-list above in force this list is redundant for filing — nothing
+      // outside the 22 is filed either way — but it stays as the record of
+      // WHICH of the remaining 41 channels are non-results (28) rather than
+      // analytes HMIS simply has not interfaced yet (13):
+      //   *-IM     the 13 "…?-IM" morphology suspect scores (Blasts-IM,
+      //            Platelet Clump?-IM, HGB Interfere-IM …) — decision-support
+      //            confidence numbers scored against a threshold, not results.
+      //   InR*     InR# and InR‰ (wildcard avoids the per-mille character).
+      //   the rest research/internal channels the BC-6000 always emits.
+      //
+      // Background on the 13 not listed here: HMIS has 16 CBC parameters whose
+      // eqIdntifier is a bare number (42, 300, 460, 44, 101, 660, 81, 280, 76,
+      // 43, 50, 26, 290, 310, 25, 414 — parameterIds 2163, 2164, 6956-6959,
+      // 6965, 6998-7000, 7003, 7004, 7009, 7036, 7236, 8096) instead of the
+      // analyzer mnemonic the working 22 carry. If the lab ever widens the
+      // interface, fix those in the HMIS equipment-parameter master first, and
+      // do NOT guess which number is which analyte — a wrong guess files a
+      // value against the wrong analyte on a patient's CBC.
+      "ignoreTestCodes": [
+        "*-IM",
+        "InR*",
+        "PLT-I",
+        "WBC-D",
+        "TNC-D",
+        "WBC-N",
+        "TNC-N",
+        "HFC#",
+        "HFC%",
+        "IME#",
+        "IME%",
+        "H-NR%",
+        "L-NR%",
+        "NLR",
+        "PLR"
+      ],
+
+      // Unit conversion — NONE. The BC-6000 reports WBC and PLT in 10^9/L
+      // (WBC 8.89, PLT 226 on CH2609070001) and the connector sends those
+      // numbers exactly as the analyzer printed them. Until 2026-09-08 both
+      // were multiplied by 1000 here; the lab then confirmed that the factor
+      // is applied ON THE HMIS SIDE — its equipment-parameter master for the
+      // CBC service carries a factor per row (WBC 1000.0, everything else
+      // 1.0) — and asked for the connector's factor to be removed, so the
+      // value is not scaled twice. Keep this empty for the BC-6000: any unit
+      // handling for this instrument belongs in that HMIS master, not here.
+      // Pinned in test/bc6000-unit-scale.test.ts.
+      "testCodeScale": {},
+
+      // ON here because this analyzer is the one that needs it. HMIS withdraws
+      // CBC parameter rows from its OWN pending list mid-sample: on
+      // CH2609080017 (2026-09-08) the panel was 38 rows at 05:01:25 and 20 rows
+      // 29 seconds later with nothing filed in between; that sample survived
+      // only because the connector had already cached the full list.
+      // CH2609080028 was first seen AFTER its own collapse, so 18 of the 22
+      // interfaced analytes — WBC, RBC, HGB, HCT, PLT, the indices, the whole
+      // differential — never had a row to be filed against. Four values filed,
+      // HMIS flipped the sample to "result interfaced", and the report printed
+      // blank, which is worse than leaving it pending: a pending sample is
+      // visibly incomplete and gets chased, an interfaced one does not.
+      //
+      // With this on the connector remembers each service's parameterIds —
+      // which are a property of the SERVICE, identical on every sample (164
+      // (labServiceId, identifier) pairs observed across 9,338 polls on
+      // 2026-09-08, zero conflicts) — and rebuilds a withdrawn row from that
+      // parameterId plus the labResultId carried by a sibling row of the SAME
+      // service on the SAME sample. Both halves are observed; nothing is
+      // guessed. Confined to PARAMETER services, so a Numeric one-row-per-test
+      // service can never lend its labResultId to a different analyte. The
+      // guards are in src/orders/parameters.ts and pinned in
+      // test/parameter-catalogue.test.ts.
+      //
+      // It cannot rescue the 16 CBC parameters HMIS registers under a bare
+      // number (42, 300, 460, 44 …) — the connector has no way to know which
+      // number is which analyte, and the note above says why it must not guess.
+      // Those stay unfilable until the eqIdntifier column is corrected in the
+      // HMIS equipment-parameter master.
+      //
+      // Every rebuild is logged at WARN with the identifiers and labResultId,
+      // so the collapses stay visible while HMIS is investigated. This is a
+      // workaround for a gateway fault, not a replacement for fixing it.
+      "fillMissingOrderRows": true,
+
+      "hl7": {
+        "sendingApp": "LIS",
+        "sendingFacility": "",
+        // The BC-6000 declares UNICODE in MSH-18; echo it back on the ACK.
+        "charset": "UNICODE",
+        "ack": true,
+        // NM only — keeps the numeric analytes and drops the IS-typed run
+        // modes, flags and remarks the BC-6000 interleaves (Take Mode, Blood
+        // Mode, Test Mode, Ref Group, alarm strings).
+        "valueTypes": ["NM"],
+        "encoding": "utf8",
+        "idleFlushMs": 0
+      }
+    },
+    {
+      // -----------------------------------------------------------------------
+      // VITROS ECi/ECiQ immunodiagnostic — ASTM E1381/E1394.
+      // Legacy: E:\Devices_Cancer\ECiQ\Vitros_ECiQ.exe.config
+      //   ComVal=COM1  MachineId=2000  MachineName=VitrosECIQ
+      //   SampleIdPrefix=ZC  VitrosDelayTime=100  Client=INSTA
+      //   ProactiveUpload=true
+      //
+      // Logs\<date>\ASTM.log shows "ASTM ORDER SEND START | sendEnqFirst=True"
+      // followed by a 15s ACK timeout — hence ackTimeoutMs 15000. Flow.log
+      // polls every 30s ("Checking pending samples for equipment 2000") and
+      // DB_Query.log looks back one day (CURDATE() - INTERVAL 1 DAY) — hence
+      // intervalMs and lookbackDays.
+      // -----------------------------------------------------------------------
+      "id": "cancer-vitros-eciq",
+      "equipmentCode": "ZCCEQ001", // MachineName from the ECiQ legacy config
+      "machineId": 2000,
+
+      // See the note on the ABL9. This one matters most: orderPoll.download is
+      // ON here, so an unnarrowed poll pushes other sites' orders to the
+      // instrument.
+
+      "protocol": "astm",
+
+      // LIVE — Moxa NPort 10.12.19.42, serial port 2, in TCP SERVER mode: the
+      // NPort LISTENS on 4002 and the connector dials out to it, so mode is
+      // "client". Verified 2026-09-07: 10.12.19.42:4002 accepts connections,
+      // 4001 and the Real COM ports 950/966 are closed, and the session
+      // 10.12.100.172 -> 10.12.19.42:4002 is established with ASTM flowing both
+      // ways (see logs/wire-cancer-vitros-eciq.log).
+      //
+      // Do NOT set mode "server" here. That would have both ends waiting to be
+      // dialled and the link would never come up — with no error, because
+      // neither side is doing anything wrong on its own.
+      "transport": {
+        "type": "tcp",
+        "mode": "client",
+        "host": "10.12.19.42",
+        "port": 4002
+      },
+
+      // DIRECT-COM alternative — the legacy wiring, COM1 @ 9600 8-N-1
+      // (ComVal=COM1 with .NET SerialPort defaults). Use this instead of the
+      // TCP block above if the analyzer is cabled straight to a serial port on
+      // this host.
+      // "transport": {
+      //   "type": "serial",
+      //   "path": "COM1",
+      //   "baudRate": 9600,
+      //   "dataBits": 8,
+      //   "stopBits": 1,
+      //   "parity": "none",
+      //   "dtr": true,
+      //   "rts": true
+      // },
+
+      "sendDemographics": true,
+      "hostQuery": false,
+
+      // Proactive push, as the legacy app ran it (ProactiveUpload=true in
+      // Vitros_ECiQ.exe.config): new orders go down to the ECiQ as they appear.
+      // Enabled once ZCCEQ001 was confirmed to return this machine's rows only.
+      "orderPoll": {
+        "enabled": true,
+        "intervalMs": 30000,
+        "lookbackDays": 1,
+        "download": true
+      },
+
+      // Patient barcodes on the ECiQ are ZC-prefixed — the legacy app enforced
+      // exactly that (SampleIdPrefix=ZC in Vitros_ECiQ.exe.config). A bare-numeric
+      // id is a control run: wire-cancer-vitros-eciq.log shows 40471 and 40472
+      // arriving beside the patient sample ZC2609060012, and each one produced a
+      // pending query to HMIS that came back empty (logs/hmis.log). Same rule and
+      // same reasoning as the VITROS 250 below.
+      "qc": {
+        "patientPrefixes": ["ZC"],
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null,
+        "upload": false
+      },
+
+      "astm": {
+        "ackTimeoutMs": 15000,
+        "frameMaxData": 240,
+        // The analyzer's own header carries sender "HOST" and no receiver id.
+        "senderId": "HOST",
+        "receiverId": "",
+        "dialect": "vitros-eciq"
+      }
+    },
+    {
+      // -----------------------------------------------------------------------
+      // VITROS 250 chemistry — KERMIT file transfer, not ASTM. Sample programs
+      // and results move as named files (SFILEn.D / R00000nn).
+      // Legacy: E:\Devices_Cancer\Vitros250\Vitros250.exe.config
+      //   ComVal=COM2  MachineId=2001  MachineName=Vitros250
+      //   SamplePrefix=ZC  VitrosDelayTime=1000  barcodeLength=9  InsID=5275
+      //   LocationId="SL Nashik"  (stale — copied from the Nashik install)
+      //
+      // Vitros250_String.txt confirms Kermit framing (SOH / seq / type-Y ACK),
+      // and Flow.log polls roughly every 26s for equipment 2001.
+      // -----------------------------------------------------------------------
+      "id": "cancer-vitros-250",
+      "equipmentCode": "ZCCEQ003", // MachineName from the VITROS 250 legacy config
+      "machineId": 2001,
+
+      // See the note on the ABL9. This analyzer already had SFILE1.D/SFILE2.D
+      // written to it for LB2609070080 (Zydus Hospital Ahmedabad) and
+      // SF2609060027 (Zydus Family Clinic - Shela) before this was set.
+
+      "protocol": "kermit",
+
+      // LIVE — second Moxa NPort 10.12.19.41, serial port 1, in TCP SERVER
+      // mode: it listens on 4001 and the connector dials out, so mode is
+      // "client". One serial port per instrument.
+      //
+      // History worth keeping: this NPort was in REAL COM mode until
+      // 2026-09-07 — 4001 was closed and only the Real COM ports 950/966 were
+      // open, so the connector could never connect and the VITROS 250 sent
+      // nothing, silently. It was switched to TCP Server in the NPort web
+      // console; 4001 then opened, the session came up, and the first two
+      // Kermit sample programs (SFILE1.D / SFILE2.D) were accepted by the
+      // analyzer. If the 250 ever goes quiet again with no error, re-check
+      // this port's operating mode first.
+      "transport": {
+        "type": "tcp",
+        "mode": "client",
+        "host": "10.12.19.41",
+        "port": 4001
+      },
+
+      // DIRECT-COM alternative — the legacy wiring, COM2 @ 9600 8-N-1
+      // (ComVal=COM2). Note the legacy log ends on "Access to the port 'COM2'
+      // is denied" and "The port is closed", so the old app was already losing
+      // this link before it was retired.
+      // "transport": {
+      //   "type": "serial",
+      //   "path": "COM2",
+      //   "baudRate": 9600,
+      //   "dataBits": 8,
+      //   "stopBits": 1,
+      //   "parity": "none",
+      //   "dtr": true,
+      //   "rts": true
+      // },
+
+      "sendDemographics": true,
+      "hostQuery": false,
+
+      "orderPoll": {
+        "enabled": true,
+        "intervalMs": 30000,
+        "lookbackDays": 1,
+        "download": true,
+        // Program ONLY ZC barcodes onto this analyzer — the order-side twin of
+        // qc.patientPrefixes below, and exactly what Vitros250.exe did
+        // (SamplePrefix=ZC, SQL "sample_id LIKE 'ZC%'").
+        //
+        // Measured 2026-09-06/07: HMIS lists LB, ZN, ZS, ZV, SF and CF
+        // barcodes under ZCCEQ003 as well, and the connector programmed 1014
+        // samples of which only 53 were ZC. The analyzer returned results for
+        // 53 samples — every one of them ZC, and zero for any other prefix, in
+        // this connector's logs AND in the whole legacy capture. So the other
+        // 95% were sample programs for tubes this instrument never sees; they
+        // only filled its program list and, being non-ZC, their results would
+        // have been dropped as QC anyway. Their rows are still cached in the
+        // order store, just never sent.
+        "downloadPrefixes": ["ZC"]
+      },
+
+      // Patient barcodes on the VITROS 250 are ZC-prefixed. The legacy app
+      // enforced exactly this (SamplePrefix=ZC in Vitros250.exe.config) and
+      // Result_Flow.log records it dropping the same kind of run:
+      //   "Skipped result sample=89772 (prefix filter: ZC)"
+      // So anything without ZC — a bare-numeric control id like 89772 — is a
+      // QC run and is neither queried against HMIS nor uploaded.
+      "qc": {
+        "patientPrefixes": ["ZC"],
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null,
+        "upload": false
+      },
+
+      "kermit": {
+        "ackTimeoutMs": 10000,
+        "maxRetries": 5,
+        // Packet pacing, copied from the legacy host (VitrosDelayTime=1000):
+        // 1 s after each acknowledged packet, and 1 s of quiet between the end
+        // of one transfer and the next send-init. Vitros250.exe sent 48
+        // transfers this way without a single error packet. Without the pause
+        // this link pushed a whole file in ~0.8 s and started the next one at
+        // once, and on 2026-09-07 the analyzer answered with
+        //   0005 INVALID PACKET USAGE   x125
+        //   0008 INVALID SEQUENCE USE   x35
+        // 151 of those 160 within two seconds of the previous transfer. Each
+        // one failed the download, tripped the breaker, and re-sent the same
+        // order minutes later (LB2609070198 went out seven times).
+        "interPacketDelayMs": 1000,
+        "interTransferDelayMs": 1000
+      }
+    }
+  ]
+}

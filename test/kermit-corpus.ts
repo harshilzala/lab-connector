@@ -18,14 +18,36 @@ import { buildOrderRecord, parseOrderRecord, parseResultFile } from '../src/code
 // it is a verification aid, not a gate for other environments.
 // =============================================================================
 
-const TX_LOG = 'E:/API_Integration/Devices/250/Vitros250_String.txt';
-const RX_LOG = 'E:/API_Integration/Devices/250/Vitros250_String_save.txt';
-const TS = /^DateTime: \d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2}/;
+// Both sites ran a VITROS 250 on the same legacy executable, so either capture
+// exercises the codec. Whichever is present on this machine is used; the Cancer
+// copy is checked second so a Nashik lab PC keeps its own traffic.
+const CAPTURE_DIRS = [
+  'E:/API_Integration/Devices/250', // Nashik lab PC
+  'E:/Devices_Cancer/Vitros250', // Cancer site (copy of D:\API Integration\Devices_Cancer)
+];
 
-if (!existsSync(TX_LOG) || !existsSync(RX_LOG)) {
-  console.log(`\n  SKIP — legacy capture not present on this machine.\n         expected ${TX_LOG}\n`);
+const dir = CAPTURE_DIRS.find(
+  (d) => existsSync(`${d}/Vitros250_String.txt`) && existsSync(`${d}/Vitros250_String_save.txt`),
+);
+
+if (!dir) {
+  console.log(
+    `\n  SKIP — legacy capture not present on this machine.\n` +
+      CAPTURE_DIRS.map((d) => `         looked in ${d}`).join('\n') +
+      '\n',
+  );
   process.exit(0);
 }
+
+const TX_LOG = `${dir}/Vitros250_String.txt`;
+const RX_LOG = `${dir}/Vitros250_String_save.txt`;
+// The two sites' copies of the legacy exe stamp the line differently — Nashik
+// writes `21-03-2026 16:53:07`, Cancer writes `9/3/2026 2:06:09 PM` (the .NET
+// default for its locale). Everything after the stamp is identical, so only the
+// stamp itself has to be recognised both ways.
+const TS = /^DateTime: (?:\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2}|\d{1,2}\/\d{1,2}\/\d{4} \d{1,2}:\d{2}:\d{2} [AP]M)/;
+
+console.log(`\n  capture: ${dir}`);
 
 const G = '\x1b[32m✓\x1b[0m';
 const B = '\x1b[31m✗\x1b[0m';
@@ -49,9 +71,22 @@ function readRuns(file: string, direction: 'TX' | 'RX') {
   let cur: { file: string; parts: string[] } | null = null;
   let packets = 0;
   let badChecksums = 0;
+  const damaged: string[] = [];
 
   for (const line of readFileSync(file, 'latin1').split(/\r?\r?\n/)) {
     if (!TS.test(line)) continue;
+
+    // A line the legacy logger could not represent tells us nothing about the
+    // wire. The Cancer capture is UTF-8 and holds exactly one such line: four
+    // 8-bit payload bytes were written as two-byte sequences (0x90 -> U+0390,
+    // 0x8E -> U+038E), so the logged packet is longer than its own LEN field
+    // and cannot checksum. Counting that as a bad checksum would blame the
+    // codec for damage done on the way to disk, so these are excluded and
+    // reported separately.
+    if (/[^\x00-\x7f]/.test(line)) {
+      damaged.push(line);
+      continue;
+    }
     const rest = line.replace(TS, '');
     const outbound = rest.startsWith('INTERFACEPC:');
     if ((direction === 'TX') !== outbound) continue;
@@ -85,7 +120,14 @@ function readRuns(file: string, direction: 'TX' | 'RX') {
       cur = null;
     }
   }
-  return { runs, packets, badChecksums };
+  return { runs, packets, badChecksums, damaged };
+}
+
+/** Report lines the legacy logger corrupted. Visible, but not a codec failure. */
+function reportDamaged(label: string, damaged: string[]) {
+  if (!damaged.length) return;
+  console.log(`  ! ${damaged.length} ${label} line(s) excluded — non-ASCII in the legacy log, not verifiable:`);
+  for (const l of damaged.slice(0, 3)) console.log(`      ${JSON.stringify(l.slice(-70))}`);
 }
 
 console.log('\n=== VITROS 250 corpus replay ===\n');
@@ -93,6 +135,7 @@ console.log('\n=== VITROS 250 corpus replay ===\n');
 // ---- Outbound: every captured order must rebuild byte-for-byte -------------
 const tx = readRuns(TX_LOG, 'TX');
 console.log(`[orders]  ${tx.runs.length} transmissions, ${tx.packets} packets`);
+reportDamaged('order', tx.damaged);
 check('every outbound packet framed + checksummed by our decoder', tx.badChecksums === 0, `bad=${tx.badChecksums}`);
 
 let rebuilt = 0;
@@ -116,6 +159,7 @@ for (const m of mismatches.slice(0, 3)) console.log(`      ${m}`);
 // ---- Inbound: every captured result record must parse ----------------------
 const rx = readRuns(RX_LOG, 'RX');
 console.log(`\n[results] ${rx.runs.length} transmissions, ${rx.packets} packets`);
+reportDamaged('result', rx.damaged);
 check('every inbound packet checksums', rx.badChecksums === 0, `bad=${rx.badChecksums}`);
 
 let records = 0, values = 0, flagged = 0, noResult = 0;

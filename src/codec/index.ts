@@ -3,6 +3,7 @@ import type { Logger } from '../logger.js';
 import type { AnalyzerConfig } from '../config.js';
 import type { ProtocolLink } from './types.js';
 import { AstmLink } from './astm/link.js';
+import { Abl9Link } from './abl9/link.js';
 import { Advia2120Link } from './advia/link.js';
 import { ClinitekAdvantusLink } from './clinitek/link.js';
 import { KermitLink } from './kermit/link.js';
@@ -18,7 +19,20 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
         ackTimeoutMs: analyzer.astm.ackTimeoutMs,
         frameMaxData: analyzer.astm.frameMaxData,
         dialect: analyzer.astm.dialect,
+        sampleIdFrom: analyzer.astm.sampleIdFrom,
         logger: logger.child({ codec: 'astm' }),
+      });
+    case 'abl9':
+      // Radiometer ABL9 — ASTM E1394 RECORDS inside a SOH…EOT stream, with no
+      // E1381 framing at all. Its records are parsed by the same parser as
+      // 'astm', so it reads sampleIdFrom and dialect from the astm block;
+      // only the link layer differs. See src/codec/abl9/link.ts.
+      return new Abl9Link(transport, {
+        sampleIdFrom: analyzer.astm.sampleIdFrom,
+        dialect: analyzer.astm.dialect,
+        ack: analyzer.abl9.ack,
+        maxBufferBytes: analyzer.abl9.maxBufferBytes,
+        logger: logger.child({ codec: 'abl9' }),
       });
     case 'advia2120i':
       return new Advia2120Link(transport, {
@@ -37,6 +51,7 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
         valueTypes: analyzer.hl7.valueTypes,
         encoding: analyzer.hl7.encoding,
         idleFlushMs: analyzer.hl7.idleFlushMs,
+        hostQuery: analyzer.hostQuery,
         logger: logger.child({ codec: 'hl7' }),
       });
     case 'kermit':
@@ -46,6 +61,8 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
       return new KermitLink(transport, {
         ackTimeoutMs: analyzer.kermit.ackTimeoutMs,
         maxRetries: analyzer.kermit.maxRetries,
+        interPacketDelayMs: analyzer.kermit.interPacketDelayMs,
+        interTransferDelayMs: analyzer.kermit.interTransferDelayMs,
         logger: logger.child({ codec: 'kermit' }),
       });
     default:

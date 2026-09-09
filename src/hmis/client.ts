@@ -122,10 +122,18 @@ export class HmisClient {
     const path = this.opts.acknowledgePath;
     const startedAt = Date.now();
     const sampleId = [...new Set(items.map((i) => i.sampleID))];
+    // Project to the gateway's own nine columns. MirthAcknowledgeItem also
+    // carries connector-side bookkeeping (resultType, synthesized) that this
+    // endpoint has never been sent and has no column for; posting the object
+    // verbatim would put unknown properties in front of a gateway that answers
+    // HTTP 200 to everything and reports failure only in the body. Listing the
+    // fields keeps the request byte-identical to what it has always been,
+    // whatever else the connector later hangs off the row.
+    const body = items.map(toAcknowledgeWire);
     let httpStatus: number | null = null;
     let response: unknown = null;
     try {
-      const sent = await this.send('POST', path, JSON.stringify(items));
+      const sent = await this.send('POST', path, JSON.stringify(body));
       httpStatus = sent.status;
       const parsed = this.parse(sent.text, path) as Partial<HmisResultUploadResponse> | null;
       response = parsed ?? sent.text;
@@ -149,7 +157,7 @@ export class HmisClient {
         method: 'POST',
         path,
         startedAt,
-        request: items,
+        request: body,
         httpStatus,
         response,
         outcome: 'sent',
@@ -162,7 +170,7 @@ export class HmisClient {
         method: 'POST',
         path,
         startedAt,
-        request: items,
+        request: body,
         httpStatus,
         response,
         outcome: httpStatus === 200 ? 'none-matched' : 'error',
@@ -183,12 +191,19 @@ export class HmisClient {
    * silently-ignored (mis-keyed or unmatched) row looks like, and swallowing it
    * would drop a patient result on the floor while reporting it as filed.
    */
-  async postResults(rows: LisInboundResultRow[]): Promise<HmisResultUploadResponse> {
+  async postResults(rows: LisInboundResultRow[], eqCode?: string): Promise<HmisResultUploadResponse> {
     if (rows.length === 0) return { status: 'success', message: 'nothing to send', successData: [], filed: 0 };
 
     const path = this.opts.resultsPath;
     const startedAt = Date.now();
     const sampleId = [...new Set(rows.map((r) => r.sampleId))];
+    // One flat line per value, so a transfer can be traced by grepping any of
+    // the four things an operator actually has to hand — the barcode, the
+    // analyzer's assay identifier, the value, or the labResultId. The same data
+    // is in `request`, but only as nested JSON: this is the readable index into
+    // it, and it is what makes "which value went to which row" answerable
+    // without a parser.
+    const filed = rows.map((r) => `${r.sampleId} ${r.identifier} = ${r.resultValue} -> labResultId ${r.labResultId}`);
     let httpStatus: number | null = null;
     let response: unknown = null;
     try {
@@ -221,6 +236,8 @@ export class HmisClient {
         response,
         outcome: 'filed',
         rows: successData.length,
+        eqCode,
+        filed,
       });
       return { status: 'success', message, successData, filed: successData.length };
     } catch (err) {
@@ -240,6 +257,10 @@ export class HmisClient {
         outcome: httpStatus === 200 ? 'none-matched' : 'error',
         rows: 0,
         error: message,
+        eqCode,
+        // Logged on the failure path too: a none-matched upload is exactly when
+        // you need to see which identifier the gateway refused to place.
+        filed,
       });
       throw err;
     }
@@ -251,6 +272,7 @@ export class HmisClient {
     kind: HmisAuditKind;
     sampleId: string | string[] | null;
     eqCode?: string | null;
+    filed?: string[];
     method: 'GET' | 'POST';
     path: string;
     startedAt: number;
@@ -321,4 +343,24 @@ export class HmisClient {
       return null;
     }
   }
+}
+
+/**
+ * The exact acknowledge body the gateway accepts — nine columns, no more.
+ *
+ * An explicit projection rather than a spread, so that adding a field to
+ * MirthAcknowledgeItem can never silently change what is posted to HMIS.
+ */
+function toAcknowledgeWire(item: MirthAcknowledgeItem): Record<string, unknown> {
+  return {
+    sampleID: item.sampleID,
+    equipmentId: item.equipmentId,
+    identifier: item.identifier,
+    ipAddress: item.ipAddress,
+    isTransmitted: item.isTransmitted,
+    labResultId: item.labResultId,
+    labServiceId: item.labServiceId,
+    portNo: item.portNo,
+    parameterId: item.parameterId,
+  };
 }

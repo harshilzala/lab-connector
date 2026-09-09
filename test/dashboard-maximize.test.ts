@@ -23,6 +23,13 @@ const el = (id: string) => {
       contains: (c: string) => classes.has(c),
       has: () => classes,
     },
+    // A real element always carries these; the panel scroll-preservation code
+    // uses all four, so the stub has to have them or it stops standing in for
+    // an element and starts inventing one that cannot exist.
+    dataset: {} as Record<string, string>,
+    addEventListener: () => {},
+    scrollTop: 0,
+    scrollHeight: 0,
     _classes: classes,
   };
 };

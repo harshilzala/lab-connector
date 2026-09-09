@@ -8,7 +8,7 @@
 // =============================================================================
 
 export type Direction = 'IN' | 'OUT';
-export type ProtocolName = 'astm' | 'hl7' | 'kermit' | 'advia2120i' | 'clinitek-advantus';
+export type ProtocolName = 'astm' | 'abl9' | 'hl7' | 'kermit' | 'advia2120i' | 'clinitek-advantus';
 
 // ---- Analyzer → connector: a request for what to run on a sample -----------
 // (ASTM "Q" query record, or an order-less result upload that implies query.)
@@ -115,6 +115,18 @@ export interface MirthAcknowledgeItem {
   labServiceId: number | null;
   portNo: string;
   parameterId: number | null;
+  /** HMIS's own shape for the service this row belongs to: "PARAMETER" when one
+   *  labResultId covers many parameters (a CBC panel) and each row is one
+   *  analyte inside it, "Numeric"/"Alphanumeric" when the row IS the whole
+   *  service. Connector-side only — the acknowledge body is projected back to
+   *  the gateway's own nine columns in hmis/client.ts, so this never goes out on
+   *  the wire. Read by the parameter catalogue, which may only reconstruct a
+   *  missing row inside a PARAMETER service. */
+  resultType?: string | null;
+  /** True when the parameter catalogue reconstructed this row from a sibling
+   *  row plus a remembered parameterId, rather than HMIS offering it. See
+   *  orders/parameters.ts. */
+  synthesized?: boolean;
 }
 
 /** Pending rows for one barcode, collapsed into a single downloadable order. */
@@ -141,6 +153,15 @@ export interface HmisResultUpload {
   barcode: string;
   /** Set when the sample is a QC/control material rather than a patient sample. */
   isQc?: boolean;
+  /** How many of this barcode's analytes have ALREADY been filed and
+   *  acknowledged, on the delivery that split this item off.
+   *
+   *  Only ever set on a remainder item — the leftovers of a partly-filed
+   *  sample, re-queued so they keep trying once their order row appears. It
+   *  exists so the console can say "22 filed, 13 still without an order row"
+   *  instead of labelling the whole sample "queued", which reads as though
+   *  nothing reached HMIS when in fact the panel is already interfaced. */
+  filedAnalytes?: number;
   results: Array<{
     testCode: string;
     value: string;
@@ -160,14 +181,18 @@ export interface HmisResultUpload {
  * deserializes into `java.util.List<com.his.lab.domain.LisInboundResults>`.
  *
  * The endpoint takes a BARE ARRAY of these; there is no wrapper object. Every
- * identifier except `resultValue` comes from the pending row the order was
- * downloaded from, NOT from the analyzer — `labResultId` is what the server
- * files against, so a result with no matching pending row cannot be uploaded.
+ * identifier except `resultValue` and `equipmentId` comes from the pending row
+ * the order was downloaded from, NOT from the analyzer — `labResultId` is what
+ * the server files against, so a result with no matching pending row cannot be
+ * uploaded.
  */
 export interface LisInboundResultRow {
   sampleId: string;
   labServiceId: number | null;
   labResultId: number | null;
+  /** The analyzer's configured `equipmentId` (config.json), identifying the
+   *  machine that produced the value. Falls back to the pending row's id only
+   *  when the analyzer config omits one. */
   equipmentId: string | number | null;
   ipAddress: string;
   portNo: string;

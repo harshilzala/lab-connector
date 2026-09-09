@@ -30,6 +30,11 @@ const TEST_KEYS = ['identifier', 'eqIdntifier', 'testCode', 'test_code', 'code',
 const EQ_CODE_KEYS = ['eqCode', 'equipmentCode', 'equipment_code', 'machineCode', 'equipmentName'];
 const SPECIMEN_KEYS = ['specimenType', 'sampleType', 'specimen', 'specimenName', 'sampleTypeName', 'containerType'];
 const PRIORITY_KEYS = ['priority', 'isStat', 'stat', 'urgent', 'isUrgent', 'isEmergency'];
+// How HMIS shapes the service this row belongs to: "PARAMETER" (one labResultId
+// for a whole panel, one row per analyte inside it) or "Numeric"/"Alphanumeric"
+// (the row is the entire service). Carried so the parameter catalogue can tell
+// the two apart; it is never sent back to the gateway.
+const RESULT_TYPE_KEYS = ['resultType', 'result_type', 'resulttype'];
 
 const PATIENT_ID_KEYS = ['uhid', 'UHID', 'patientId', 'patientID', 'patientCode', 'mrn', 'mrNo'];
 const FIRST_NAME_KEYS = ['firstName', 'patientFirstName', 'fname'];
@@ -118,6 +123,7 @@ export function normalizePending(body: unknown, opts: NormalizeOptions): Pending
       labServiceId: toNumber(row.labServiceId),
       portNo: String(row.portNo ?? opts.portNo ?? ''),
       parameterId: toNumber(row.parameterId),
+      resultType: pickString(row, RESULT_TYPE_KEYS),
     });
 
     // Sample-level attributes repeat on every row; take the first non-empty.
@@ -165,6 +171,11 @@ function pick(row: Record<string, unknown>, keys: string[]): unknown {
     if (v !== undefined && v !== null && String(v).trim() !== '') return v;
   }
   return null;
+}
+
+function pickString(row: Record<string, unknown>, keys: string[]): string | null {
+  const v = pick(row, keys);
+  return v === null ? null : String(v).trim();
 }
 
 function toNumber(v: unknown): number | null {
@@ -250,4 +261,71 @@ export function formatApiDate(d: Date): string {
   const dd = String(d.getDate()).padStart(2, '0');
   const mm = String(d.getMonth() + 1).padStart(2, '0');
   return `${dd}-${mm}-${d.getFullYear()}`;
+}
+
+// -----------------------------------------------------------------------------
+// Poll-shaped queries. The order poller asks for a whole day's rows for one
+// equipment code — no sampleId — so the reply covers many tubes at once.
+// -----------------------------------------------------------------------------
+
+/**
+ * Split a multi-sample reply into one `PendingOrders` per barcode, keyed by the
+ * canonical (trimmed, upper-cased) barcode. Each group goes through
+ * `normalizePending` so the row filtering and column aliasing are exactly what
+ * a single-sample lookup would have produced.
+ */
+export function groupPendingByBarcode(body: unknown, opts: Omit<NormalizeOptions, 'sampleId'>): Map<string, PendingOrders> {
+  const groups = new Map<string, { sampleId: string; rows: MirthPendingRow[] }>();
+  for (const row of unwrapRows(body)) {
+    const raw = pick(row, SAMPLE_KEYS);
+    if (raw === null) continue;
+    const sampleId = String(raw).trim();
+    const key = sampleId.toUpperCase();
+    if (!key) continue;
+    const g = groups.get(key) ?? { sampleId, rows: [] };
+    g.rows.push(row);
+    groups.set(key, g);
+  }
+
+  const out = new Map<string, PendingOrders>();
+  for (const [key, g] of groups) {
+    const pending = normalizePending(g.rows, { ...opts, sampleId: g.sampleId });
+    if (pending.found) out.set(key, pending);
+  }
+  return out;
+}
+
+/**
+ * Combine the lookups made under several equipment codes for ONE barcode into a
+ * single order. The gateway keys tests to codes, so a tube whose tests straddle
+ * an analyzer's old and new registration comes back in pieces.
+ */
+export function mergePending(parts: PendingOrders[]): PendingOrders {
+  const first = parts[0];
+  if (!first) throw new Error('mergePending needs at least one part');
+  const merged: PendingOrders = {
+    found: false,
+    sampleId: first.sampleId,
+    testCodes: [],
+    patient: null,
+    priority: 'R',
+    specimenType: null,
+    ackItems: [],
+  };
+  for (const p of parts) {
+    for (const code of p.testCodes) if (!merged.testCodes.includes(code)) merged.testCodes.push(code);
+    merged.ackItems.push(...p.ackItems);
+    if (!merged.patient && p.patient) merged.patient = p.patient;
+    if (merged.specimenType === null && p.specimenType !== null) merged.specimenType = p.specimenType;
+    if (p.priority === 'S') merged.priority = 'S';
+    if (p.found) merged.found = true;
+  }
+  return merged;
+}
+
+/** `formatApiDate` for the day `daysAgo` days before `from`. */
+export function formatApiDateDaysAgo(daysAgo: number, from = new Date()): string {
+  const d = new Date(from);
+  d.setDate(d.getDate() - daysAgo);
+  return formatApiDate(d);
 }

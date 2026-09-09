@@ -5,9 +5,13 @@ import type { Logger } from '../logger.js';
 // =============================================================================
 // Retention sweeper — deletes logs and spool items past their keep-window.
 //
-// Two directories are swept, and they are NOT equivalent:
+// Two directories are swept, and they are NOT equivalent — each has its own
+// window (`logDays` for logs, `days` for the spool):
 //
-//   logs/          diagnostic text. Deleting an old one costs nothing.
+//   logs/          the evidence trail: one HMIS transaction file and one wire
+//                  file per analyzer PER DAY (see daily-log.ts). Deleting an
+//                  old one costs nothing operationally, but the lab needs the
+//                  trail for 30 days, so logDays is the longer window.
 //
 //   spool/<id>/    patient results. An item is removed from the spool the
 //                  moment it is filed successfully, so ANYTHING still sitting
@@ -25,8 +29,10 @@ import type { Logger } from '../logger.js';
 // =============================================================================
 
 export interface RetentionOptions {
-  /** Keep-window in days. Anything older is removed. */
+  /** Keep-window in days for spool items. Anything older is removed. */
   days: number;
+  /** Keep-window in days for files in logDir. Defaults to `days`. */
+  logDays?: number;
   /** Directory holding the application + HMIS logs. */
   logDir: string;
   /** Spool root; each analyzer owns a <root>/<analyzerId> subtree. */
@@ -65,16 +71,19 @@ export class RetentionSweeper {
 
   /** One pass. Never throws — a cleanup failure must not stop the connector. */
   sweep(): SweepReport {
-    const cutoff = Date.now() - this.opts.days * 24 * 60 * 60 * 1000;
+    const DAY = 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - this.opts.days * DAY;
+    const logCutoff = Date.now() - this.logDays * DAY;
     const report: SweepReport = { logFilesDeleted: 0, spoolItemsDeleted: 0, bytesFreed: 0, errors: 0 };
 
-    this.sweepLogs(cutoff, report);
+    this.sweepLogs(logCutoff, report);
     this.sweepSpool(cutoff, report);
 
     if (report.logFilesDeleted || report.spoolItemsDeleted || report.errors) {
       this.opts.logger.info(
         {
           days: this.opts.days,
+          logDays: this.logDays,
           logFiles: report.logFilesDeleted,
           spoolItems: report.spoolItemsDeleted,
           freedKb: Math.round(report.bytesFreed / 1024),
@@ -84,6 +93,10 @@ export class RetentionSweeper {
       );
     }
     return report;
+  }
+
+  private get logDays(): number {
+    return this.opts.logDays ?? this.opts.days;
   }
 
   // ---------------------------------------------------------------------------
@@ -108,7 +121,7 @@ export class RetentionSweeper {
       }
       report.logFilesDeleted++;
       report.bytesFreed += size;
-      this.opts.logger.info({ path, days: this.opts.days }, 'expired log file deleted');
+      this.opts.logger.info({ path, days: this.logDays }, 'expired log file deleted');
     }
   }
 

@@ -4,6 +4,10 @@ import type { AnalyzerStatus, WireLogEntry } from '../session/orchestrator.js';
 import type { SpoolEnvelope } from '../queue/spool.js';
 import type { HmisResultUpload } from '../types.js';
 import { renderDashboard } from './dashboard.js';
+import { renderConnectorTool } from './connector-tool.js';
+import { ProbeSession, type ProbeTransportConfig } from '../probe/session.js';
+import { FAMILY_LABELS, identify, knownProtocols, parsePayload } from '../probe/identify.js';
+import { listSerialPorts, scanTcp, sweepBaudRates } from '../probe/discover.js';
 import { renderLoginPage, type LoginView } from './login.js';
 import { ZYDUS_LOGO_SVG } from './logo.js';
 import {
@@ -22,7 +26,14 @@ export interface AdminBackend {
   retry(id: string, msgId: string): boolean;
   clearWire(id: string): boolean;
   remove(id: string, msgId: string): boolean;
+  /** filing.mode "staged" analyzers — null for a queued one. */
+  staged(id: string): StagedSummary[] | null;
+  fileNow(id: string, barcode: string): Promise<boolean>;
+  /** Returns the barcode the sample now sits under, or null. */
+  rekey(id: string, from: string, to: string): string | null;
+  removeStaged(id: string, barcode: string): boolean;
 }
+import type { StagedSummary } from '../results/store.js';
 
 /** Plenty for a login form; anything larger is not a request we serve. */
 const MAX_BODY_BYTES = 16 * 1024;
@@ -39,6 +50,10 @@ export class AdminServer {
   private readonly sessions = new SessionStore();
   private readonly throttle = new LoginThrottle();
   private sweeper: NodeJS.Timeout | null = null;
+  // The Connector Tool's probe. One per console: it is a commissioning
+  // instrument, not a service, and two probes racing for the same port would
+  // only produce a capture nobody can read.
+  private probe: ProbeSession | null = null;
 
   constructor(
     private readonly backend: AdminBackend,
@@ -78,6 +93,7 @@ export class AdminServer {
   }
 
   async stop(): Promise<void> {
+    if (this.probe) await this.probe.stop().catch(() => {});
     if (this.sweeper) clearInterval(this.sweeper);
     this.sweeper = null;
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
@@ -168,10 +184,203 @@ export class AdminServer {
         return this.json(res, ok ? { ok } : { error: 'unknown queue item' }, ok ? 200 : 404);
       }
 
+      // ---- staged result store (filing.mode "staged") ----
+      const stagedList = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/staged$/);
+      if (method === 'GET' && stagedList) {
+        const s = this.backend.staged(stagedList[1]!);
+        return s ? this.json(res, { samples: s }) : this.json(res, { error: 'not a staged analyzer' }, 404);
+      }
+
+      const stagedAction = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/staged\/([^/]+)\/(file|rekey)$/);
+      if (method === 'POST' && stagedAction) {
+        if (!this.sameOrigin(req)) return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        const id = stagedAction[1]!;
+        const barcode = decodeURIComponent(stagedAction[2]!);
+        if (stagedAction[3] === 'file') {
+          const ok = await this.backend.fileNow(id, barcode);
+          return this.json(res, ok ? { ok } : { error: 'unknown sample' }, ok ? 200 : 404);
+        }
+        let to = '';
+        try {
+          const body = JSON.parse((await readBody(req)) || '{}') as { to?: unknown };
+          to = String(body.to ?? '').trim();
+        } catch {
+          /* not JSON — treated as no barcode given */
+        }
+        if (!to) return this.json(res, { error: 'the new barcode is required' }, 400);
+        const moved = this.backend.rekey(id, barcode, to);
+        if (moved) this.logger.warn({ analyzer: id, from: barcode, to: moved }, 'staged sample re-keyed from the admin console');
+        return this.json(res, moved ? { ok: true, barcode: moved } : { error: 'unknown sample' }, moved ? 200 : 404);
+      }
+
+      const stagedRemove = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/staged\/([^/]+)$/);
+      if (method === 'DELETE' && stagedRemove) {
+        if (!this.sameOrigin(req)) return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        const barcode = decodeURIComponent(stagedRemove[2]!);
+        const ok = this.backend.removeStaged(stagedRemove[1]!, barcode);
+        if (ok) this.logger.warn({ analyzer: stagedRemove[1], barcode }, 'staged sample removed from the admin console');
+        return this.json(res, ok ? { ok } : { error: 'unknown sample' }, ok ? 200 : 404);
+      }
+
+      // ---- Connector Tool: the universal device monitor ----
+      if (method === 'GET' && p === '/connector') {
+        return this.html(res, renderConnectorTool({ username: session.username }));
+      }
+      if (p.startsWith('/api/connector')) {
+        // Everything under here either opens sockets or drives a live link, so
+        // the same-origin guard the other mutating routes use applies to every
+        // verb except the read-only GETs.
+        if (method !== 'GET' && !this.sameOrigin(req)) {
+          return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        }
+        return await this.connectorTool(req, res, p, method);
+      }
+
       this.json(res, { error: 'not found' }, 404);
     } catch (err) {
       this.logger.error({ err }, 'admin request failed');
       if (!res.headersSent) this.json(res, { error: 'internal error' }, 500);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Connector Tool
+  //
+  // A commissioning instrument, not part of the interface: it opens raw links
+  // to unknown devices, records what arrives and fingerprints it. It never
+  // files a result, touches the spool or calls HMIS. The probe is bound to this
+  // console's lifetime and is stopped when the server stops.
+  // ---------------------------------------------------------------------------
+  private async connectorTool(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    p: string,
+    method: string,
+  ): Promise<void> {
+    const body = async (): Promise<Record<string, unknown>> => {
+      const raw = await readBody(req);
+      if (raw === null) throw new Error('request body too large');
+      if (!raw) return {};
+      try {
+        return JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        throw new Error('request body is not valid JSON');
+      }
+    };
+
+    try {
+      // ---- discovery ----
+      if (method === 'GET' && p === '/api/connector/protocols') {
+        return this.json(res, { protocols: knownProtocols(), families: FAMILY_LABELS });
+      }
+
+      if (method === 'POST' && p === '/api/connector/scan') {
+        const b = await body();
+        const host = String(b.host ?? '').trim();
+        if (!host) return this.json(res, { error: 'a host, range or CIDR is required' }, 400);
+        const ports = Array.isArray(b.ports) ? b.ports.map(Number).filter((n) => n > 0 && n < 65536) : undefined;
+        const result = await scanTcp(
+          {
+            host,
+            ...(ports?.length ? { ports } : {}),
+            ...(b.connectTimeoutMs
+              ? { connectTimeoutMs: Math.min(5000, Math.max(100, Number(b.connectTimeoutMs))) }
+              : {}),
+          },
+          this.logger,
+        );
+        return this.json(res, result);
+      }
+
+      if (method === 'GET' && p === '/api/connector/serial') {
+        return this.json(res, await listSerialPorts());
+      }
+
+      if (method === 'POST' && p === '/api/connector/serial/sweep') {
+        const b = await body();
+        const path = String(b.path ?? '').trim();
+        if (!path) return this.json(res, { error: 'a serial port path is required' }, 400);
+        const listenMsPerRate = b.listenMsPerRate
+          ? Math.min(15000, Math.max(500, Number(b.listenMsPerRate)))
+          : undefined;
+        return this.json(res, await sweepBaudRates(path, listenMsPerRate ? { listenMsPerRate } : {}));
+      }
+
+      // ---- probe ----
+      if (method === 'GET' && p === '/api/connector/probe') {
+        return this.json(
+          res,
+          this.probe
+            ? { state: this.probe.snapshot(), log: this.probe.log() }
+            : { state: IDLE_PROBE_STATE, log: [] },
+        );
+      }
+
+      if (method === 'POST' && p === '/api/connector/probe/start') {
+        const b = await body();
+        const transport = parseProbeTransport(b.transport);
+        // One probe at a time — a second start replaces the first rather than
+        // leaving an orphan holding the port.
+        if (this.probe) await this.probe.stop();
+        this.probe = new ProbeSession(
+          {
+            transport,
+            autoAck: b.autoAck !== false,
+            maxCaptureBytes: 4 * 1024 * 1024,
+            maxEvents: 2000,
+          },
+          this.logger.child({ mod: 'connector-tool' }),
+          'captures',
+        );
+        await this.probe.start();
+        return this.json(res, { ok: true, state: this.probe.snapshot() });
+      }
+
+      if (method === 'POST' && p === '/api/connector/probe/stop') {
+        if (!this.probe) return this.json(res, { error: 'no probe is running' }, 400);
+        await this.probe.stop();
+        return this.json(res, { ok: true, state: this.probe.snapshot() });
+      }
+
+      if (method === 'POST' && p === '/api/connector/probe/clear') {
+        if (!this.probe) return this.json(res, { error: 'no probe has been started' }, 400);
+        this.probe.clear();
+        return this.json(res, { ok: true });
+      }
+
+      if (method === 'POST' && p === '/api/connector/probe/save') {
+        if (!this.probe) return this.json(res, { error: 'no probe has been started' }, 400);
+        return this.json(res, this.probe.save());
+      }
+
+      if (method === 'POST' && p === '/api/connector/probe/send') {
+        if (!this.probe) return this.json(res, { error: 'no probe is running' }, 400);
+        const b = await body();
+        const mode = b.mode === 'hex' ? 'hex' : 'text';
+        const data = parsePayload(String(b.data ?? ''), mode);
+        if (!data.length) return this.json(res, { error: 'nothing to send' }, 400);
+        await this.probe.send(data);
+        return this.json(res, { ok: true, bytes: data.length });
+      }
+
+      // ---- identify ----
+      if (p === '/api/connector/identify') {
+        if (method === 'GET') {
+          if (!this.probe) return this.json(res, { error: 'no capture yet — start a probe or paste data' }, 400);
+          return this.json(res, this.probe.analyze());
+        }
+        if (method === 'POST') {
+          const b = await body();
+          const mode = b.mode === 'hex' ? 'hex' : 'text';
+          return this.json(res, identify(parsePayload(String(b.data ?? ''), mode)));
+        }
+      }
+
+      return this.json(res, { error: 'not found' }, 404);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ err: message, path: p }, 'connector-tool request failed');
+      return this.json(res, { error: message }, 400);
     }
   }
 
@@ -400,4 +609,57 @@ function readBody(req: http.IncomingMessage): Promise<string | null> {
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', () => resolve(null));
   });
+}
+
+/** The shape the Connector Tool page expects before any probe has been started. */
+const IDLE_PROBE_STATE = {
+  running: false,
+  endpoint: '',
+  autoAck: true,
+  connected: false,
+  startedAt: null,
+  connectedAt: null,
+  bytesIn: 0,
+  bytesOut: 0,
+  lastActivityAt: null,
+  error: null,
+};
+
+/**
+ * Validate the transport the operator described in the browser. The probe opens
+ * real sockets and real COM ports, so every field is checked here rather than
+ * trusted — a typo should be a 400, not an exception out of the transport.
+ */
+function parseProbeTransport(raw: unknown): ProbeTransportConfig {
+  const t = (raw ?? {}) as Record<string, unknown>;
+  if (t.type === 'serial') {
+    const path = String(t.path ?? '').trim();
+    if (!path) throw new Error('a serial port path is required');
+    const baudRate = Number(t.baudRate ?? 9600);
+    if (!Number.isFinite(baudRate) || baudRate <= 0) throw new Error('baud rate must be a positive number');
+    const dataBits = Number(t.dataBits ?? 8);
+    if (![5, 6, 7, 8].includes(dataBits)) throw new Error('data bits must be 5, 6, 7 or 8');
+    const stopBits = Number(t.stopBits ?? 1);
+    if (![1, 2].includes(stopBits)) throw new Error('stop bits must be 1 or 2');
+    const parity = String(t.parity ?? 'none');
+    if (!['none', 'even', 'odd', 'mark', 'space'].includes(parity)) throw new Error(`unknown parity "${parity}"`);
+    return {
+      type: 'serial',
+      path,
+      baudRate,
+      dataBits: dataBits as 5 | 6 | 7 | 8,
+      stopBits: stopBits as 1 | 2,
+      parity: parity as 'none' | 'even' | 'odd' | 'mark' | 'space',
+      dtr: t.dtr !== false,
+      rts: t.rts !== false,
+    };
+  }
+
+  const mode = String(t.mode ?? 'server');
+  if (mode !== 'server' && mode !== 'client') throw new Error('mode must be "server" or "client"');
+  const port = Number(t.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('port must be between 1 and 65535');
+  const host = String(t.host ?? (mode === 'server' ? '0.0.0.0' : '')).trim();
+  if (!host) throw new Error('a host is required to dial a device');
+  return { type: 'tcp', mode, host, port };
 }

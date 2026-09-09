@@ -1,0 +1,211 @@
+{
+  "logLevel": "info",
+  "spoolDir": "./spool",
+
+  "hmis": {
+    "baseUrl": "https://hims.zhhrpl.in/live/portal",
+    "pendingPath": "/mirth/pending",
+    "acknowledgePath": "/mirth/acknowledge",
+    "resultsPath": "/mirth/labresult",
+    "timeoutMs": 15000,
+    "tlsRejectUnauthorized": true
+  },
+
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 7071,
+    "authFile": "./admin-auth.json"
+  },
+
+  "analyzers": [
+    {
+      // VITROS ECi / ECiQ immunodiagnostic — ASTM E1381/E1394.
+      // Behind Moxa NPort 10.20.1.54, switched to TCP Server mode on 4001.
+      // Verified live: the analyzer sends EOT/ENQ on this socket and answers
+      // our ENQ with its own (ASTM contention), so the link is up.
+      "id": "vitros-eciq",
+      "equipmentCode": "ZYCAPIFC01",
+      "equipmentId": 222778829,
+      // HMIS still raises this machine's thyroid panel (TSH/FT3/FT4 — 035, 032,
+      // 074, 038, 009, 010) under the retired middleware's code ZHFC01; only
+      // PSA (075) was re-mapped to ZYCAPIFC01. Both are polled and merged so
+      // one tube's tests are found whichever code they sit under. Remove
+      // ZHFC01 once every ECiQ test in HMIS points at ZYCAPIFC01.
+      "extraEquipmentCodes": ["ZHFC01"],
+      // Shela family clinic — the site the retired Orders service polled
+      // (UserSite=9246332). Narrows every pending query to this lab.
+      "siteId": "9246332",
+
+      "protocol": "astm",
+
+      // COM-mode alternative — used while the NPort was in Real COM mode.
+      // COM3 @ 9600 8-N-1, matching the legacy Vitros_ECiQ.exe.config
+      // (ComVal=COM3, .NET SerialPort defaults). Swap back if the NPort is
+      // ever returned to Real COM.
+      // "transport": {
+      //   "type": "serial",
+      //   "path": "COM3",
+      //   "baudRate": 9600,
+      //   "dataBits": 8,
+      //   "stopBits": 1,
+      //   "parity": "none",
+      //   "dtr": true,
+      //   "rts": true
+      // },
+
+      "transport": {
+        "type": "tcp",
+        "mode": "client",
+        "host": "10.20.1.54",
+        "port": 4001
+      },
+
+      "sendDemographics": true,
+      "hostQuery": false,
+
+      // Real-time: poll HMIS every 30s and program new tests on the ECiQ as
+      // they are ordered, the way the retired Vitros_ECiQ.exe did
+      // (ProactiveUpload=true) — without acknowledging at download time.
+      "orderPoll": {
+        "enabled": true,
+        "intervalMs": 30000,
+        "lookbackDays": 1,
+        "download": true
+      },
+
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+
+      "astm": {
+        "ackTimeoutMs": 15000,
+        "frameMaxData": 240,
+        // The analyzer's own header carries sender "HOST" and NO receiver id,
+        // no processing id and no version — see the vitros-eciq dialect.
+        "senderId": "HOST",
+        "receiverId": "",
+        "dialect": "vitros-eciq"
+      }
+    },
+    {
+      // VITROS 250 chemistry — KERMIT file transfer, not ASTM. Sample programs
+      // and results move as named files (SFILEn.D / R00000nn).
+      // Behind Moxa NPort 10.20.1.53, switched to TCP Server mode on 4001.
+      "id": "vitros-250",
+      "equipmentCode": "ZHFC02",
+      "equipmentId": 177336856,
+      "siteId": "9246332",
+
+      "protocol": "kermit",
+
+      // COM-mode alternative — COM2 @ 9600 8-N-1, matching the legacy
+      // Vitros250.exe.config (ComVal=COM2).
+      // "transport": {
+      //   "type": "serial",
+      //   "path": "COM2",
+      //   "baudRate": 9600,
+      //   "dataBits": 8,
+      //   "stopBits": 1,
+      //   "parity": "none",
+      //   "dtr": true,
+      //   "rts": true
+      // },
+
+      "transport": {
+        "type": "tcp",
+        "mode": "client",
+        "host": "10.20.1.53",
+        "port": 4001
+      },
+
+      "sendDemographics": true,
+      "hostQuery": false,
+
+      // Real-time: sample programs (SFILEn.D) are sent as orders appear in
+      // HMIS, as the retired Vitros250.exe did from its local order table.
+      "orderPoll": {
+        "enabled": true,
+        "intervalMs": 30000,
+        "lookbackDays": 1,
+        "download": true
+      },
+
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+
+      "kermit": {
+        "ackTimeoutMs": 10000,
+        "maxRetries": 5
+      }
+    },
+    {
+      // Erba H360 haematology (CBC) — HL7 v2 over MLLP. The analyzer dials us,
+      // so this side listens.
+      "id": "erba-h360",
+      "equipmentCode": "ZHFC03",
+      "machineId": 2002,
+
+      "protocol": "hl7",
+
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "10.20.1.7",
+        "port": 3010
+      },
+
+      "ipAddress": "10.20.1.7",
+      "portNo": "3010",
+      "siteId": "9246332",
+
+      "sendDemographics": false,
+      // Bidirectional: answer the analyzer's host queries with a worklist. This
+      // is inert until the H360 is switched to host-query mode on the instrument
+      // itself — a results-only H360 sends no query, so nothing changes. When it
+      // does query, the connector looks up the pending order and replies with an
+      // ORM^O01 (see src/codec/hl7/link.ts). Set sendDemographics:true as well
+      // if the patient name should appear on the analyzer's worklist.
+      "hostQuery": true,
+
+      // download:false — we do NOT broadcast orders; the worklist is sent only
+      // in reply to a query. Polling still caches every CBC order row so a
+      // result stays filable after the row is acknowledged (rerun, restart,
+      // late result).
+      "orderPoll": {
+        "enabled": true,
+        "intervalMs": 30000,
+        "lookbackDays": 1,
+        "download": false
+      },
+
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+
+      // H360 instrument code → ZHFC03 parameter name, for the three the HMIS
+      // registers under the report name. Exactly the set the retired middleware
+      // filed (its Results log for SF2608290014: 11 of 22 analytes, these three
+      // renamed, GRAN%/MID% and the # counts NOT mapped to Neutrophils/
+      // Monocytes). Widening this is a lab decision, not a connector one.
+      "testCodeAliases": {
+        "HGB": "HAEMOGLOBIN",
+        "HCT": "HEMATOCRIT",
+        "LYM%": "Lymphocytes"
+      },
+
+      "hl7": {
+        "sendingApp": "LIS",
+        "sendingFacility": "",
+        "charset": "UNICODE",
+        "ack": true,
+        "valueTypes": ["NM"],
+        "encoding": "utf8",
+        "idleFlushMs": 0
+      }
+    }
+  ]
+}

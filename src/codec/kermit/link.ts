@@ -34,6 +34,19 @@ export interface KermitLinkOptions {
   ackTimeoutMs: number;
   /** Retransmissions per packet before the transfer is abandoned. */
   maxRetries: number;
+  /**
+   * Pause after each acknowledged packet before the next goes out.
+   *
+   * The analyzer acknowledges fast but needs time to act on what it just
+   * acknowledged. The legacy host paced every packet by 1 s (VitrosDelayTime)
+   * and never drew an error packet; this link, sending a whole transfer in
+   * ~0.8 s, drew "0005 INVALID PACKET USAGE" / "0008 INVALID SEQUENCE USE"
+   * 160 times in a day, almost always on the transfer that followed another
+   * within two seconds. Default 1000; tests pass 0.
+   */
+  interPacketDelayMs?: number;
+  /** Minimum quiet time between the end of one transfer and the next S. */
+  interTransferDelayMs?: number;
   logger: Logger;
 }
 
@@ -63,6 +76,8 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
 
   private txQueue: Promise<unknown> = Promise.resolve();
   private orderSequence = 0;
+  /** When the last transfer (ours) finished, for the inter-transfer pause. */
+  private lastTransferEndedAt = 0;
 
   private readonly onDataBound = (c: Buffer) => this.onData(c);
 
@@ -193,6 +208,7 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
   /** Send one payload as a named Kermit file: S, F, D…, Z, B. */
   private async sendFile(fileName: string, payload: string): Promise<void> {
     await this.awaitIdle();
+    await this.awaitTransferGap();
     this.sending = true;
     this.emit('wire', { direction: 'OUT', text: `${fileName}: ${payload}` });
     try {
@@ -203,16 +219,35 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
       const ack = await this.sendPacket({ seq: seq++, type: 'S', data: '' });
       if (ack.data) this.params = parseSendInit(ack.data);
 
+      await this.pace();
       await this.sendPacket({ seq: seq++, type: 'F', data: quote(fileName, this.params.qctl) });
       for (const chunk of chunkPayload(payload, this.params)) {
+        await this.pace();
         await this.sendPacket({ seq: seq++, type: 'D', data: chunk });
       }
+      await this.pace();
       await this.sendPacket({ seq: seq++, type: 'Z', data: '' });
+      await this.pace();
       await this.sendPacket({ seq: seq++, type: 'B', data: '' });
     } finally {
       this.sending = false;
       this.decoder.reset();
+      this.lastTransferEndedAt = Date.now();
     }
+  }
+
+  /** The per-packet pause — see KermitLinkOptions.interPacketDelayMs. */
+  private pace(): Promise<void> {
+    const ms = this.opts.interPacketDelayMs ?? 0;
+    return ms > 0 ? delay(ms) : Promise.resolve();
+  }
+
+  /** Hold the next send-init until the previous transfer has been quiet long enough. */
+  private async awaitTransferGap(): Promise<void> {
+    const ms = this.opts.interTransferDelayMs ?? 0;
+    if (ms <= 0 || !this.lastTransferEndedAt) return;
+    const remaining = this.lastTransferEndedAt + ms - Date.now();
+    if (remaining > 0) await delay(remaining);
   }
 
   /** Transmit one packet and wait for its Y, retransmitting on NAK or silence. */

@@ -6,7 +6,10 @@ import { HmisAudit } from '../src/hmis/audit.js';
 import { HmisClient } from '../src/hmis/client.js';
 import { logger } from '../src/logger.js';
 
-const FILE = './logs/hmis-audit-test.log';
+const BASE = './logs/hmis-audit-test.log';
+const audit = new HmisAudit(BASE, logger);
+// Entries land in the day file beside BASE (hmis-audit-test-YYYY-MM-DD.log).
+const FILE = audit.currentPath();
 rmSync(FILE, { force: true });
 
 const client = new HmisClient({
@@ -17,7 +20,7 @@ const client = new HmisClient({
   timeoutMs: 15000,
   tlsRejectUnauthorized: true,
   logger,
-  audit: new HmisAudit(FILE, logger),
+  audit,
 });
 
 // 1) a barcode with a live order, 2) one with none

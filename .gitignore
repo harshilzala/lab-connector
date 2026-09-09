@@ -8,10 +8,10 @@ logs/
 spool/
 data/
 
-# Local configuration (contains the shared HMAC secret). Copy from
-# config.example.json and keep out of version control.
-
-
+# Local configuration — per-site analyzer wiring, HMIS URL, equipment ids and
+# COM/TCP endpoints. Differs on every machine. Copy from config.example.json
+# and keep out of version control.
+config.json
 
 # Local dashboard credential (scrypt hash + recovery key hash). Seeded on
 # first start — never commit.
@@ -30,4 +30,10 @@ captures/
 # throwaway scratch files (scripts, staged samples) — never committed
 .scratch/
 
-config.json
+# PM2 home. Kept beside the connector rather than the machine-wide one so an
+# unelevated account can drive PM2 (see magic/README.md). Pure machine-local
+# runtime state: daemon pid, log, and the dump pm2 resurrect reads at logon.
+.pm2/
+
+# Set by Lab-Interface-stop.bat; tells the watchdog the stop was deliberate.
+.lab-maintenance

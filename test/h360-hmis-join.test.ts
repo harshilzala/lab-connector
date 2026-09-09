@@ -49,7 +49,10 @@ const ZHFC03_IDENTIFIERS = [
   'WBC',
 ];
 
-const cfg = loadConfig('./config.json');
+// Reads the reference config, not the deployed config.json — see the note in
+// test/ack-after-file.test.ts. The ZHFC03 corpus below is Nashik's, so the
+// analyzer definition it joins against has to be Nashik's too.
+const cfg = loadConfig(join(here, 'fixtures', 'reference-config.json'));
 const analyzer = cfg.analyzers.find((a) => a.id === 'erba-h360')!;
 assert.equal(analyzer.equipmentCode, 'ZHFC03', 'the H360 files against the CBC equipment');
 
@@ -115,8 +118,14 @@ assert.equal(byId.get('WBC'), '8.52');
 assert.equal(byId.get('HAEMOGLOBIN'), '10.9', 'HGB value lands on HAEMOGLOBIN');
 assert.equal(byId.get('HEMATOCRIT'), '31.5', 'HCT value lands on HEMATOCRIT');
 assert.equal(byId.get('Lymphocytes'), '23.7', 'LYM% lands on the percentage parameter');
-assert.equal(byId.get('Absolute Lymphocyte count*'), '2.02', 'LYM# lands on the absolute count');
-assert.notEqual(byId.get('Lymphocytes'), byId.get('Absolute Lymphocyte count*'), '% and # are distinct parameters');
+// LYM# is deliberately NOT aliased. testCodeAliases carries exactly the three
+// renames the retired middleware filed; the absolute counts and GRAN%/MID% were
+// left out because widening the set is a lab decision, not a connector one.
+// What matters for safety is that the unmapped "#" count is not filed at all,
+// and above all that it never lands on the "%" parameter — those are different
+// analytes and 2.02 filed as 23.7% would be a real, plausible-looking error.
+assert.equal(byId.get('Absolute Lymphocyte count*'), undefined, 'LYM# is not filed while it has no alias');
+assert.notEqual(byId.get('Lymphocytes'), '2.02', 'the absolute count never lands on the percentage parameter');
 console.log('✓ each value lands on the parameter it belongs to');
 
 // Every filed row carries the ids the results endpoint files against.
@@ -126,5 +135,39 @@ for (const r of rows) {
   assert.ok(r.parameterId, `${r.identifier} has no parameterId`);
 }
 console.log('✓ every filed row carries labResultId / labServiceId / parameterId');
+
+// equipmentId names the machine that produced the value, so it comes from
+// config.json — NOT from the pending row, which carries whichever equipment the
+// order happened to be raised against.
+{
+  // The rule is exercised against a FIXTURE id, not whatever config.json holds
+  // today: this pins the mapper's behaviour, and a lab editing config.json must
+  // not be able to turn the check red or, worse, green-by-omission.
+  const CONFIGURED = 424242;
+  const configured = { ...analyzer, equipmentId: CONFIGURED } as never;
+  const upl = toResultUploads(configured, parsed)[0]!;
+  const otherEq = orderRows.map((o) => ({ ...o, equipmentId: 999999999 }));
+
+  for (const r of toLisResultRows(upl, orderRows, undefined, analyzer.testCodeAliases).rows) {
+    assert.equal(r.equipmentId, CONFIGURED, `${r.identifier} must report the configured equipmentId`);
+  }
+  // Pending rows saying something else must not win.
+  const viaOther = toLisResultRows(upl, otherEq, undefined, analyzer.testCodeAliases);
+  for (const r of viaOther.rows) {
+    assert.equal(r.equipmentId, CONFIGURED, 'config wins over the pending row');
+  }
+
+  // Whether the LIVE config fills it in is a deployment question, not a code
+  // one — but say so, because with it unset every H360 result is filed under
+  // whichever equipment the order happened to be raised against.
+  if (!analyzer.equipmentId) {
+    console.log('  NOTE: config.json sets no equipmentId for this analyzer — results fall back to the pending row');
+  }
+  // …but a config with no id still falls back rather than sending null.
+  const noId = toResultUploads({ ...analyzer, equipmentId: undefined } as never, parsed)[0]!;
+  const viaFallback = toLisResultRows(noId, otherEq, undefined, analyzer.testCodeAliases);
+  assert.equal(viaFallback.rows[0]!.equipmentId, 999999999, 'falls back to the pending row when config omits it');
+  console.log('✓ equipmentId comes from config.json, with the pending row as fallback');
+}
 
 console.log('\nALL H360 → ZHFC03 JOIN TESTS PASSED');

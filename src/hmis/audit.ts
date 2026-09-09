@@ -1,6 +1,5 @@
-import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
 import type { Logger } from '../logger.js';
+import { DailyLogFile } from '../maintenance/daily-log.js';
 
 // =============================================================================
 // HMIS transaction log — one JSON line per call to the gateway.
@@ -16,8 +15,11 @@ import type { Logger } from '../logger.js';
 // therefore carries an `outcome` verdict derived from the response body, not
 // from the transport.
 //
-// Format is line-delimited JSON so a single barcode's whole history is one
-// grep:  findstr LB2609020570 logs\hmis.log
+// Format is line-delimited JSON, one file per calendar day —
+// logs\hmis-2026-09-07.log, see DailyLogFile — kept for retention.logDays
+// (30 at the Cancer site). A single barcode's whole history is therefore one
+// grep across the family:
+//   findstr LB2609020570 logs\hmis-*.log
 // =============================================================================
 
 /** Which of the three endpoints the entry describes. */
@@ -40,6 +42,14 @@ export interface HmisAuditEntry {
   /** Barcode(s) the call concerns — the grep key. */
   sampleId: string | string[] | null;
   eqCode?: string | null;
+  /**
+   * Result uploads only: one flat line per value —
+   *   "SF2609050017 1.000000+032+1 = 395 -> labResultId 92768304"
+   * The same facts are inside `request`, but only as nested JSON. This is the
+   * readable index into it, so a transfer can be traced by grepping whichever
+   * handle the operator has: barcode, assay identifier, value, or labResultId.
+   */
+  filed?: string[];
   method: 'GET' | 'POST';
   url: string;
   /** Request body, parsed. Absent on GET. */
@@ -59,36 +69,28 @@ export interface HmisAuditEntry {
 const MAX_FIELD_CHARS = 8000;
 
 export class HmisAudit {
-  constructor(
-    private readonly file: string,
-    private readonly logger: Logger,
-    private readonly maxBytes = 10 * 1024 * 1024,
-  ) {
-    mkdirSync(dirname(file), { recursive: true });
+  private readonly file: DailyLogFile;
+
+  /**
+   * @param base     configured file name, e.g. ./logs/hmis.log. Entries go to
+   *                 <stem>-YYYY-MM-DD.log beside it; the base itself is unused.
+   * @param maxBytes a day that grows past this continues in a numbered part —
+   *                 nothing is dropped, that is the retention sweeper's job.
+   */
+  constructor(base: string, logger: Logger, maxBytes = 10 * 1024 * 1024) {
+    this.file = new DailyLogFile(base, logger, maxBytes);
+  }
+
+  /** The file the next entry lands in — e.g. logs\hmis-2026-09-07.log */
+  currentPath(): string {
+    return this.file.currentPath();
   }
 
   record(entry: HmisAuditEntry): void {
     // Never let an audit-write problem break a call that otherwise succeeded:
-    // the result upload matters more than its own log line.
-    try {
-      this.rotateIfLarge();
-      appendFileSync(this.file, JSON.stringify(entry, truncate) + '\n', 'utf8');
-    } catch (err) {
-      this.logger.warn(
-        { file: this.file, err: err instanceof Error ? err.message : String(err) },
-        'could not write the HMIS transaction log',
-      );
-    }
-  }
-
-  /** Single-generation rotation: hmis.log → hmis.log.1, oldest is dropped. */
-  private rotateIfLarge(): void {
-    try {
-      if (statSync(this.file).size < this.maxBytes) return;
-      renameSync(this.file, `${this.file}.1`);
-    } catch {
-      /* no file yet, or another process holds it — either way just append */
-    }
+    // the result upload matters more than its own log line. DailyLogFile
+    // swallows the write error and reports it on the application log.
+    this.file.append(JSON.stringify(entry, truncate));
   }
 }
 

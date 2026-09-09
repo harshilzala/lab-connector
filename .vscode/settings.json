@@ -3,6 +3,7 @@
   // commented-out COM-mode transport beside the live TCP one. Tell the editor
   // that too, or it flags every one of those lines as a JSON syntax error.
   "files.associations": {
-    "config.json": "jsonc"
+    "config.json": "jsonc",
+    "config.example.json": "jsonc"
   }
 }

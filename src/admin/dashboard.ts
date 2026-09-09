@@ -187,6 +187,7 @@ ${FONT_LINK}
     <div class="tools">
       <span class="clock" id="clock"></span>
       <span class="who"><span class="avatar">${initial}</span>${esc(o.username)}</span>
+      <a class="btn btn-ghost btn-sm" href="/connector" title="Identify and connect a new machine">Connector Tool</a>
       <button class="btn btn-ghost btn-sm" type="button" onclick="openPw()">Change password</button>
       <form method="post" action="/logout" style="margin:0">
         <button class="btn btn-ghost btn-sm" type="submit">Sign out</button>
@@ -235,7 +236,41 @@ ${FONT_LINK}
 <script>
 // state.max is the id of the maximized machine, or null for the normal grid.
 // state.analyzers caches the last poll so toggling repaints without a fetch.
-const state = { open: null, tab: 'wire', max: null, analyzers: [] };
+// state.scroll remembers where the operator had scrolled each panel, keyed by
+// analyzer+tab. Needed because the 5s poll rebuilds the whole card grid, which
+// destroys the panel element and would otherwise snap the view back to the top
+// mid-read.
+const state = { open: null, tab: 'wire', max: null, analyzers: [], scroll: {} };
+
+const scrollKey = (id) => id + '|' + state.tab;
+
+/**
+ * Keep the operator's place across a re-render.
+ *
+ * The wire log is newest-first, so a new frame is PREPENDED and everything the
+ * operator was reading shifts down. Restoring the raw pixel offset would still
+ * move the text under their eyes, so the offset is corrected by however much
+ * the content grew above it — the frame they were looking at stays put.
+ *
+ * Sitting at the very top is treated as "follow the latest": the view is left
+ * at 0 so incoming frames appear naturally, which is the one case where NOT
+ * moving is what the operator wants.
+ */
+function keepScroll(el, id) {
+  const key = scrollKey(id);
+  const prev = state.scroll[key];
+  if (prev && prev.top > 0) {
+    el.scrollTop = prev.top + (el.scrollHeight - prev.height);
+  }
+  const save = () => { state.scroll[key] = { top: el.scrollTop, height: el.scrollHeight }; };
+  save();
+  // One listener per element: this runs twice per poll (once when the grid is
+  // rebuilt, once when the fetch lands) and the element outlives both calls.
+  if (!el.dataset.scrollBound) {
+    el.dataset.scrollBound = '1';
+    el.addEventListener('scroll', save, { passive: true });
+  }
+}
 
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function time(iso) { return iso ? new Date(iso).toLocaleTimeString() : '\u2014'; }
@@ -252,10 +287,27 @@ function statusPill(a) {
     ? '<span class="pill ok">Connected</span>'
     : '<span class="pill bad">Offline</span>';
 }
-function queuePill(sp) {
+function queuePill(a) {
+  const sp = a.spool || { pending: 0, failed: 0 };
+  // A staged analyzer has no queue: its results wait, per sample, for the
+  // HMIS order to exist. "Waiting" is the honest word for that.
+  if (a.filing === 'staged') {
+    const st = a.staged || { waiting: 0, complete: 0 };
+    if (st.waiting > 0) return '<span class="pill warn">' + st.waiting + ' waiting</span>';
+    return '<span class="pill ok">Clear</span>';
+  }
   if (sp.failed > 0)  return '<span class="pill bad">' + sp.failed + ' failed</span>';
   if (sp.pending > 0) return '<span class="pill warn">' + sp.pending + ' pending</span>';
   return '<span class="pill ok">Clear</span>';
+}
+// Order store + poller state. A poll error is the thing an operator must see:
+// it means new orders are not reaching this analyzer.
+function ordersLine(o) {
+  if (!o) return '—';
+  var stored = o.stored + ' stored';
+  if (!o.pollEnabled) return esc(stored) + ' · poll off';
+  if (o.lastPollError) return '<span class="pill bad">poll failing</span> ' + esc(stored) + ' · ' + esc(o.lastPollError);
+  return esc(stored) + ' · polled ' + time(o.lastPollAt);
 }
 
 function renderStats(analyzers) {
@@ -289,6 +341,15 @@ function renderCards(analyzers) {
 
   const grid = document.getElementById('cards');
   grid.classList.toggle('has-max', !!state.max);
+
+  // Rebuilding the grid throws away the open panel and replaces it with the
+  // "Pick a view above" placeholder, and renderPanel only refills it once its
+  // fetch returns. On the 5s poll that collapsed the panel and flashed the
+  // operator's reading position away several times a minute. Carry the current
+  // contents across so the panel is never empty in between.
+  const openPanel = state.open ? document.getElementById('panel-' + state.open) : null;
+  const carried = openPanel ? openPanel.innerHTML : null;
+
   grid.innerHTML = analyzers.map(a => \`
     <article class="card \${state.max === a.id ? 'is-max' : ''}">
       <div class="card-top">
@@ -312,12 +373,13 @@ function renderCards(analyzers) {
       </div>
       <div class="card-body">
         <div class="kv"><span class="k">Last message</span><span class="v">\${time(a.lastMessageAt)}</span></div>
-        <div class="kv"><span class="k">Upload queue</span><span class="v">\${queuePill(a.spool)}</span></div>
+        <div class="kv"><span class="k">\${a.filing === 'staged' ? 'Results' : 'Upload queue'}</span><span class="v">\${queuePill(a)}</span></div>
+        <div class="kv"><span class="k">Orders</span><span class="v">\${ordersLine(a.orders)}</span></div>
         <div class="tabs">
           <button type="button" data-a="\${esc(a.id)}" data-t="wire"
                   class="\${state.open === a.id && state.tab === 'wire' ? 'active' : ''}">Wire log</button>
           <button type="button" data-a="\${esc(a.id)}" data-t="spool"
-                  class="\${state.open === a.id && state.tab === 'spool' ? 'active' : ''}">Upload queue</button>
+                  class="\${state.open === a.id && state.tab === 'spool' ? 'active' : ''}">\${a.filing === 'staged' ? 'Results' : 'Upload queue'}</button>
         </div>
         <div id="tools-\${esc(a.id)}"></div>
         <div class="panel" id="panel-\${esc(a.id)}">
@@ -325,6 +387,16 @@ function renderCards(analyzers) {
         </div>
       </div>
     </article>\`).join('');
+
+  // Put the carried contents back before the browser paints, so the panel keeps
+  // both its text and the operator's scroll position while renderPanel refetches.
+  if (carried !== null) {
+    const fresh = document.getElementById('panel-' + state.open);
+    if (fresh) {
+      fresh.innerHTML = carried;
+      keepScroll(fresh, state.open);
+    }
+  }
 
   document.querySelectorAll('button[data-max]').forEach(b => {
     b.onclick = () => setMax(state.max === b.dataset.max ? null : b.dataset.max);
@@ -384,24 +456,43 @@ async function renderPanel(id) {
           '<li><div class="head"><span class="dir ' + esc(w.direction) + '">' + esc(w.direction) + '</span>' +
           '<span>' + time(w.at) + '</span></div><pre>' + esc(w.text) + '</pre></li>').join('') + '</ul>'
       : '<div class="empty">No traffic on the wire yet.</div>';
+    keepScroll(el, id);
     return;
   }
 
   if (tools) tools.innerHTML = '';
+  const an = (state.analyzers || []).find(a => a.id === id);
+  if (an && an.filing === 'staged') return renderStaged(id, el);
   const s = await j('/api/analyzers/' + encodeURIComponent(id) + '/spool');
   // Ids and barcodes ride in attributes, so they go through esc() here too.
   const removeBtn = (env) =>
     '<button class="btn btn-ghost btn-sm btn-danger" type="button" data-q-remove="' + esc(env.id) +
     '" data-q-barcode="' + esc(env.payload.barcode) + '">Remove</button>';
+  // A remainder item holds only the analytes that had no order row; the rest of
+  // the sample is already filed and acknowledged. Saying "queued" against the
+  // bare barcode reads as though nothing reached HMIS, so show the split.
+  const partly = (env) => {
+    const filed = (env.payload && env.payload.filedAnalytes) || 0;
+    if (!filed) return '';
+    const left = ((env.payload && env.payload.results) || []).length;
+    return '<div class="err">' + filed + ' analyte' + (filed === 1 ? '' : 's') +
+      ' already filed to HMIS &mdash; ' + left + ' still ' + (left === 1 ? 'has' : 'have') +
+      ' no order row</div>';
+  };
   const failed = (s.failed || []).map(f =>
     '<li><div class="grow"><div class="barcode">' + esc(f.payload.barcode) + '</div>' +
+    partly(f) +
     '<div class="err">' + esc(f.lastError || 'delivery failed') + '</div></div>' +
     '<span class="pill bad">' + f.attempts + ' tries</span>' +
     '<button class="btn btn-ghost btn-sm" type="button" data-q-retry="' + esc(f.id) + '">Retry</button>' +
     removeBtn(f) + '</li>').join('');
-  const pending = (s.pending || []).map(p =>
-    '<li><div class="grow"><div class="barcode">' + esc(p.payload.barcode) + '</div></div>' +
-    '<span class="pill warn">queued</span>' + removeBtn(p) + '</li>').join('');
+  const pending = (s.pending || []).map(p => {
+    const filed = (p.payload && p.payload.filedAnalytes) || 0;
+    return '<li><div class="grow"><div class="barcode">' + esc(p.payload.barcode) + '</div>' +
+      partly(p) + '</div>' +
+      '<span class="pill ' + (filed ? 'mut' : 'warn') + '">' +
+      (filed ? 'partly filed' : 'queued') + '</span>' + removeBtn(p) + '</li>';
+  }).join('');
 
   el.innerHTML = (failed || pending)
     ? '<ul class="q">' + failed + pending + '</ul>'
@@ -411,6 +502,66 @@ async function renderPanel(id) {
   el.querySelectorAll('[data-q-remove]').forEach(b => {
     b.onclick = () => removeQueued(id, b.dataset.qRemove, b.dataset.qBarcode);
   });
+  keepScroll(el, id);
+}
+
+// Staged analyzers (filing.mode "staged"): one row per sample, showing how
+// much of it has reached HMIS and what is still waiting for an order row.
+async function renderStaged(id, el) {
+  const { samples } = await j('/api/analyzers/' + encodeURIComponent(id) + '/staged');
+  const rows = (samples || []).map(s => {
+    const pill = s.complete
+      ? '<span class="pill ok">filed</span>'
+      : (s.filed > 0 ? '<span class="pill mut">partly filed</span>' : '<span class="pill warn">waiting for order</span>');
+    const codes = (s.waitingCodes || []);
+    const detail = s.filed + ' of ' + s.total + ' filed' +
+      (s.waiting ? ' &mdash; ' + s.waiting + ' waiting: ' + esc(codes.slice(0, 8).join(', ')) + (codes.length > 8 ? ' &hellip;' : '') : '') +
+      (s.dropped ? ' &mdash; ' + s.dropped + ' not interfaced' : '');
+    const when = 'received ' + time(s.firstReceivedAt) +
+      (s.lastCheckedAt ? ' · HMIS asked ' + time(s.lastCheckedAt) : '') +
+      (s.attempts ? ' · ' + s.attempts + ' pass' + (s.attempts === 1 ? '' : 'es') : '');
+    const from = s.rekeyedFrom ? '<div class="err">re-keyed from ' + esc(s.rekeyedFrom) + '</div>' : '';
+    const err = (s.lastError && !s.complete && !/^no order row yet/.test(s.lastError))
+      ? '<div class="err">' + esc(s.lastError) + '</div>' : '';
+    const actions = s.complete ? '' :
+      '<button class="btn btn-ghost btn-sm" type="button" data-s-file="' + esc(s.barcode) + '">File now</button>' +
+      '<button class="btn btn-ghost btn-sm" type="button" data-s-rekey="' + esc(s.barcode) + '">Re-key</button>';
+    return '<li><div class="grow"><div class="barcode">' + esc(s.barcode) + '</div>' +
+      '<div class="err">' + detail + '</div><div class="err">' + esc(when) + '</div>' + from + err + '</div>' +
+      pill + actions +
+      '<button class="btn btn-ghost btn-sm btn-danger" type="button" data-s-remove="' + esc(s.barcode) + '">Remove</button></li>';
+  }).join('');
+  el.innerHTML = rows
+    ? '<ul class="q">' + rows + '</ul>'
+    : '<div class="empty">No staged results &mdash; everything received has reached the HMIS.</div>';
+  el.querySelectorAll('[data-s-file]').forEach(b => { b.onclick = () => stagedFile(id, b.dataset.sFile); });
+  el.querySelectorAll('[data-s-rekey]').forEach(b => { b.onclick = () => stagedRekey(id, b.dataset.sRekey); });
+  el.querySelectorAll('[data-s-remove]').forEach(b => { b.onclick = () => stagedRemove(id, b.dataset.sRemove); });
+  keepScroll(el, id);
+}
+
+async function stagedFile(id, barcode) {
+  await j('/api/analyzers/' + encodeURIComponent(id) + '/staged/' + encodeURIComponent(barcode) + '/file', { method: 'POST' });
+  renderPanel(id);
+}
+
+// The fix for a sample the operator typed wrongly on the instrument (an MRN, a
+// short number, a name): move its values to the real tube barcode and file.
+async function stagedRekey(id, barcode) {
+  const to = prompt('Move the results of ' + barcode + ' to which barcode?\\n\\nType the barcode exactly as printed on the tube.');
+  if (!to || !to.trim()) return;
+  const r = await j('/api/analyzers/' + encodeURIComponent(id) + '/staged/' + encodeURIComponent(barcode) + '/rekey',
+    { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ to: to.trim() }) });
+  if (r && r.error) alert(r.error);
+  refresh();
+  renderPanel(id);
+}
+
+async function stagedRemove(id, barcode) {
+  if (!confirm('Remove sample ' + barcode + ' from the result store?\\n\\nIts unfiled values will never be sent to the HMIS.')) return;
+  await j('/api/analyzers/' + encodeURIComponent(id) + '/staged/' + encodeURIComponent(barcode), { method: 'DELETE' });
+  refresh();
+  renderPanel(id);
 }
 
 async function retry(id, msgId) {

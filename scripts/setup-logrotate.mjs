@@ -1,4 +1,4 @@
-// Configure pm2-logrotate for a 7-day log window. Idempotent: re-running it
+// Configure pm2-logrotate for a 30-day log window. Idempotent: re-running it
 // when nothing has changed does nothing at all.
 //
 //   npm run pm2:logrotate
@@ -21,7 +21,7 @@ const MODULE = 'pm2-logrotate';
 // soon as it hits 10M rather than waiting for midnight.
 const WANTED = {
   max_size: '10M',
-  retain: '7',
+  retain: '30',
   compress: 'true',
   dateFormat: 'YYYY-MM-DD_HH-mm-ss',
   rotateInterval: '0 0 * * *',
@@ -78,5 +78,5 @@ if (changes.length === 0) {
 
 console.log('\neffective configuration:');
 for (const [k, v] of Object.entries(currentConfig())) console.log(`  ${k.padEnd(15)} ${v}`);
-console.log('\nlogs rotate daily, 7 kept, gzipped, early rotation past 10M.');
+console.log('\nlogs rotate daily, 30 kept, gzipped, early rotation past 10M.');
 console.log('verify any time with:  pm2 conf pm2-logrotate');

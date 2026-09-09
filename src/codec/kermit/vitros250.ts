@@ -65,7 +65,13 @@ export const decodeTestCode = (ch: string): string => String(ch.charCodeAt(0));
 function flatName(o: OrderDownload): string {
   const p = o.patient;
   if (!p) return '';
-  const joined = [p.lastName ?? '', p.firstName ?? '', p.middleName ?? ''].join('');
+  // HMIS sends a lone "." as the last name of a single-name patient (LName "."
+  // FName "DEEP SHIKHA"). Joined as-is that went on the wire as ".DEEPSHIKHA"
+  // — 102 of 1177 orders on 2026-09-07 — where the legacy host, reading one
+  // Name column, sent "DEEPSHIKHA". Drop a part that is ONLY a dot; a dot
+  // inside a real name ("KAPILKUMAR.") is still kept, as the corpus requires.
+  const part = (s: string | null | undefined) => ((s ?? '').trim() === '.' ? '' : (s ?? ''));
+  const joined = [part(p.lastName), part(p.firstName), part(p.middleName)].join('');
   // WHITESPACE ONLY — nothing else is touched. "MOTIBHAI M CHAUDHARY" goes on
   // the wire as "MOTIBHAIMCHAUDHARY", but punctuation and case both survive:
   // the capture carries "KAPILKUMAR." and "MrsJANAKBANARENDRASINHCHU", so
