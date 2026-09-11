@@ -80,6 +80,23 @@ export interface ProbeState {
   error: string | null;
 }
 
+/**
+ * A dial error as the operator needs to read it. ECONNREFUSED from a serial
+ * device server is nearly always its one-connection limit: a Moxa NPort in
+ * TCP Server mode accepts a single client, so while the live connector holds
+ * the port every further dial is refused.
+ */
+function explainDial(err: Error): string {
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === 'ECONNREFUSED') {
+    return `${err.message} (refused — a device server such as an NPort takes one connection; another session, usually the running connector, already holds it)`;
+  }
+  if (code === 'ETIMEDOUT' || code === 'EHOSTUNREACH') {
+    return `${err.message} (no answer — check the address, the cable and that the port is open)`;
+  }
+  return err.message;
+}
+
 const ENQ = 0x05;
 const ACK = 0x06;
 const STX = 0x02;
@@ -166,7 +183,17 @@ export class ProbeSession extends EventEmitter {
     transport.on('connect', () => {
       this.state.connected = true;
       this.state.connectedAt = new Date().toISOString();
+      this.state.error = null;
       this.push('SYS', Buffer.from(`peer connected on ${transport.describe}`));
+    });
+    // Client mode redials every few seconds; a dial that keeps failing would
+    // otherwise look exactly like a device that has simply not spoken yet.
+    // Record the first failure and each change of reason, not every retry.
+    transport.on('dial-error', (err: Error) => {
+      const message = explainDial(err);
+      if (this.state.error === message) return;
+      this.state.error = message;
+      this.push('SYS', Buffer.from(`dial failed: ${message} — retrying`));
     });
     transport.on('close', () => {
       this.state.connected = false;

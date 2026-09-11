@@ -1,4 +1,5 @@
 import http from 'node:http';
+import os from 'node:os';
 import type { Logger } from '../logger.js';
 import type { AnalyzerStatus, WireLogEntry } from '../session/orchestrator.js';
 import type { SpoolEnvelope } from '../queue/spool.js';
@@ -319,6 +320,24 @@ export class AdminServer {
       if (method === 'POST' && p === '/api/connector/probe/start') {
         const b = await body();
         const transport = parseProbeTransport(b.transport);
+        // The probe runs inside the connector, so it competes with the live
+        // analyzer sessions for the same endpoints. A serial device server
+        // (Moxa NPort) takes one TCP client and refuses the rest, and a port
+        // the connector listens on cannot be bound twice — either way the
+        // probe would just redial for ever. Say so up front.
+        const held = this.heldBy(transport);
+        if (held) {
+          return this.json(
+            res,
+            {
+              error:
+                `${held.endpoint} is already held by the running "${held.id}" analyzer session, and the device ` +
+                `accepts one connection at a time. Stop the connector (or remove that analyzer from config.json) ` +
+                `before probing it, or probe from a PC that is not running the connector.`,
+            },
+            409,
+          );
+        }
         // One probe at a time — a second start replaces the first rather than
         // leaving an orphan holding the port.
         if (this.probe) await this.probe.stop();
@@ -382,6 +401,18 @@ export class AdminServer {
       this.logger.warn({ err: message, path: p }, 'connector-tool request failed');
       return this.json(res, { error: message }, 400);
     }
+  }
+
+  /**
+   * The live analyzer session, if any, whose transport is the same TCP
+   * host:port the probe wants. Direction is ignored on purpose: the status
+   * endpoint is `tcp://host:port (mode)`, and the clash is the endpoint.
+   */
+  private heldBy(t: ProbeTransportConfig): { id: string; endpoint: string } | null {
+    if (t.type !== 'tcp') return null;
+    const want = `tcp://${t.host}:${t.port} (`;
+    const hit = this.backend.statuses().find((s) => s.endpoint.startsWith(want));
+    return hit ? { id: hit.id, endpoint: hit.endpoint } : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -661,5 +692,19 @@ function parseProbeTransport(raw: unknown): ProbeTransportConfig {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('port must be between 1 and 65535');
   const host = String(t.host ?? (mode === 'server' ? '0.0.0.0' : '')).trim();
   if (!host) throw new Error('a host is required to dial a device');
+  // The classic slip: the device's address typed into a "Listen" probe. That
+  // binds a socket on an IP this PC does not have and dies with EADDRNOTAVAIL,
+  // which reads like the tool is broken rather than pointed the wrong way.
+  if (mode === 'server' && !isLocalAddress(host)) {
+    throw new Error(
+      `${host} is not an address on this PC, so the probe cannot listen on it. ` +
+        `Listen binds a local interface (0.0.0.0 for all); to reach a device at ${host} choose "Connect — we dial the device".`,
+    );
+  }
   return { type: 'tcp', mode, host, port };
+}
+
+function isLocalAddress(host: string): boolean {
+  if (['0.0.0.0', '::', 'localhost', '127.0.0.1', '::1'].includes(host)) return true;
+  return Object.values(os.networkInterfaces()).some((addrs) => addrs?.some((a) => a.address === host));
 }
