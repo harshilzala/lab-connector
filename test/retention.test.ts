@@ -93,3 +93,31 @@ const r2 = new RetentionSweeper({
 console.log('pending held:', r2.spoolItemsDeleted === 0 && readdirSync(spoolPending).includes('OLD002-eee.json') ? 'PASS' : 'FAIL');
 
 rmSync(root, { recursive: true, force: true });
+
+// ---- separate log window: logDays keeps logs longer than spool items --------
+const logDir2 = join(root, 'logs2');
+mkdirSync(logDir2, { recursive: true });
+const log2 = (name: string, daysOld: number) => {
+  const p = join(logDir2, name);
+  writeFileSync(p, 'x'.repeat(100));
+  const t = ago(daysOld);
+  utimesSync(p, t, t);
+};
+log2('hmis-2026-08-01.log', 31);
+log2('hmis-2026-08-10.log', 29);
+log2('wire-cancer-abl9-2026-08-20.log', 8);
+const r3 = new RetentionSweeper({
+  days: 7,
+  logDays: 30,
+  logDir: logDir2,
+  spoolRoot: join(root, 'no-spool'),
+  intervalMs: 60_000,
+  includeSpoolPending: true,
+  logger,
+}).sweep();
+const left3 = readdirSync(logDir2).sort();
+console.log('\nlogDays=30 sweep:', r3, 'left:', left3);
+const ok3 = r3.logFilesDeleted === 1 && left3.join() === 'hmis-2026-08-10.log,wire-cancer-abl9-2026-08-20.log';
+console.log(ok3 ? 'OK  logs older than logDays go, 8-day-old log stays' : 'FAILED logDays window');
+if (!ok3) process.exitCode = 1;
+rmSync(root, { recursive: true, force: true });

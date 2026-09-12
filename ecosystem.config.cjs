@@ -1,11 +1,11 @@
-// PM2 process definition for LAB-Interface — the HMIS lab connector.
+// PM2 process definition for Lab-Interface — the HMIS lab connector.
 //
 // This file is .cjs (not .js) on purpose: package.json sets "type": "module",
 // so a plain .js file is treated as ESM and `module.exports` would throw. PM2
 // reads CommonJS config, hence the .cjs extension.
 //
-// Day to day this is driven by LAB-Interface.bat (start/redeploy) and
-// LAB-Interface-stop.bat (stop), not by the npm scripts below.
+// Day to day this is driven by Lab-Interface.bat (start/redeploy) and
+// Lab-Interface-stop.bat (stop), not by the npm scripts below.
 //
 // Build + start together:   npm run pm2:start      (tsc, then pm2 start this)
 // Redeploy after edits:     npm run pm2:restart    (tsc, then pm2 restart)
@@ -18,7 +18,7 @@ const path = require('node:path');
 module.exports = {
   apps: [
     {
-      name: 'LAB-Interface',
+      name: 'Lab-Interface',
       script: path.join(__dirname, 'dist', 'index.js'),
       cwd: __dirname,
 
@@ -42,7 +42,7 @@ module.exports = {
       // after a delay rather than hammered. The ceiling is deliberately high
       // (not PM2's default 10) so a transient fault — the analyzer switch down
       // overnight, the network not up yet at logon — never parks the connector
-      // permanently. If PM2 ever does give up entirely, the LAB-Interface
+      // permanently. If PM2 ever does give up entirely, the Lab-Interface
       // watchdog scheduled task brings it back within 5 minutes.
       min_uptime: 10000,
       max_restarts: 1000,

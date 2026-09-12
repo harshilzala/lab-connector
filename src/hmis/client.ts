@@ -122,10 +122,18 @@ export class HmisClient {
     const path = this.opts.acknowledgePath;
     const startedAt = Date.now();
     const sampleId = [...new Set(items.map((i) => i.sampleID))];
+    // Project to the gateway's own nine columns. MirthAcknowledgeItem also
+    // carries connector-side bookkeeping (resultType, synthesized) that this
+    // endpoint has never been sent and has no column for; posting the object
+    // verbatim would put unknown properties in front of a gateway that answers
+    // HTTP 200 to everything and reports failure only in the body. Listing the
+    // fields keeps the request byte-identical to what it has always been,
+    // whatever else the connector later hangs off the row.
+    const body = items.map(toAcknowledgeWire);
     let httpStatus: number | null = null;
     let response: unknown = null;
     try {
-      const sent = await this.send('POST', path, JSON.stringify(items));
+      const sent = await this.send('POST', path, JSON.stringify(body));
       httpStatus = sent.status;
       const parsed = this.parse(sent.text, path) as Partial<HmisResultUploadResponse> | null;
       response = parsed ?? sent.text;
@@ -149,7 +157,7 @@ export class HmisClient {
         method: 'POST',
         path,
         startedAt,
-        request: items,
+        request: body,
         httpStatus,
         response,
         outcome: 'sent',
@@ -162,7 +170,7 @@ export class HmisClient {
         method: 'POST',
         path,
         startedAt,
-        request: items,
+        request: body,
         httpStatus,
         response,
         outcome: httpStatus === 200 ? 'none-matched' : 'error',
@@ -335,4 +343,24 @@ export class HmisClient {
       return null;
     }
   }
+}
+
+/**
+ * The exact acknowledge body the gateway accepts — nine columns, no more.
+ *
+ * An explicit projection rather than a spread, so that adding a field to
+ * MirthAcknowledgeItem can never silently change what is posted to HMIS.
+ */
+function toAcknowledgeWire(item: MirthAcknowledgeItem): Record<string, unknown> {
+  return {
+    sampleID: item.sampleID,
+    equipmentId: item.equipmentId,
+    identifier: item.identifier,
+    ipAddress: item.ipAddress,
+    isTransmitted: item.isTransmitted,
+    labResultId: item.labResultId,
+    labServiceId: item.labServiceId,
+    portNo: item.portNo,
+    parameterId: item.parameterId,
+  };
 }

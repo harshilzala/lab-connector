@@ -30,5 +30,10 @@ captures/
 # throwaway scratch files (scripts, staged samples) — never committed
 .scratch/
 
-# Set by LAB-Interface-stop.bat; tells the watchdog the stop was deliberate.
-.lab-interface-maintenance
+# PM2 home. Kept beside the connector rather than the machine-wide one so an
+# unelevated account can drive PM2 (see magic/README.md). Pure machine-local
+# runtime state: daemon pid, log, and the dump pm2 resurrect reads at logon.
+.pm2/
+
+# Set by Lab-Interface-stop.bat; tells the watchdog the stop was deliberate.
+.lab-maintenance

@@ -52,6 +52,8 @@ input::placeholder { color:#b4aeae; }
 .btn-ghost { background:#fff; color:var(--body); border-color:var(--line); }
 .btn-ghost:hover { background:var(--teal-soft); border-color:var(--teal); color:var(--teal-700); }
 .btn-block { width:100%; }
+/* An anchor styled as a button must not pick up the global link underline. */
+a.btn, a.btn:hover { text-decoration:none; }
 .btn:disabled { opacity:.55; cursor:not-allowed; }
 
 .btn-sm { padding:6px 12px; font-size:13px; border-radius:8px; }

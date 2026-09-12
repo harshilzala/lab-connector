@@ -20,6 +20,7 @@
   // Housekeeping for the rolling logs and the delivered-result spool.
   "retention": {
     "days": 7,
+    "logDays": 30,
     "sweepIntervalHours": 6,
     "logDir": "./logs",
     "includeSpoolPending": true

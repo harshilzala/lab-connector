@@ -17,7 +17,7 @@ import type { MirthAcknowledgeItem, PendingOrders } from '../src/types.js';
 //   Run:  npx tsx test/order-store.test.ts
 
 const quiet = { child: () => quiet, info() {}, warn() {}, error() {}, debug() {}, trace() {}, fatal() {} } as any;
-const dir = mkdtempSync(join(tmpdir(), 'genex-orders-'));
+const dir = mkdtempSync(join(tmpdir(), 'lab-orders-'));
 
 function row(identifier: string, labResultId: number): MirthAcknowledgeItem {
   return {

@@ -8,7 +8,9 @@ import { createTransport } from '../transport/index.js';
 import type { Transport } from '../transport/types.js';
 import { createProtocolLink } from '../codec/index.js';
 import { SpoolQueue } from '../queue/spool.js';
-import { isVoidResult, normalizeBarcode, toLisResultRows, toResultUploads } from '../mapping/mapper.js';
+import { ResultStore, type StagedSummary } from '../results/store.js';
+import { StagedFiler } from '../results/filer.js';
+import { isQcSample, isVoidResult, normalizeBarcode, toLisResultRows, toResultUploads } from '../mapping/mapper.js';
 import {
   formatApiDate,
   formatApiDateDaysAgo,
@@ -18,6 +20,8 @@ import {
 } from '../hmis/pending.js';
 import { assayKey } from '../codec/astm/records.js';
 import { OrderStore, ORDER_RETENTION_DAYS } from '../orders/store.js';
+import { ParameterCatalogue } from '../orders/parameters.js';
+import { WireAudit } from './wire-audit.js';
 
 /** How often the order store drops entries past ORDER_RETENTION_DAYS. */
 const ORDER_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -57,6 +61,10 @@ export interface AnalyzerStatus {
   connected: boolean;
   lastMessageAt: string | null;
   spool: { pending: number; failed: number };
+  /** See config `filing.mode`. */
+  filing: 'queue' | 'staged';
+  /** Staged analyzers only: samples still waiting / fully filed. */
+  staged: { waiting: number; complete: number } | null;
   orders: OrderPollStatus;
 }
 
@@ -75,6 +83,11 @@ export interface OrderPollStatus {
   downloadPausedUntil: string | null;
   /** Consecutive failed downloads. 0 once one succeeds. */
   downloadFailStreak: number;
+  /** How many HMIS services, and parameters within them, this analyzer has
+   *  learned the shape of. Only used to rebuild a withdrawn order row, and only
+   *  when `fillMissingOrderRows` is on, but always collected — so the console
+   *  shows whether the catalogue is warm before the flag is turned on. */
+  parameterCatalogue: { services: number; parameters: number; enabled: boolean };
 }
 
 // =============================================================================
@@ -102,11 +115,25 @@ export class AnalyzerRuntime {
   private readonly spool: SpoolQueue<HmisResultUpload>;
   private readonly log: Logger;
   private readonly wireLog: WireLogEntry[] = [];
+  /** Durable copy of the same frames. The ring buffer above is 200 entries
+   *  and is lost on restart, so it cannot answer "the machine says it sent
+   *  that sample" — this file can. */
+  private readonly wireAudit: WireAudit | null;
   private lastMessageAt: string | null = null;
   /** Every order row this analyzer has been offered, keyed by barcode, so a
    *  result can be joined to its labResultId long after the row was
    *  acknowledged — see src/orders/store.ts. */
   private readonly orders: OrderStore;
+  /** What each HMIS service's parameter list looks like — see
+   *  src/orders/parameters.ts. Always LEARNED, so switching
+   *  `fillMissingOrderRows` on takes effect immediately instead of after a
+   *  warm-up; only READ when that flag is set. */
+  private readonly parameters: ParameterCatalogue;
+  /** filing.mode "staged": the per-sample result store and its filing pass.
+   *  Null on a "queue" analyzer, which delivers through the spool instead. */
+  private readonly staged: ResultStore | null;
+  private readonly filer: StagedFiler | null;
+  private fileTimer: NodeJS.Timeout | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private sweepTimer: NodeJS.Timeout | null = null;
   private polling = false;
@@ -122,12 +149,35 @@ export class AnalyzerRuntime {
     private readonly hmis: HmisClient,
     spoolRoot: string,
     logger: Logger,
+    /** Where to persist the wire log. Omitted (tests, ad-hoc runs) = memory only. */
+    wireLogFile?: string,
+    /** retention.days — how long a staged value waits for its order before it
+     *  is discarded. */
+    private readonly retentionDays = 7,
   ) {
     this.log = logger.child({ analyzer: cfg.id });
     this.transport = createTransport(cfg.transport, this.log);
     this.link = createProtocolLink(cfg, this.transport, this.log);
     this.spool = new SpoolQueue<HmisResultUpload>(join(spoolRoot, cfg.id), this.log);
     this.orders = new OrderStore(join(spoolRoot, cfg.id, 'orders'), this.log);
+    this.parameters = new ParameterCatalogue(ParameterCatalogue.fileFor(join(spoolRoot, cfg.id)), this.log);
+    this.wireAudit = wireLogFile ? new WireAudit(wireLogFile, this.log) : null;
+
+    if (cfg.filing.mode === 'staged') {
+      this.staged = new ResultStore(join(spoolRoot, cfg.id, 'results'), this.log);
+      this.filer = new StagedFiler({
+        store: this.staged,
+        orderRows: (barcode, opts) => this.resolveOrderRows(barcode, opts),
+        join: (upload, rows) => this.joinRows(upload, rows),
+        postResults: (rows) => this.hmis.postResults(rows, this.cfg.equipmentCode),
+        acknowledge: (rows) => this.hmis.acknowledge(rows),
+        log: this.log,
+        recheckMs: cfg.filing.recheckMs,
+      });
+    } else {
+      this.staged = null;
+      this.filer = null;
+    }
 
     // A reconnect is the cheapest evidence the instrument may be back, so give
     // it an immediate attempt rather than waiting out the backoff.
@@ -139,33 +189,49 @@ export class AnalyzerRuntime {
   }
 
   async start(): Promise<void> {
-    // Deliver spooled results to HMIS; a throw here keeps the item queued.
-    this.spool.start(async (payload) => {
+    // A staged analyzer files from its result store (see startStaged); a
+    // queued one delivers spooled items in order — a throw here keeps the
+    // item queued.
+    if (this.staged && this.filer) {
+      this.startStaged(this.staged, this.filer);
+    } else this.spool.start(async (payload) => {
       // The results endpoint files against labResultId, which only the order
       // row carries — so join the analyzer's values back to the pending rows
       // for this barcode before sending. Done HERE, at delivery time, so a
       // lookup failure is retried by the spool rather than losing the result.
-      //
-      // HMIS spells the assay identifier the way the ANALYZER does, which for a
-      // VITROS is the full "1.000000+032+1" rather than the "032" the codec
-      // reports. Join on the dialect's canonical key so the two meet.
-      const canonical = this.cfg.protocol === 'astm' ? assayKey(this.cfg.astm.dialect) : undefined;
-      const join = (orderRows: MirthAcknowledgeItem[]) =>
-        toLisResultRows(payload, orderRows, canonical, this.cfg.testCodeAliases);
+      const join = (orderRows: MirthAcknowledgeItem[]) => this.joinRows(payload, orderRows);
 
       let orderRows = await this.resolveOrderRows(payload.barcode);
-      let { rows, unmatched, matched, voided } = join(orderRows);
+      let { rows, unmatched, matched, voided, ignored, scaled } = join(orderRows);
       if (unmatched.length) {
         // The store may simply be behind: a test added to the order after the
         // rows were cached. Ask HMIS once more before giving up on the codes.
         orderRows = await this.resolveOrderRows(payload.barcode, { refresh: true });
-        ({ rows, unmatched, matched, voided } = join(orderRows));
+        ({ rows, unmatched, matched, voided, ignored, scaled } = join(orderRows));
+      }
+
+      // Not a warning: these are configured as non-results, or fall outside the
+      // analyzer's allowTestCodes list, so their absence from HMIS is expected
+      // rather than something the lab should chase.
+      if (ignored.length) {
+        this.log.debug({ barcode: payload.barcode, ignored }, 'codes not interfaced to HMIS dropped — not filed, not retried');
+      }
+
+      // Logged at info, not debug: a unit conversion changes the number that
+      // reaches the patient report, so the lab must be able to see it happened
+      // and check it against the analyzer printout.
+      if (scaled.length) {
+        this.log.info({ barcode: payload.barcode, scaled }, "unit conversion applied before filing");
       }
 
       if (voided.length) {
         this.log.warn({ barcode: payload.barcode, voided }, 'analyzer reported no value for these assays — not filed; the rerun will file');
-        if (rows.length === 0 && unmatched.length === 0) return; // nothing real in this item
       }
+
+      // Nothing filable and nothing outstanding — every value in this item was
+      // a placeholder or a configured non-result. Returning clears it from the
+      // spool; throwing would retry a message that can never produce a row.
+      if (rows.length === 0 && unmatched.length === 0) return;
 
       if (unmatched.length) {
         this.log.warn(
@@ -220,6 +286,11 @@ export class AnalyzerRuntime {
           ...payload,
           results: payload.results.filter((r) => keep.has(r.testCode)),
           messageId: `${payload.messageId}-r${unmatched.length}`,
+          // Carry the running total, so the console can show this item as the
+          // leftovers of a sample that is already interfaced rather than as an
+          // upload that never reached HMIS. Accumulated, because a remainder
+          // that later files some of its codes splits again.
+          filedAnalytes: (payload.filedAnalytes ?? 0) + rows.length,
         };
         this.spool.enqueue(remainder, remainder.messageId);
         this.log.warn(
@@ -230,8 +301,20 @@ export class AnalyzerRuntime {
     });
     await this.link.start();
 
-    this.orders.sweep(ORDER_RETENTION_DAYS);
-    this.sweepTimer = setInterval(() => this.orders.sweep(ORDER_RETENTION_DAYS), ORDER_SWEEP_INTERVAL_MS);
+    const sweep = () => {
+      this.orders.sweep(ORDER_RETENTION_DAYS);
+      if (this.staged) {
+        const r = this.staged.sweep(this.retentionDays, this.cfg.filing.keepFiledDays);
+        if (r.discarded || r.cleared) {
+          this.log.info(
+            { ...r, unfiledDays: this.retentionDays, filedDays: this.cfg.filing.keepFiledDays },
+            'staged result store swept',
+          );
+        }
+      }
+    };
+    sweep();
+    this.sweepTimer = setInterval(sweep, ORDER_SWEEP_INTERVAL_MS);
 
     if (this.cfg.orderPoll.enabled) {
       const { intervalMs, lookbackDays, download } = this.cfg.orderPoll;
@@ -254,11 +337,14 @@ export class AnalyzerRuntime {
     this.pollTimer = null;
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.sweepTimer = null;
+    if (this.fileTimer) clearInterval(this.fileTimer);
+    this.fileTimer = null;
     this.spool.stop();
     await this.link.stop();
   }
 
   status(): AnalyzerStatus {
+    const stagedCounts = this.staged?.counts() ?? null;
     return {
       id: this.cfg.id,
       equipmentCode: this.cfg.equipmentCode,
@@ -266,7 +352,11 @@ export class AnalyzerRuntime {
       endpoint: describeTransport(this.cfg),
       connected: this.transport.connected,
       lastMessageAt: this.lastMessageAt,
-      spool: this.spool.counts(),
+      // On a staged analyzer "pending" is the samples still waiting for an
+      // order row, so the console tiles keep meaning "not yet in HMIS".
+      spool: stagedCounts ? { pending: stagedCounts.waiting, failed: this.spool.counts().failed } : this.spool.counts(),
+      filing: this.cfg.filing.mode,
+      staged: stagedCounts,
       orders: {
         stored: this.orders.count(),
         pollEnabled: this.cfg.orderPoll.enabled,
@@ -275,6 +365,7 @@ export class AnalyzerRuntime {
         downloaded: this.downloadedCount,
         downloadPausedUntil: this.downloadPausedUntil ? new Date(this.downloadPausedUntil).toISOString() : null,
         downloadFailStreak: this.downloadFailStreak,
+        parameterCatalogue: { ...this.parameters.counts(), enabled: this.cfg.fillMissingOrderRows },
       },
     };
   }
@@ -294,10 +385,14 @@ export class AnalyzerRuntime {
   private async pollOrders(): Promise<void> {
     if (this.polling) return; // a slow gateway must not stack ticks
     this.polling = true;
-    const { lookbackDays, download } = this.cfg.orderPoll;
+    const { lookbackDays, download, downloadPrefixes } = this.cfg.orderPoll;
     let samples = 0;
     let pushed = 0;
     let held = 0; // ready to send, but the download breaker is open
+    let notOurs = 0; // cached but outside downloadPrefixes — never sent
+    const downloadable = (barcode: string): boolean =>
+      downloadPrefixes.length === 0 ||
+      downloadPrefixes.some((p) => barcode.toUpperCase().startsWith(p.toUpperCase()));
     try {
       for (const eqCode of this.equipmentCodes()) {
         for (let daysAgo = 0; daysAgo <= lookbackDays; daysAgo++) {
@@ -316,8 +411,18 @@ export class AnalyzerRuntime {
           });
           for (const [, pending] of groups) {
             samples++;
+            // The poll is where a complete panel is most likely to be seen, so
+            // it is the catalogue's main source.
+            this.parameters.learn(pending.ackItems);
             const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll');
             if (!download || newCodes.length === 0) continue;
+            if (!downloadable(order.sampleId)) {
+              // The gateway lists this barcode under our eqCode, but the
+              // analyzer does not run it (see orderPoll.downloadPrefixes). The
+              // rows stay cached for result-time joins; nothing is programmed.
+              notOurs++;
+              continue;
+            }
             if (!this.transport.connected) {
               // Leave it un-downloaded; the next tick after reconnect sends it.
               this.log.warn({ barcode: order.sampleId, tests: newCodes }, 'order waiting — analyzer link is down');
@@ -367,7 +472,11 @@ export class AnalyzerRuntime {
       this.lastPollAt = new Date().toISOString();
       if (this.lastPollError) this.log.info('order polling recovered');
       this.lastPollError = null;
-      if (samples || pushed || held) this.log.debug({ samples, pushed, held }, 'order poll complete');
+      // New rows may have arrived for a staged sample that was waiting.
+      if (this.filer) void this.filer.run('poll');
+      if (samples || pushed || held || notOurs) {
+        this.log.debug({ samples, pushed, held, notOurs }, 'order poll complete');
+      }
     } catch (err) {
       this.lastPollError = err instanceof Error ? err.message : String(err);
       this.log.error({ err: this.lastPollError }, 'order poll failed — new orders are not reaching this analyzer');
@@ -444,6 +553,130 @@ export class AnalyzerRuntime {
     return dropped;
   }
 
+  // ---- staged result store (filing.mode "staged") ---------------------------
+
+  /** Null on a queued analyzer. */
+  stagedSummaries(): StagedSummary[] | null {
+    return this.staged?.summaries() ?? null;
+  }
+
+  /** Operator "file now": one immediate pass for this barcode, with a live
+   *  HMIS lookup regardless of the recheck cadence. */
+  async stagedFileNow(barcode: string): Promise<boolean> {
+    if (!this.staged || !this.filer) return false;
+    const s = this.staged.get(barcode);
+    if (!s) return false;
+    await this.filer.run('operator', s.barcode);
+    return true;
+  }
+
+  /** Move a mistyped sample to its real barcode and file it. Returns the
+   *  barcode it now sits under, or null when `from` is unknown. */
+  stagedRekey(from: string, to: string): string | null {
+    if (!this.staged || !this.filer) return null;
+    const moved = this.staged.rekey(from, to);
+    if (!moved) return null;
+    void this.filer.run('rekey', moved.barcode);
+    return moved.barcode;
+  }
+
+  /** Drops a staged sample — its unfiled values will never reach HMIS. */
+  stagedRemove(barcode: string): boolean {
+    const ok = this.staged?.remove(normalizeBarcode(barcode)) ?? false;
+    if (ok) this.log.warn({ barcode: normalizeBarcode(barcode) }, 'staged sample removed by an operator');
+    return ok;
+  }
+
+  /**
+   * Bring up staged filing. Whatever the upload queue still holds from before
+   * the switch is folded into the store — every value it carried, under its
+   * original receipt time — so nothing already received is lost and the
+   * queue is left empty. Then the filing pass runs on its timer; it also runs
+   * after every order poll and on every inbound result.
+   */
+  private startStaged(store: ResultStore, filer: StagedFiler): void {
+    let imported = 0;
+    for (const env of [...this.spool.listPending(10_000), ...this.spool.listFailed(10_000)]) {
+      const { changed } = store.upsert(env.payload, env.createdAt);
+      this.spool.discard(env.id);
+      imported++;
+      this.log.info(
+        { id: env.id, barcode: env.payload.barcode, values: changed.length, attempts: env.attempts },
+        'queued item moved into the staged result store',
+      );
+    }
+    if (imported) this.log.warn({ imported, ...store.counts() }, 'upload queue migrated into the staged result store');
+
+    this.fileTimer = setInterval(() => void filer.run('timer'), this.cfg.filing.passIntervalMs);
+    setTimeout(() => void filer.run('startup'), FIRST_POLL_DELAY_MS);
+    this.log.info(
+      { ...store.counts(), passIntervalMs: this.cfg.filing.passIntervalMs, recheckMs: this.cfg.filing.recheckMs },
+      'staged result filing enabled — results wait for their order instead of queueing',
+    );
+  }
+
+  /** The analyzer's result-to-order join: aliases, ignore list, allow-list,
+   *  unit scaling, and the dialect's canonical assay key — HMIS spells a
+   *  VITROS identifier as the full "1.000000+032+1" where the codec reports
+   *  "032", so the two meet on the canonical form. */
+  private joinRows(payload: HmisResultUpload, orderRows: MirthAcknowledgeItem[]) {
+    const canonical = this.cfg.protocol === 'astm' ? assayKey(this.cfg.astm.dialect) : undefined;
+    const join = (rows: MirthAcknowledgeItem[]) =>
+      toLisResultRows(
+        payload,
+        rows,
+        canonical,
+        this.cfg.testCodeAliases,
+        this.cfg.ignoreTestCodes,
+        this.cfg.testCodeScale,
+        this.cfg.allowTestCodes,
+      );
+
+    const joined = join(orderRows);
+    if (!this.cfg.fillMissingOrderRows || joined.unmatched.length === 0) return joined;
+
+    // Every value here is one HMIS is not currently offering a row for. If the
+    // catalogue has seen the parameter on this service before, the row can be
+    // rebuilt from it plus this sample's own labResultId — see
+    // src/orders/parameters.ts for why that is exact rather than a guess.
+    //
+    // Both spellings are offered: the analyzer's own code, and the alias the
+    // config maps it to, because either may be how HMIS names the parameter.
+    const candidates: string[] = [];
+    for (const code of joined.unmatched) {
+      candidates.push(code);
+      const alias = this.aliasFor(code);
+      if (alias) candidates.push(alias);
+    }
+
+    const { rows: rebuilt, unknown } = this.parameters.synthesize(orderRows, candidates, canonical);
+    if (rebuilt.length === 0) return joined;
+
+    const filled = join([...orderRows, ...rebuilt]);
+    this.log.warn(
+      {
+        barcode: payload.barcode,
+        rebuilt: rebuilt.map((r) => r.identifier),
+        labResultIds: [...new Set(rebuilt.map((r) => r.labResultId))],
+        stillUnknown: filled.unmatched,
+        fixInHmis: unknown.length > 0 ? unknown : undefined,
+      },
+      'HMIS is not offering an order row for these parameters — rebuilt from the parameter catalogue so the values file instead of leaving the report blank',
+    );
+    return filled;
+  }
+
+  /** The configured alias for an analyzer assay code, matched the way the
+   *  mapper matches it: case-insensitively, exact spelling. */
+  private aliasFor(code: string): string | null {
+    const k = (code ?? '').trim().toUpperCase();
+    if (!k) return null;
+    for (const [from, to] of Object.entries(this.cfg.testCodeAliases)) {
+      if ((from ?? '').trim().toUpperCase() === k) return to;
+    }
+    return null;
+  }
+
   // ---------------------------------------------------------------------------
   private async onMessage(msg: ParsedMessage): Promise<void> {
     this.lastMessageAt = new Date().toISOString();
@@ -471,6 +704,24 @@ export class AnalyzerRuntime {
       }
       const uploads = toResultUploads(this.cfg, msg);
       for (const u of uploads) {
+        // A control run has no order row in HMIS. Filing it would query pending
+        // for a barcode the gateway has never heard of, find nothing, and retry
+        // the upload for as long as the spool allows — which is exactly what
+        // sample 89772 did. The legacy app dropped these at the same point.
+        if (u.isQc && !this.cfg.qc.upload) {
+          this.log.info({ barcode: u.barcode, count: u.results.length }, 'QC/control run — not sent to HMIS');
+          continue;
+        }
+        if (this.staged && this.filer) {
+          // Stored first, filed after — the old middleware's order of events.
+          const { changed, unchanged } = this.staged.upsert(u);
+          this.log.info(
+            { barcode: u.barcode, values: u.results.length, changed: changed.length, unchanged: unchanged.length },
+            changed.length ? 'results staged for filing' : 'results re-sent by the analyzer — already held, nothing new',
+          );
+          void this.filer.run('message', u.barcode);
+          continue;
+        }
         this.spool.enqueue(u, u.messageId); // messageId is deterministic → idempotent
         this.log.info({ barcode: u.barcode, count: u.results.length, qc: u.isQc }, 'results queued for upload');
       }
@@ -481,6 +732,14 @@ export class AnalyzerRuntime {
     // HMIS matches barcodes case-sensitively; look up with the canonical
     // uppercase form so a lowercase-entered sample still resolves its order.
     const lookup = normalizeBarcode(barcode);
+
+    // A control barcode has no order in HMIS. Asking anyway just adds a round
+    // trip per retry (89772 produced 100 identical pending queries), so answer
+    // the instrument locally with no order instead.
+    if (isQcSample(lookup, this.cfg.qc)) {
+      this.log.info({ barcode: lookup }, 'QC/control barcode — not queried against HMIS');
+      return;
+    }
     try {
       // One row per pending test — collapse the rows for this barcode into a
       // single order, keeping each row so it can be acknowledged afterwards.
@@ -543,7 +802,9 @@ export class AnalyzerRuntime {
         }),
       );
     }
-    return mergePending(parts);
+    const merged = mergePending(parts);
+    this.parameters.learn(merged.ackItems);
+    return merged;
   }
 
   /**
@@ -581,8 +842,10 @@ export class AnalyzerRuntime {
   }
 
   private recordWire(w: WireEvent): void {
-    this.wireLog.push({ at: new Date().toISOString(), direction: w.direction, text: w.text });
+    const entry: WireLogEntry = { at: new Date().toISOString(), direction: w.direction, text: w.text };
+    this.wireLog.push(entry);
     if (this.wireLog.length > 200) this.wireLog.shift();
+    this.wireAudit?.record(entry);
   }
 }
 

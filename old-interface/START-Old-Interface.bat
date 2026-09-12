@@ -2,7 +2,7 @@
 rem ===========================================================================
 rem  Starts the retired Old Interface by hand. Nothing else starts it.
 rem
-rem  STOP LAB-Interface FIRST (LAB-Interface-stop.bat). Both systems drive
+rem  STOP Lab-Interface FIRST (Lab-Interface-stop.bat). Both systems drive
 rem  the same three analyzers and post to the same HMIS; running them together
 rem  means a fight over the serial links and duplicate results.
 rem

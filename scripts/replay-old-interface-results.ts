@@ -3,6 +3,8 @@ import { join, resolve } from 'node:path';
 import { loadConfig } from '../src/config.js';
 import { HmisClient } from '../src/hmis/client.js';
 import { HmisAudit } from '../src/hmis/audit.js';
+import { DailyLogFile } from '../src/maintenance/daily-log.js';
+import { DailyLogFile } from '../src/maintenance/daily-log.js';
 import { OrderStore } from '../src/orders/store.js';
 import { isVoidResult, normalizeBarcode, toLisResultRows } from '../src/mapping/mapper.js';
 import { assayKey } from '../src/codec/astm/records.js';
@@ -25,7 +27,7 @@ import type { HmisResultUpload } from '../src/types.js';
 // A (sample, test) is PENDING when the analyzer reported a real value for it
 // and neither system has had that row accepted by HMIS. Concretely, a row is
 // skipped when its (sampleId, labResultId, parameterId) appears in --old-filed
-// or in this connector's own audit log (logs/hmis.log). The latest value per
+// or in this connector's own audit log (logs/hmis-YYYY-MM-DD.log). The latest value per
 // (sample, test) wins; "No Result" placeholders are ignored.
 //
 // Rows are joined to the order store (spool/<analyzer>/orders) exactly as a
@@ -77,7 +79,12 @@ for (const r of JSON.parse(readFileSync(oldFiledPath, 'utf8')) as Array<{ sample
 }
 const oldFiledCount = filed.size;
 try {
-  for (const line of readFileSync(resolve(cfg.hmis.auditLog ?? './logs/hmis.log'), 'utf8').split('\n')) {
+  // Every day file of the HMIS log, so a result this connector filed weeks
+  // ago is still seen as already accepted.
+  const auditLines = DailyLogFile.files(resolve(cfg.hmis.auditLog ?? './logs/hmis.log')).flatMap((f) =>
+    readFileSync(f, 'utf8').split('\n'),
+  );
+  for (const line of auditLines) {
     if (!line.includes('"kind":"result"')) continue;
     const e = JSON.parse(line) as { response?: { successData?: Array<{ sampleId?: string; labResultId?: unknown; parameterId?: unknown }> } };
     for (const s of e.response?.successData ?? []) if (s.sampleId) filed.add(filedKey(s.sampleId, s.labResultId, s.parameterId));

@@ -23,7 +23,7 @@ import type { AnalyzerConfig } from '../src/config.js';
 //   Run:  npx tsx test/download-backoff.test.ts
 
 const quiet = { child: () => quiet, info() {}, warn() {}, error() {}, debug() {}, trace() {}, fatal() {} } as any;
-const dir = mkdtempSync(join(tmpdir(), 'genex-backoff-'));
+const dir = mkdtempSync(join(tmpdir(), 'lab-backoff-'));
 
 // One pending CBC row per poll, on a barcode that changes so each tick has
 // genuinely new work to push.
@@ -71,11 +71,16 @@ const cfg = {
   sendDemographics: false,
   hostQuery: false,
   sendDate: false,
-  orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: true },
+  orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: true, downloadPrefixes: [] },
   qc: { sampleIdPrefixes: [], sampleIdRegex: null },
   testCodeAliases: {},
   astm: { ackTimeoutMs: 15000, frameMaxData: 240, senderId: 'HOST', receiverId: '', dialect: 'vitros-eciq' },
-  kermit: { ackTimeoutMs: 10000, maxRetries: 5 },
+  kermit: { ackTimeoutMs: 10000, maxRetries: 5, interPacketDelayMs: 0, interTransferDelayMs: 0 },
+  // The schema defaults, spelled out. This fixture is cast straight to
+  // AnalyzerConfig, so nothing type-checks it and a field added to the schema
+  // later goes missing here silently — which is how it came to throw on
+  // `cfg.filing.mode` in the runtime constructor.
+  filing: { mode: 'queue', passIntervalMs: 15000, recheckMs: 300000, keepFiledDays: 2 },
   hl7: { sendingApp: 'LIS', sendingFacility: '', charset: 'UNICODE', ack: true, valueTypes: ['NM'], encoding: 'utf8', idleFlushMs: 0 },
 } as unknown as AnalyzerConfig;
 

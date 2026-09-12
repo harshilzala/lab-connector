@@ -75,7 +75,13 @@ export class TcpTransport extends EventEmitter implements Transport {
       this.opts.logger.info({ endpoint: this.describe }, 'TCP client connected');
       this.adoptSocket(socket);
     });
-    socket.on('error', (err) => this.opts.logger.warn({ err: err.message }, 'TCP client connection error'));
+    socket.on('error', (err) => {
+      this.opts.logger.warn({ err: err.message }, 'TCP client connection error');
+      // Not 'error': a refused dial is routine while an analyzer is off, and the
+      // protocol links treat 'error' as a link fault. Anyone who needs to know
+      // why a client link is not up (the connector-tool probe) listens for this.
+      this.emit('dial-error', err);
+    });
     socket.on('close', () => {
       if (this.stopping) return;
       this.reconnectTimer = setTimeout(() => this.dial().catch(() => {}), 3000);

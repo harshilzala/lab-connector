@@ -6,7 +6,7 @@ import { OrderStore } from '../src/orders/store.js';
 import type { MirthPendingRow } from '../src/types.js';
 
 // =============================================================================
-// Seed LAB-Interface's order store from the retired middleware's own logs.
+// Seed Lab-Interface's order store from the retired middleware's own logs.
 //
 // The Old Interface's Orders service (E:\API_Integration\Services\Orders)
 // wrote every pending row it pulled from HMIS to
@@ -21,7 +21,7 @@ import type { MirthPendingRow } from '../src/types.js';
 // contains the row's equipmentCode, and are marked as already downloaded: the
 // Old Interface pushed them to the instrument itself.
 //
-// Safe to run while LAB-Interface is up (the store is one atomic file per
+// Safe to run while Lab-Interface is up (the store is one atomic file per
 // barcode) and safe to run twice (identical rows change nothing).
 //
 //   npx tsx scripts/import-old-interface-orders.ts [--days 7]

@@ -8,7 +8,7 @@
 // =============================================================================
 
 export type Direction = 'IN' | 'OUT';
-export type ProtocolName = 'astm' | 'hl7' | 'kermit' | 'advia2120i' | 'clinitek-advantus';
+export type ProtocolName = 'astm' | 'abl9' | 'hl7' | 'kermit' | 'advia2120i' | 'clinitek-advantus' | 'gh900';
 
 // ---- Analyzer → connector: a request for what to run on a sample -----------
 // (ASTM "Q" query record, or an order-less result upload that implies query.)
@@ -70,6 +70,10 @@ export interface ParsedMessage {
   queries: HostQuery[];
   /** Result records — present in result uploads. */
   results: InstrumentResult[];
+  /** Set when the PROTOCOL itself marked the upload as a QC/control run (HL7
+   *  MSH-11 = "Q"). The barcode-shape rules in the analyzer's qc config still
+   *  apply on top; this is an extra, authoritative signal. */
+  isQc?: boolean;
   /** The raw wire text, retained for the audit log. */
   raw: string;
 }
@@ -115,6 +119,18 @@ export interface MirthAcknowledgeItem {
   labServiceId: number | null;
   portNo: string;
   parameterId: number | null;
+  /** HMIS's own shape for the service this row belongs to: "PARAMETER" when one
+   *  labResultId covers many parameters (a CBC panel) and each row is one
+   *  analyte inside it, "Numeric"/"Alphanumeric" when the row IS the whole
+   *  service. Connector-side only — the acknowledge body is projected back to
+   *  the gateway's own nine columns in hmis/client.ts, so this never goes out on
+   *  the wire. Read by the parameter catalogue, which may only reconstruct a
+   *  missing row inside a PARAMETER service. */
+  resultType?: string | null;
+  /** True when the parameter catalogue reconstructed this row from a sibling
+   *  row plus a remembered parameterId, rather than HMIS offering it. See
+   *  orders/parameters.ts. */
+  synthesized?: boolean;
 }
 
 /** Pending rows for one barcode, collapsed into a single downloadable order. */
@@ -141,6 +157,15 @@ export interface HmisResultUpload {
   barcode: string;
   /** Set when the sample is a QC/control material rather than a patient sample. */
   isQc?: boolean;
+  /** How many of this barcode's analytes have ALREADY been filed and
+   *  acknowledged, on the delivery that split this item off.
+   *
+   *  Only ever set on a remainder item — the leftovers of a partly-filed
+   *  sample, re-queued so they keep trying once their order row appears. It
+   *  exists so the console can say "22 filed, 13 still without an order row"
+   *  instead of labelling the whole sample "queued", which reads as though
+   *  nothing reached HMIS when in fact the panel is already interfaced. */
+  filedAnalytes?: number;
   results: Array<{
     testCode: string;
     value: string;

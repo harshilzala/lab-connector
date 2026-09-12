@@ -52,6 +52,10 @@ export interface Hl7Message {
   triggerEvent: string;
   /** MSH-10 — echoed back in the ACK's MSH-10 and MSA-2. */
   controlId: string;
+  /** MSH-11 processing id. The Mindray BC-5000/BC-5150 protocol (§4.3.1) uses
+   *  it to say what the message IS — "P" a sample result or worklist query,
+   *  "Q" a QC analysis result — and requires the ACK to carry the same value. */
+  processingId: string;
   sendingApp: string; // MSH-3
   sendingFacility: string; // MSH-4
   version: string; // MSH-12
@@ -101,12 +105,33 @@ export function parseHl7(raw: string): Hl7Message {
     messageType,
     triggerEvent: component(messageType, 2, encoding),
     controlId: fieldOf(msh, 10),
+    processingId: fieldOf(msh, 11),
     sendingApp: fieldOf(msh, 3),
     sendingFacility: fieldOf(msh, 4),
     version: fieldOf(msh, 12),
     charset: fieldOf(msh, 18),
     raw: text,
   };
+}
+
+/**
+ * Shorten any field longer than `maxField` characters to a placeholder that
+ * says how much was cut. The Mindray BC-5150 puts its histogram and
+ * scattergram bitmaps into ED-typed OBX segments as Base64 — five of them,
+ * ~184 KB of a 188 KB message — which is meaningless in a log and costly in
+ * the spool. Numeric results are never anywhere near the limit, so nothing
+ * that is filed is touched. Segment and field structure is preserved.
+ */
+export function elideLongFields(text: string, enc: Hl7Encoding = DEFAULT_ENCODING, maxField = 256): string {
+  return text
+    .split('\r')
+    .map((seg) =>
+      seg
+        .split(enc.field)
+        .map((f) => (f.length > maxField ? `${f.slice(0, 24)}<${f.length - 24} chars omitted>` : f))
+        .join(enc.field),
+    )
+    .join('\r');
 }
 
 export interface Hl7ParseOptions {
@@ -183,7 +208,14 @@ export function hl7ToParsedMessage(msg: Hl7Message, opts: Hl7ParseOptions = {}):
     patient,
     queries: [], // ORU is an unsolicited upload; the H360 never host-queries.
     results: filable,
-    raw: msg.raw,
+    // MSH-11 "Q" is the analyzer's own statement that this is a control run
+    // (Mindray BC-5000/BC-5150 §5.3: OBR-3 is then the QC file number and
+    // PID-3 the control lot, neither of which is a patient barcode). Flagging
+    // it here means the QC decision no longer rests on the barcode's shape.
+    isQc: msg.processingId.toUpperCase() === 'Q',
+    // Kept per sample in the staged store and shown on the console; the
+    // bitmaps add nothing there.
+    raw: elideLongFields(msg.raw, enc),
   };
 }
 

@@ -18,7 +18,11 @@ import type { MirthAcknowledgeItem } from '../src/types.js';
 //   Run:  npx tsx test/ack-after-file.test.ts
 
 const here = dirname(fileURLToPath(import.meta.url));
-const cfg = loadConfig('./config.json');
+// Reads the reference config, not the deployed config.json: this pins codec and
+// acknowledge behaviour against a fixed analyzer definition, so it must keep
+// working at a site whose config.json has no H360 in it (e.g. the Cancer site,
+// whose haematology is a Mindray BC-6000). See test/fixtures/reference-config.json.
+const cfg = loadConfig(join(here, 'fixtures', 'reference-config.json'));
 const analyzer = cfg.analyzers.find((a) => a.id === 'erba-h360')!;
 
 const IDENTIFIERS = ['WBC', 'RBC', 'PLT', 'HAEMOGLOBIN', 'HEMATOCRIT', 'MCV', 'Blasts', 'PARASITE'];
@@ -76,11 +80,25 @@ console.log('✓ every acknowledge item carries sampleID / identifier / labResul
 // Guarded by reading the source: acknowledge must appear AFTER postResults in
 // the spool handler, and must not appear in the order-download path at all.
 const src = readFileSync(join(here, '..', 'src', 'session', 'orchestrator.ts'), 'utf8');
-const post = src.indexOf('this.hmis.postResults(');
-const ack = src.indexOf('this.hmis.acknowledge(');
+// The queued delivery (spool handler) is the LAST occurrence of each call; the
+// earlier pair is the staged filer being wired up in the constructor.
+const post = src.lastIndexOf('this.hmis.postResults(');
+const ack = src.lastIndexOf('this.hmis.acknowledge(');
 assert.ok(post !== -1 && ack !== -1, 'both calls present');
-assert.ok(ack > post, 'acknowledge is called after postResults');
-assert.equal(src.split('this.hmis.acknowledge(').length - 1, 1, 'acknowledge is called from exactly one place');
+assert.ok(ack > post, 'acknowledge is called after postResults in the queued delivery');
+assert.equal(
+  src.split('this.hmis.acknowledge(').length - 1,
+  2,
+  'acknowledge is wired from exactly two places: the queued delivery and the staged filer',
+);
+// The staged filer (filing.mode "staged") must keep the same order: post, then
+// acknowledge, and only once.
+const filer = readFileSync(join(here, '..', 'src', 'results', 'filer.ts'), 'utf8');
+assert.equal(filer.split('this.deps.acknowledge(').length - 1, 1, 'the staged filer acknowledges from exactly one place');
+assert.ok(
+  filer.indexOf('this.deps.acknowledge(') > filer.indexOf('this.deps.postResults('),
+  'the staged filer acknowledges after posting',
+);
 
 const answerQuery = src.slice(src.indexOf('private async answerQuery('));
 const nextMethod = answerQuery.indexOf('\n  private ', 1);

@@ -1,4 +1,6 @@
 import assert from 'node:assert';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { isVoidResult, toLisResultRows, toResultUploads } from '../src/mapping/mapper.js';
 import { loadConfig } from '../src/config.js';
 import type { MirthAcknowledgeItem, ParsedMessage } from '../src/types.js';
@@ -19,7 +21,12 @@ assert.ok(!isVoidResult('0'));
 assert.ok(!isVoidResult('<0.02'));
 assert.ok(!isVoidResult('4.700'));
 
-const cfg = loadConfig('./config.json');
+// Reads the reference config, not the deployed config.json — see the note in
+// test/ack-after-file.test.ts. Every site's VITROS ECiQ is a different analyzer
+// id (Nashik "vitros-eciq", Cancer "cancer-vitros-eciq"), and this test pins
+// mapper behaviour, not one deployment's naming.
+const here = dirname(fileURLToPath(import.meta.url));
+const cfg = loadConfig(join(here, 'fixtures', 'reference-config.json'));
 const eciq = cfg.analyzers.find((a) => a.id === 'vitros-eciq')!;
 
 const msg: ParsedMessage = {

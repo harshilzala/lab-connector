@@ -1,7 +1,7 @@
 # Old Interface
 
 This folder controls the **Old Interface** — the previous lab integration that
-`LAB-Interface` replaces. Its code still lives at `E:\API_Integration`; only
+`Lab-Interface` replaces. Its code still lives at `E:\API_Integration`; only
 its ability to start by itself has been taken away.
 
 It is **retired, not deleted**. Nothing here runs unless a person deliberately
@@ -31,17 +31,17 @@ targets and working directories survive exactly as they were.
 
 ## Why it must stay down
 
-The Old Interface and LAB-Interface talk to the same three analyzers and the
+The Old Interface and Lab-Interface talk to the same three analyzers and the
 same HMIS. Running both means two systems competing for one serial link and two
 systems posting results for the same sample. The VITROS 250 half of the Old
 Interface was already failing for this reason before it was retired — its log
 ends on `SendDetails: FAILED - The port is closed`, because the Moxa NPort had
-been switched from Real COM to TCP server mode for LAB-Interface.
+been switched from Real COM to TCP server mode for Lab-Interface.
 
 ## Starting it by hand
 
 Only when you actually want to fall back to it, and only after stopping
-LAB-Interface first with `LAB-Interface-stop.bat`:
+Lab-Interface first with `Lab-Interface-stop.bat`:
 
 - `START-Old-Interface.bat` — starts the three services (prompts for admin) and
   the three device programs.

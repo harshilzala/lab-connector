@@ -39,12 +39,18 @@ export class Connector implements AdminBackend {
 
     const spoolRoot = resolve(cfg.spoolDir);
     for (const a of cfg.analyzers) {
-      this.runtimes.set(a.id, new AnalyzerRuntime(a, this.hmis, spoolRoot, logger));
+      // Wire frames go to logs/wire-<id>-YYYY-MM-DD.log beside the HMIS
+      // transaction log, so "the instrument says it sent that sample" stays
+      // answerable after a restart — for retention.logDays, after which the
+      // sweeper removes the day file.
+      const wireLogFile = resolve(cfg.retention.logDir, `wire-${a.id}.log`);
+      this.runtimes.set(a.id, new AnalyzerRuntime(a, this.hmis, spoolRoot, logger, wireLogFile, cfg.retention.days || 7));
     }
 
     if (cfg.retention.days > 0) {
       this.retention = new RetentionSweeper({
         days: cfg.retention.days,
+        logDays: cfg.retention.logDays,
         logDir: resolve(cfg.retention.logDir),
         spoolRoot,
         intervalMs: Math.round(cfg.retention.sweepIntervalHours * 60 * 60 * 1000),
@@ -92,8 +98,10 @@ export class Connector implements AdminBackend {
       {
         analyzers: [...this.runtimes.keys()],
         hmis: this.cfg.hmis.baseUrl,
-        hmisLog: this.cfg.hmis.auditLog ?? 'disabled',
+        hmisLog: this.cfg.hmis.auditLog ? this.cfg.hmis.auditLog.replace(/(\.[^./\\]+)?$/, '-YYYY-MM-DD$1') : 'disabled',
+        wireLogs: `${this.cfg.retention.logDir}/wire-<analyzer>-YYYY-MM-DD.log`,
         retentionDays: this.cfg.retention.days || 'disabled',
+        logRetentionDays: this.cfg.retention.days ? this.cfg.retention.logDays : 'disabled',
       },
       'lab-connector started',
     );
@@ -134,5 +142,21 @@ export class Connector implements AdminBackend {
 
   remove(id: string, msgId: string) {
     return this.runtimes.get(id)?.discardSpooled(msgId) ?? false;
+  }
+
+  staged(id: string) {
+    return this.runtimes.get(id)?.stagedSummaries() ?? null;
+  }
+
+  fileNow(id: string, barcode: string) {
+    return this.runtimes.get(id)?.stagedFileNow(barcode) ?? Promise.resolve(false);
+  }
+
+  rekey(id: string, from: string, to: string) {
+    return this.runtimes.get(id)?.stagedRekey(from, to) ?? null;
+  }
+
+  removeStaged(id: string, barcode: string) {
+    return this.runtimes.get(id)?.stagedRemove(barcode) ?? false;
   }
 }

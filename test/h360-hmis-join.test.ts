@@ -49,7 +49,10 @@ const ZHFC03_IDENTIFIERS = [
   'WBC',
 ];
 
-const cfg = loadConfig('./config.json');
+// Reads the reference config, not the deployed config.json — see the note in
+// test/ack-after-file.test.ts. The ZHFC03 corpus below is Nashik's, so the
+// analyzer definition it joins against has to be Nashik's too.
+const cfg = loadConfig(join(here, 'fixtures', 'reference-config.json'));
 const analyzer = cfg.analyzers.find((a) => a.id === 'erba-h360')!;
 assert.equal(analyzer.equipmentCode, 'ZHFC03', 'the H360 files against the CBC equipment');
 

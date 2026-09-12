@@ -1,0 +1,169 @@
+{
+  // ===========================================================================
+  // CANCER SITE — OFFLINE / DASHBOARD-ONLY PROFILE
+  //
+  // Brings the application up so http://127.0.0.1:7071 answers, while touching
+  // NOTHING outside this server:
+  //
+  //   * no equipment online — every analyzer listens on LOOPBACK only, on a
+  //     port no instrument is configured to dial. Nothing is dialled outbound,
+  //     so the ABL9, BC-6000 and the two VITROS are never contacted, and the
+  //     lab network cannot reach these listeners either.
+  //   * no HMIS connection — order polling is disabled on all four analyzers
+  //     and hmis.baseUrl points at the local discard port, so no request can
+  //     ever leave this machine for hims.zhhrpl.in.
+  //   * separate spool (./spool-offline) so nothing here can mix with real
+  //     patient results.
+  //
+  // This is for bringing the UI up and looking at it. It is NOT the go-live
+  // config — that is config.json. Run with:
+  //
+  //   set LAB_CONNECTOR_CONFIG=.\config.offline.json
+  //
+  // Analyzer ids, protocols and codec settings are kept identical to
+  // config.json so the dashboard shows the real four machines.
+  // ===========================================================================
+
+  "logLevel": "info",
+  "spoolDir": "./spool-offline",
+
+  "hmis": {
+    // Discard port on loopback: refuses instantly, cannot reach any real host.
+    // The production gateway (https://hims.zhhrpl.in/live/portal) is
+    // deliberately NOT referenced anywhere in this file.
+    "baseUrl": "http://127.0.0.1:9",
+    "pendingPath": "/mirth/pending",
+    "acknowledgePath": "/mirth/acknowledge",
+    "resultsPath": "/mirth/labresult",
+    "timeoutMs": 2000,
+    "tlsRejectUnauthorized": true,
+    "auditLog": "./logs/hmis-offline.log",
+    "auditMaxBytes": 10485760
+  },
+
+  "retention": {
+    "days": 7,
+    "logDays": 30,
+    "sweepIntervalHours": 6,
+    "logDir": "./logs",
+    "includeSpoolPending": false
+  },
+
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 7071,
+    "authFile": "./admin-auth.json"
+  },
+
+  "analyzers": [
+    {
+      // Radiometer ABL9 — OFFLINE. Loopback listener, nothing dials it.
+      "id": "cancer-abl9",
+      "equipmentCode": "EQCODE-ABL9",
+      "machineId": 523,
+      "protocol": "astm",
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "127.0.0.1",
+        "port": 16080
+      },
+      "sendDemographics": false,
+      "hostQuery": false,
+      "orderPoll": { "enabled": false, "download": false },
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+      "astm": {
+        "ackTimeoutMs": 15000,
+        "frameMaxData": 240,
+        "senderId": "HMIS-LIS",
+        "receiverId": "ABL9",
+        "dialect": "atellica"
+      }
+    },
+    {
+      // Mindray BC-6000 — OFFLINE. Loopback listener, nothing dials it.
+      "id": "cancer-bc6000",
+      "equipmentCode": "EQCODE-BC6000",
+      "machineId": 624,
+      "protocol": "hl7",
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "127.0.0.1",
+        "port": 16060
+      },
+      "sendDemographics": false,
+      "hostQuery": false,
+      "orderPoll": { "enabled": false, "download": false },
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+      "testCodeAliases": {},
+      "hl7": {
+        "sendingApp": "LIS",
+        "sendingFacility": "",
+        "charset": "UNICODE",
+        "ack": true,
+        "valueTypes": ["NM"],
+        "encoding": "utf8",
+        "idleFlushMs": 0
+      }
+    },
+    {
+      // VITROS ECi/ECiQ — OFFLINE. In config.json this DIALS OUT to a Moxa
+      // NPort; here it is flipped to a loopback listener so no dial happens.
+      "id": "cancer-vitros-eciq",
+      "equipmentCode": "EQCODE-ECIQ",
+      "machineId": 2000,
+      "protocol": "astm",
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "127.0.0.1",
+        "port": 14001
+      },
+      "sendDemographics": true,
+      "hostQuery": false,
+      "orderPoll": { "enabled": false, "download": false },
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+      "astm": {
+        "ackTimeoutMs": 15000,
+        "frameMaxData": 240,
+        "senderId": "HOST",
+        "receiverId": "",
+        "dialect": "vitros-eciq"
+      }
+    },
+    {
+      // VITROS 250 — OFFLINE. Same treatment: listener on loopback, no dial.
+      "id": "cancer-vitros-250",
+      "equipmentCode": "EQCODE-V250",
+      "machineId": 2001,
+      "protocol": "kermit",
+      "transport": {
+        "type": "tcp",
+        "mode": "server",
+        "host": "127.0.0.1",
+        "port": 14002
+      },
+      "sendDemographics": true,
+      "hostQuery": false,
+      "orderPoll": { "enabled": false, "download": false },
+      "qc": {
+        "sampleIdPrefixes": ["QC", "QC-", "CTRL", "CONTROL", "$"],
+        "sampleIdRegex": null
+      },
+      "kermit": {
+        "ackTimeoutMs": 10000,
+        "maxRetries": 5
+      }
+    }
+  ]
+}

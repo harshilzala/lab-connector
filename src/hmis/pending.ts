@@ -30,6 +30,11 @@ const TEST_KEYS = ['identifier', 'eqIdntifier', 'testCode', 'test_code', 'code',
 const EQ_CODE_KEYS = ['eqCode', 'equipmentCode', 'equipment_code', 'machineCode', 'equipmentName'];
 const SPECIMEN_KEYS = ['specimenType', 'sampleType', 'specimen', 'specimenName', 'sampleTypeName', 'containerType'];
 const PRIORITY_KEYS = ['priority', 'isStat', 'stat', 'urgent', 'isUrgent', 'isEmergency'];
+// How HMIS shapes the service this row belongs to: "PARAMETER" (one labResultId
+// for a whole panel, one row per analyte inside it) or "Numeric"/"Alphanumeric"
+// (the row is the entire service). Carried so the parameter catalogue can tell
+// the two apart; it is never sent back to the gateway.
+const RESULT_TYPE_KEYS = ['resultType', 'result_type', 'resulttype'];
 
 const PATIENT_ID_KEYS = ['uhid', 'UHID', 'patientId', 'patientID', 'patientCode', 'mrn', 'mrNo'];
 const FIRST_NAME_KEYS = ['firstName', 'patientFirstName', 'fname'];
@@ -118,6 +123,7 @@ export function normalizePending(body: unknown, opts: NormalizeOptions): Pending
       labServiceId: toNumber(row.labServiceId),
       portNo: String(row.portNo ?? opts.portNo ?? ''),
       parameterId: toNumber(row.parameterId),
+      resultType: pickString(row, RESULT_TYPE_KEYS),
     });
 
     // Sample-level attributes repeat on every row; take the first non-empty.
@@ -165,6 +171,11 @@ function pick(row: Record<string, unknown>, keys: string[]): unknown {
     if (v !== undefined && v !== null && String(v).trim() !== '') return v;
   }
   return null;
+}
+
+function pickString(row: Record<string, unknown>, keys: string[]): string | null {
+  const v = pick(row, keys);
+  return v === null ? null : String(v).trim();
 }
 
 function toNumber(v: unknown): number | null {

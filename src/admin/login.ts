@@ -41,6 +41,8 @@ body { display:flex; flex-direction:column; min-height:100vh; background:#fff; }
 .field { margin:0 0 16px; }
 .field-head { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
 .field-head a { font-size:12.5px; font-weight:700; }
+.field-foot { margin:8px 0 0; text-align:right; }
+.field-foot a { font-size:12.5px; font-weight:700; }
 .hint { margin:7px 0 0; font-size:12.5px; color:var(--mut); }
 .actions { margin-top:22px; display:flex; flex-direction:column; gap:10px; }
 .footnote {
@@ -74,12 +76,10 @@ function loginForm(o: LoginPageOptions): string {
                  spellcheck="false" required autofocus />
         </div>
         <div class="field">
-          <div class="field-head">
-            <label for="password">Password</label>
-            <a href="/login?view=reset">Forgot password?</a>
-          </div>
+          <label for="password">Password</label>
           <input id="password" name="password" type="password" placeholder="••••••••••"
                  autocomplete="current-password" required />
+          <p class="field-foot"><a href="/login?view=reset">Forgot password?</a></p>
         </div>
         <div class="actions">
           <button class="btn btn-primary btn-block" type="submit">Sign in</button>

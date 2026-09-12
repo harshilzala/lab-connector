@@ -6,6 +6,9 @@ export const STX = 0x02; // start of a frame
 export const ETX = 0x03; // end of the LAST frame of a record
 export const ETB = 0x17; // end of an INTERMEDIATE frame (record continues)
 export const EOT = 0x04; // end of transmission — release the line
+// Not part of E1381. The Radiometer ABL9 opens each message with it instead of
+// an ENQ handshake — see src/codec/abl9/link.ts.
+export const SOH = 0x01; // start of header (ABL9 record stream only)
 export const CR = 0x0d;
 export const LF = 0x0a;
 
@@ -17,6 +20,7 @@ export const CONTROL_NAMES: Record<number, string> = {
   [ETX]: 'ETX',
   [ETB]: 'ETB',
   [EOT]: 'EOT',
+  [SOH]: 'SOH',
   [CR]: 'CR',
   [LF]: 'LF',
 };

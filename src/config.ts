@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { DEFAULT_DIALECT, ASTM_DIALECT_NAMES, type AstmDialect } from './codec/astm/records.js';
+import { PROFILE_NAMES, applyProfiles } from './profiles/index.js';
 
 // Minimal .env loader (no dependency). Reads KEY=VALUE lines and populates
 // process.env without overwriting variables already set in the real environment.
@@ -68,6 +69,33 @@ const AstmOptions = z.object({
   /** Order-download shape. Inbound parsing is vendor-neutral; the download is
    *  not — an analyzer silently ignores an order it cannot parse. */
   dialect: z.enum(ASTM_DIALECTS).default(DEFAULT_DIALECT),
+  /** WHICH inbound record carries the barcode HMIS keys on.
+   *
+   *  "order" (default, the ASTM norm): the O record's specimen id, falling back
+   *  to the P record when the O record named no specimen. Correct for Atellica
+   *  and the VITROS family.
+   *
+   *  "patient": the P record's laboratory-assigned patient id first. The
+   *  Radiometer ABL9 fills the two fields the other way round — the ZC tube
+   *  barcode goes on the P record and the patient's 14-digit MRN goes in the O
+   *  record's specimen id. Across a month of captured ABL9 traffic 130 of 414
+   *  messages carried BOTH, so reading the O one would file against an MRN that
+   *  HMIS never matches. The legacy integration filed the P value for exactly
+   *  those samples. Set it only on an analyzer proven to behave this way — on a
+   *  normal instrument it would prefer the patient id over the tube barcode. */
+  sampleIdFrom: z.enum(['order', 'patient']).default('order'),
+});
+
+/** Radiometer ABL9 SOH…EOT record stream — see src/codec/abl9/link.ts. The
+ *  ABL9 sends ASTM E1394 records with NO E1381 framing, so it reads
+ *  sampleIdFrom and dialect from the `astm` block and only needs these two. */
+const Abl9Options = z.object({
+  /** Answer each completed envelope with one ACK byte, as the legacy .NET
+   *  middleware did — 414 ACKs for 414 messages in Cancer_ABL9.txt. */
+  ack: z.boolean().default(true),
+  /** Abandon a partial envelope that grows past this without an EOT. The
+   *  largest real envelope measured is 2.3 KB. */
+  maxBufferBytes: z.number().int().positive().default(262144),
 });
 
 /** Kermit link tuning for the VITROS 250/350 — see src/codec/kermit/. */
@@ -75,6 +103,16 @@ const KermitOptions = z.object({
   /** Wait for a Y acknowledgement before retransmitting a packet. */
   ackTimeoutMs: z.number().int().positive().default(10000),
   maxRetries: z.number().int().positive().default(5),
+  /** Pause after each acknowledged packet before sending the next one.
+   *  The legacy Vitros250.exe paced every packet by 1 s (VitrosDelayTime=1000)
+   *  and never drew an error packet in 48 captured transfers; sending the
+   *  whole file in under a second drew "0005 INVALID PACKET USAGE" from the
+   *  analyzer 125 times in one day. 0 disables the pause. */
+  interPacketDelayMs: z.number().int().nonnegative().default(1000),
+  /** Minimum quiet time between the end of one transfer and the send-init of
+   *  the next. 151 of 160 rejections measured on 2026-09-07 came within two
+   *  seconds of the previous transfer finishing. 0 disables. */
+  interTransferDelayMs: z.number().int().nonnegative().default(1000),
 });
 
 /** HL7 v2 over MLLP — see src/codec/hl7/. Defaults reproduce the Erba H360
@@ -98,8 +136,24 @@ const Hl7Options = z.object({
   idleFlushMs: z.number().int().nonnegative().default(0),
 });
 
+/** Lifotronic GH900 Plus HbA1c analyzer — see src/codec/gh900. */
+const Gh900Options = z.object({
+  /** File a run whose test error code is E1/E2 (sampling too little / too
+   *  much). Off by default: a mis-sampled run is not a result; it is logged
+   *  and dropped, and the rerun files. */
+  fileOnSamplingError: z.boolean().default(false),
+});
+
 const AnalyzerSchema = z.object({
   id: z.string().regex(/^[a-z0-9-]+$/, 'analyzer id must be kebab-case'),
+  /** Instrument MODEL this block is an instance of — see src/profiles. The
+   *  profile supplies every model-level default (protocol, transport type /
+   *  mode / port, ACK conventions, reportable analytes, non-result channels),
+   *  so a block only has to say what is specific to THIS site: id,
+   *  equipmentCode, the analyzer's address, and any local override. Keys
+   *  written here always win over the profile. Optional: a block without it is
+   *  read exactly as before. */
+  profile: z.enum(PROFILE_NAMES).optional(),
   /** Sent as the `eqCode` query parameter — this is what identifies the machine
    *  now that there is no id/secret pair. */
   equipmentCode: z.string(),
@@ -129,7 +183,7 @@ const AnalyzerSchema = z.object({
   /** Reported in the acknowledge body; derived from a TCP transport when unset. */
   ipAddress: z.string().optional(),
   portNo: z.string().optional(),
-  protocol: z.enum(['astm', 'hl7', 'kermit', 'advia2120i', 'clinitek-advantus']).default('astm'),
+  protocol: z.enum(['astm', 'abl9', 'hl7', 'kermit', 'advia2120i', 'clinitek-advantus', 'gh900']).default('astm'),
   transport: TransportSchema,
   sendDemographics: z.boolean().default(false),
   hostQuery: z.boolean().default(true),
@@ -157,14 +211,38 @@ const AnalyzerSchema = z.object({
       /** Push new tests to the analyzer. Off for a results-only link (HL7
        *  H360): the rows are still stored so results can be filed. */
       download: z.boolean().default(true),
+      /** Only barcodes starting with one of these are programmed onto the
+       *  analyzer. Rows for other barcodes are still cached in the order
+       *  store (so a result can be joined if one ever arrives) but are never
+       *  sent. Empty = download everything the gateway returns.
+       *
+       *  This is the order-side twin of qc.patientPrefixes: the legacy
+       *  Vitros250.exe applied SamplePrefix=ZC to both directions, and the
+       *  VITROS 250 has only ever returned results for ZC barcodes. */
+      downloadPrefixes: z.array(z.string().min(1)).default([]),
     })
     .default({}),
+  /** Recognising a control/QC run so it is not filed as a patient result.
+   *  Two independent tests, either of which marks the sample as QC:
+   *    - sampleIdPrefixes / sampleIdRegex: a DENY list — the id looks like a
+   *      control ("QC...", "CTRL...").
+   *    - patientPrefixes: an ALLOW list — when non-empty, any id that does NOT
+   *      start with one of these is treated as non-patient. This is how the
+   *      legacy VITROS 250 app worked (SamplePrefix=ZC in Vitros250.exe.config;
+   *      Result_Flow.log shows "Skipped result sample=89772 (prefix filter: ZC)"),
+   *      and it is the only thing that catches a bare-numeric control id.
+   *  Leave patientPrefixes empty on an analyzer whose patient barcodes are not
+   *  reliably prefixed — an over-tight allow list silently drops real results. */
   qc: z
     .object({
       sampleIdPrefixes: z.array(z.string()).default([]),
       sampleIdRegex: z.string().nullable().default(null),
+      patientPrefixes: z.array(z.string()).default([]),
+      /** Send QC results to HMIS anyway. Off: a control is a lab-internal run
+       *  with no order row, so filing it only produces retry churn. */
+      upload: z.boolean().default(false),
     })
-    .default({ sampleIdPrefixes: [], sampleIdRegex: null }),
+    .default({}),
   /** Analyzer assay code → HMIS `eqIdntifier`, for analytes the two systems
    *  NAME differently (H360 "HGB" vs ZHFC03 "HAEMOGLOBIN"). Only consulted when
    *  the analyzer's own code matches no pending row, so it can never shadow a
@@ -172,9 +250,108 @@ const AnalyzerSchema = z.object({
    *  this is the escape hatch when the parameter is named after the report
    *  line rather than the instrument. */
   testCodeAliases: z.record(z.string()).default({}),
+  /** Assay codes this analyzer emits that are not reportable results and will
+   *  never have a pending row — research-only channels and flag scores. They
+   *  are dropped at delivery time instead of being re-queued as an unfilable
+   *  remainder that burns its retry budget once per sample. An entry may lead
+   *  with "*" to match by suffix ("*-IM"), trail with "*" to match by prefix
+   *  ("InR*"), or both to match anywhere ("*Histogram*"); matching is
+   *  case-insensitive. List ONLY codes that are not
+   *  results — a genuine analyte still missing its HMIS row belongs in
+   *  testCodeAliases or in the HMIS master, so that it keeps being retried. */
+  ignoreTestCodes: z.array(z.string()).default([]),
+  /** The ONLY assay codes this analyzer files — an allow-list, checked before
+   *  ignoreTestCodes. Empty (the default) means "no allow-list: file whatever
+   *  matches a pending row". When set, every other code the instrument emits
+   *  is dropped at delivery time as `ignored`: not filed, not re-queued, not
+   *  counted as unmatched. For an interface the lab has scoped to a fixed
+   *  parameter set (the BC-6000 files exactly the 22 CBC analytes HMIS
+   *  registers under the instrument mnemonic) this stops the connector from
+   *  trying to push the analyzer's remaining channels into HMIS, and from
+   *  burning a retry budget on each of them once per sample. Matching is
+   *  case-insensitive and exact — no wildcards, because an allow-list is the
+   *  statement of what reaches a patient record and must be read literally. */
+  allowTestCodes: z.array(z.string()).default([]),
+  /** Analyzer assay code → factor its value is multiplied by before the row is
+   *  posted, for the analytes the instrument and HMIS report in DIFFERENT
+   *  UNITS. The BC-6000 sends WBC and PLT in 10^9/L (WBC 8.89, PLT 226) where
+   *  HMIS holds them per microlitre (8890, 226000), so both carry a factor of
+   *  1000. Applied at delivery time, like testCodeAliases, so correcting a
+   *  factor also repairs results already sitting in the spool.
+   *
+   *  Only strictly numeric values are scaled; anything else (a flag string, a
+   *  "<0.1") is filed unchanged. Matching is case-insensitive and exact — no
+   *  "*" wildcards, because a wrong factor silently files a wrong number on a
+   *  patient's report, and a wildcard makes it easy to hit an analyte that was
+   *  already in the right unit. */
+  testCodeScale: z.record(z.number().finite().positive()).default({}),
+  /** Rebuild the order rows HMIS has stopped offering, so a result can still be
+   *  filed against the parameter it belongs to.
+   *
+   *  OFF by default: with this false the connector files only against rows HMIS
+   *  is currently offering, which is the conservative behaviour and the one
+   *  every analyzer had before.
+   *
+   *  Turn it on for an analyzer whose panel HMIS withdraws mid-sample. Measured
+   *  on the Cancer BC-6000, 2026-09-08: the CBC pending list for CH2609080017
+   *  held all 38 rows at 05:01:25 and only 20 of them 29 seconds later, with
+   *  nothing filed in between. CH2609080028 was first seen after its own
+   *  collapse, so 18 of its 22 interfaced analytes — WBC, RBC, HGB, HCT, PLT,
+   *  the indices, the whole differential — never had a row to be filed against.
+   *  Four values filed, HMIS flipped the sample to "result interfaced", and the
+   *  report printed blank.
+   *
+   *  With this on, the connector remembers each service's parameterIds (they
+   *  are a property of the SERVICE, identical on every sample: 164 pairs
+   *  observed across 9,338 polls, zero conflicts) and rebuilds a missing row by
+   *  taking the parameterId from that memory and the per-sample labResultId
+   *  from a sibling row of the SAME service on the SAME sample. Restricted to
+   *  PARAMETER services, where one labResultId genuinely covers the panel; a
+   *  Numeric service is one row per test, so there is no sibling to borrow from
+   *  and nothing is ever rebuilt. See src/orders/parameters.ts for the guards.
+   *
+   *  It cannot invent an analyte HMIS has never named. The BC-6000's 16 CBC
+   *  parameters registered under a bare number (42, 300, 460 …) instead of the
+   *  instrument mnemonic stay unfilable until that column is fixed in the HMIS
+   *  equipment-parameter master — the connector must not guess which number is
+   *  which analyte, because a wrong guess files a value against the wrong
+   *  analyte on a patient's CBC. */
+  fillMissingOrderRows: z.boolean().default(false),
+  /** How this analyzer's results reach HMIS.
+   *
+   *  "queue"  — one spool item per message, delivered in order, retried up to
+   *             50 times and then parked. The first item that cannot be filed
+   *             (no order row yet) holds up every item behind it.
+   *
+   *  "staged" — the way the retired middleware worked, rebuilt on files: every
+   *             value is written into a per-sample store the moment it arrives
+   *             (spool/<id>/results/<barcode>.json, no database), and a filing
+   *             pass joins each sample to whatever order rows exist NOW, files
+   *             what matches, and leaves the rest waiting. Samples are
+   *             independent, nothing is parked, a sample run before its order
+   *             was raised simply files later, a rerun replaces the value, and
+   *             a mistyped barcode can be re-keyed from the console. Waiting
+   *             values expire after retention.days. */
+  filing: z
+    .object({
+      mode: z.enum(['queue', 'staged']).default('queue'),
+      /** Staged: how often the filing pass runs on its own. It also runs after
+       *  every order poll and the moment a result arrives. */
+      passIntervalMs: z.number().int().min(5_000).default(15_000),
+      /** Staged: a sample still without order rows is asked about at HMIS
+       *  directly (a per-sample pending query) no more often than this — the
+       *  order poll covers the normal case, this is the safety net. */
+      recheckMs: z.number().int().min(30_000).default(5 * 60_000),
+      /** Staged: a fully filed sample stays visible on the console for this
+       *  many days, then its file is dropped. */
+      keepFiledDays: z.number().int().min(0).max(30).default(2),
+    })
+    .default({}),
   astm: AstmOptions.default({}),
+  abl9: Abl9Options.default({}),
   kermit: KermitOptions.default({}),
   hl7: Hl7Options.default({}),
+  gh900: Gh900Options.default({}),
 });
 
 const ConfigSchema = z.object({
@@ -192,16 +369,25 @@ const ConfigSchema = z.object({
     tlsRejectUnauthorized: z.boolean().default(true),
     /** Line-delimited JSON record of every gateway call: the query for a
      *  sample and whether orders came back, and each result upload with the
-     *  response it got. Set to null to switch the file off. */
+     *  request payload and the response it got. This is the BASE name: entries
+     *  are written to one file per day beside it (logs/hmis-YYYY-MM-DD.log)
+     *  and kept for retention.logDays. Set to null to switch the file off. */
     auditLog: z.string().nullable().default('./logs/hmis.log'),
-    /** Rotate to <file>.1 past this size; one generation is kept. */
+    /** A day's file that grows past this continues in a numbered part
+     *  (hmis-YYYY-MM-DD.1.log). Nothing is discarded by size. */
     auditMaxBytes: z.number().int().positive().default(10 * 1024 * 1024),
   }),
   /** Housekeeping: how long logs and unfiled spool items are kept on disk. */
   retention: z
     .object({
-      /** Keep-window in days; older files are deleted. 0 disables the sweep. */
+      /** Keep-window in days for unfiled spool items. 0 disables the whole
+       *  sweep (logs included). */
       days: z.number().int().nonnegative().default(7),
+      /** Keep-window in days for everything in logDir — the HMIS transaction
+       *  log, the per-analyzer wire logs and rotated PM2 output. Files whose
+       *  last write is older than this are deleted. Separate from `days` so
+       *  the evidence trail can be kept far longer than undeliverable results. */
+      logDays: z.number().int().nonnegative().default(30),
       /** Swept at startup and then on this interval. */
       sweepIntervalHours: z.number().positive().default(6),
       /** Directory holding the application and HMIS logs. */
@@ -211,7 +397,7 @@ const ConfigSchema = z.object({
        *  undelivered work indefinitely and clear only failed/. */
       includeSpoolPending: z.boolean().default(true),
     })
-    .default({ days: 7, sweepIntervalHours: 6, logDir: './logs', includeSpoolPending: true }),
+    .default({ days: 7, logDays: 30, sweepIntervalHours: 6, logDir: './logs', includeSpoolPending: true }),
   admin: z
     .object({
       host: z.string().default('127.0.0.1'),
@@ -356,7 +542,9 @@ export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.
   } catch (err) {
     throw new Error(`Failed to read config at ${abs}: ${(err as Error).message}`);
   }
-  const withEnv = applyEnvOverrides(raw);
+  // Model-level defaults from the analyzer's profile go under the block first,
+  // so the schema validates the RESULT — a profile cannot bypass validation.
+  const withEnv = applyEnvOverrides(applyProfiles(raw));
   const parsed = ConfigSchema.safeParse(withEnv);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `  • ${i.path.join('.')}: ${i.message}`).join('\n');
