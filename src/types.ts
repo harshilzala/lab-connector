@@ -8,7 +8,7 @@
 // =============================================================================
 
 export type Direction = 'IN' | 'OUT';
-export type ProtocolName = 'astm' | 'abl9' | 'hl7' | 'kermit' | 'advia2120i' | 'clinitek-advantus';
+export type ProtocolName = 'astm' | 'abl9' | 'hl7' | 'kermit' | 'advia2120i' | 'clinitek-advantus' | 'gh900';
 
 // ---- Analyzer → connector: a request for what to run on a sample -----------
 // (ASTM "Q" query record, or an order-less result upload that implies query.)
@@ -70,6 +70,10 @@ export interface ParsedMessage {
   queries: HostQuery[];
   /** Result records — present in result uploads. */
   results: InstrumentResult[];
+  /** Set when the PROTOCOL itself marked the upload as a QC/control run (HL7
+   *  MSH-11 = "Q"). The barcode-shape rules in the analyzer's qc config still
+   *  apply on top; this is an extra, authoritative signal. */
+  isQc?: boolean;
   /** The raw wire text, retained for the audit log. */
   raw: string;
 }

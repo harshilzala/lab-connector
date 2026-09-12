@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { DEFAULT_DIALECT, ASTM_DIALECT_NAMES, type AstmDialect } from './codec/astm/records.js';
+import { PROFILE_NAMES, applyProfiles } from './profiles/index.js';
 
 // Minimal .env loader (no dependency). Reads KEY=VALUE lines and populates
 // process.env without overwriting variables already set in the real environment.
@@ -135,8 +136,24 @@ const Hl7Options = z.object({
   idleFlushMs: z.number().int().nonnegative().default(0),
 });
 
+/** Lifotronic GH900 Plus HbA1c analyzer — see src/codec/gh900. */
+const Gh900Options = z.object({
+  /** File a run whose test error code is E1/E2 (sampling too little / too
+   *  much). Off by default: a mis-sampled run is not a result; it is logged
+   *  and dropped, and the rerun files. */
+  fileOnSamplingError: z.boolean().default(false),
+});
+
 const AnalyzerSchema = z.object({
   id: z.string().regex(/^[a-z0-9-]+$/, 'analyzer id must be kebab-case'),
+  /** Instrument MODEL this block is an instance of — see src/profiles. The
+   *  profile supplies every model-level default (protocol, transport type /
+   *  mode / port, ACK conventions, reportable analytes, non-result channels),
+   *  so a block only has to say what is specific to THIS site: id,
+   *  equipmentCode, the analyzer's address, and any local override. Keys
+   *  written here always win over the profile. Optional: a block without it is
+   *  read exactly as before. */
+  profile: z.enum(PROFILE_NAMES).optional(),
   /** Sent as the `eqCode` query parameter — this is what identifies the machine
    *  now that there is no id/secret pair. */
   equipmentCode: z.string(),
@@ -166,7 +183,7 @@ const AnalyzerSchema = z.object({
   /** Reported in the acknowledge body; derived from a TCP transport when unset. */
   ipAddress: z.string().optional(),
   portNo: z.string().optional(),
-  protocol: z.enum(['astm', 'abl9', 'hl7', 'kermit', 'advia2120i', 'clinitek-advantus']).default('astm'),
+  protocol: z.enum(['astm', 'abl9', 'hl7', 'kermit', 'advia2120i', 'clinitek-advantus', 'gh900']).default('astm'),
   transport: TransportSchema,
   sendDemographics: z.boolean().default(false),
   hostQuery: z.boolean().default(true),
@@ -237,8 +254,9 @@ const AnalyzerSchema = z.object({
    *  never have a pending row — research-only channels and flag scores. They
    *  are dropped at delivery time instead of being re-queued as an unfilable
    *  remainder that burns its retry budget once per sample. An entry may lead
-   *  with "*" to match by suffix ("*-IM") or trail with "*" to match by prefix
-   *  ("InR*"); matching is case-insensitive. List ONLY codes that are not
+   *  with "*" to match by suffix ("*-IM"), trail with "*" to match by prefix
+   *  ("InR*"), or both to match anywhere ("*Histogram*"); matching is
+   *  case-insensitive. List ONLY codes that are not
    *  results — a genuine analyte still missing its HMIS row belongs in
    *  testCodeAliases or in the HMIS master, so that it keeps being retried. */
   ignoreTestCodes: z.array(z.string()).default([]),
@@ -333,6 +351,7 @@ const AnalyzerSchema = z.object({
   abl9: Abl9Options.default({}),
   kermit: KermitOptions.default({}),
   hl7: Hl7Options.default({}),
+  gh900: Gh900Options.default({}),
 });
 
 const ConfigSchema = z.object({
@@ -523,7 +542,9 @@ export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.
   } catch (err) {
     throw new Error(`Failed to read config at ${abs}: ${(err as Error).message}`);
   }
-  const withEnv = applyEnvOverrides(raw);
+  // Model-level defaults from the analyzer's profile go under the block first,
+  // so the schema validates the RESULT — a profile cannot bypass validation.
+  const withEnv = applyEnvOverrides(applyProfiles(raw));
   const parsed = ConfigSchema.safeParse(withEnv);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `  • ${i.path.join('.')}: ${i.message}`).join('\n');

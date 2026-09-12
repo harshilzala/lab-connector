@@ -95,6 +95,24 @@ Edit `config.json`:
 - `hmis.pendingPath` / `acknowledgePath` / `resultsPath` — default to
   `/mirth/pending`, `/mirth/acknowledge`, `/mirth/results`.
 - One entry per analyzer under `analyzers[]`:
+  - `profile` — the instrument **model**, from the machine profile library in
+    `src/profiles/index.ts` (`mindray-bc5150`, `mindray-bc6000`, `erba-h360`,
+    `lifotronic-gh900plus`, `vitros-eciq`, `vitros-250`, `snibe-maglumi`
+    …). The profile supplies every model-level default — protocol, transport
+    type/mode/port, ACK conventions, the analytes the instrument reports, the
+    channels that are not results — so the same model at a second site is just
+    its identifiers:
+
+    ```jsonc
+    { "id": "site-bc5150", "profile": "mindray-bc5150",
+      "equipmentCode": "XXXX001", "transport": { "host": "10.x.x.x" } }
+    ```
+
+    Any key written in the block wins over the profile (objects merge one level
+    deep; arrays and scalars replace). Optional — a block without `profile` is
+    read exactly as before. **Adding a new model means adding a profile**, with
+    the vendor document or wire capture each number came from, not copying a
+    block between sites.
   - `equipmentCode` — **required**; sent as `eqCode` to identify the machine.
   - `extraEquipmentCodes` — other `eqCode`s HMIS raises this *same* machine's
     orders under (a re-registered analyzer keeps its old code on the tests

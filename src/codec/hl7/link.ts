@@ -5,6 +5,7 @@ import type { OrderDownload } from '../../types.js';
 import type { ProtocolLink } from '../types.js';
 import { MllpDecoder, wrapMllp } from './mllp.js';
 import {
+  elideLongFields,
   hl7ToParsedMessage,
   hl7ToQueryMessage,
   isQueryMessage,
@@ -68,6 +69,8 @@ export interface Hl7LinkOptions {
  *  correlate the worklist reply the orchestrator asks us to send back. */
 interface QueryContext {
   controlId: string;
+  /** MSH-11 of the query, echoed on whatever we send back. */
+  processingId: string;
   encoding: Hl7Encoding;
   version: string;
   charset: string;
@@ -89,6 +92,10 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
 
   /** Set when a host query arrives; consumed by the next sendOrders reply. */
   private queryCtx: QueryContext | null = null;
+
+  /** Bare control-byte chunks seen outside any frame (the BC-5150's 0x02 every
+   *  3 s). Counted, not logged: they carry nothing and were 75% of the wire log. */
+  private keepAlives = 0;
 
   constructor(private readonly transport: Transport, private readonly opts: Hl7LinkOptions) {
     super();
@@ -157,17 +164,31 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
   }
 
   // ---- inbound --------------------------------------------------------------
+  //
+  // The wire log gets ONE line per complete message, with over-long fields
+  // (Base64 bitmaps) shortened, rather than one line per TCP chunk: a BC-5150
+  // result arrives as ~25 chunks of 8 KB, 98% of it histogram/scattergram
+  // bitmaps. A chunk that is only control bytes outside a frame is the
+  // instrument's keep-alive and is counted instead of logged.
   private onData(chunk: Buffer): void {
-    this.emit('wire', { direction: 'IN', text: printable(chunk.toString(this.encoding)) });
-
     let messages: string[];
     try {
       messages = this.decoder.push(chunk);
     } catch (err) {
+      this.emit('wire', { direction: 'IN', text: printable(elideLongFields(chunk.toString(this.encoding))) });
       this.emit('error', err instanceof Error ? err : new Error(String(err)));
       return;
     }
-    for (const text of messages) this.handleMessage(text);
+    if (messages.length === 0 && isKeepAlive(chunk)) {
+      this.keepAlives += 1;
+      if (this.keepAlives % 1000 === 1) {
+        this.opts.logger.debug({ count: this.keepAlives }, 'HL7 link keep-alive bytes from analyzer (not logged to wire)');
+      }
+    }
+    for (const text of messages) {
+      this.emit('wire', { direction: 'IN', text: printable(elideLongFields(text)) });
+      this.handleMessage(text);
+    }
     this.armIdleFlush();
   }
 
@@ -183,6 +204,7 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       this.idleTimer = null;
       for (const text of this.decoder.flushUnframed()) {
         this.opts.logger.warn('HL7 message had no MLLP end block — flushed on idle');
+        this.emit('wire', { direction: 'IN', text: printable(elideLongFields(text)) });
         this.handleMessage(text);
       }
     }, this.idleFlushMs);
@@ -241,6 +263,7 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
     // Capture context for the reply the orchestrator will ask us to send.
     this.queryCtx = {
       controlId: msg.controlId,
+      processingId: msg.processingId || 'P',
       encoding: msg.encoding,
       version: msg.version || '2.3.1',
       charset: msg.charset,
@@ -300,7 +323,7 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       '',
       `ORM${cc}O01`,
       ctx.controlId || now,
-      'P',
+      ctx.processingId,
       ctx.version,
       '',
       '',
@@ -351,7 +374,7 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       '',
       `ACK${cc}R01`,
       ctx.controlId,
-      'P',
+      ctx.processingId,
       ctx.version,
       '',
       '',
@@ -376,11 +399,16 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
     const charset = this.opts.charset ?? msg.charset ?? '';
     const version = msg.version || '2.3.1';
     const trigger = msg.triggerEvent || 'R01';
+    // MSH-11 is echoed, not fixed: the Mindray BC-5000/BC-5150 sends "Q" on a
+    // QC result and requires the ACK to carry the same value (protocol §4.3.1,
+    // §5.4). A sample result carries "P", which is what the H360 reference ACK
+    // always sent — so this changes nothing for that analyzer.
+    const processingId = msg.processingId || 'P';
 
     // Field layout matches the reference byte-for-byte:
     // MSH-3 app, MSH-4 facility, MSH-5/6 empty, MSH-7 now, MSH-8 empty,
-    // MSH-9 ACK^<trigger>, MSH-10 echoed control id, MSH-11 P, MSH-12 version,
-    // MSH-13..17 empty, MSH-18 charset.
+    // MSH-9 ACK^<trigger>, MSH-10 echoed control id, MSH-11 echoed processing
+    // id, MSH-12 version, MSH-13..17 empty, MSH-18 charset.
     const msh = [
       'MSH',
       msg.encoding.component + msg.encoding.repeat + msg.encoding.escape + msg.encoding.subcomponent,
@@ -392,7 +420,7 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       '',
       `ACK${msg.encoding.component}${trigger}`,
       msg.controlId,
-      'P',
+      processingId,
       version,
       '',
       '',
@@ -415,6 +443,14 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
 export function hl7Now(d = new Date()): string {
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/** True for a chunk made only of control bytes that is not part of a frame
+ *  (no VT start, no FS end): a keep-alive or a stray CR/LF, never data. */
+function isKeepAlive(chunk: Buffer): boolean {
+  if (chunk.length === 0 || chunk.length > 8) return false;
+  for (const b of chunk) if (b >= 0x20 || b === 0x0b || b === 0x1c) return false;
+  return true;
 }
 
 /** Segment separators as visible newlines for the admin wire log. */

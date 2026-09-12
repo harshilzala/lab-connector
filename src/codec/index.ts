@@ -8,6 +8,7 @@ import { Advia2120Link } from './advia/link.js';
 import { ClinitekAdvantusLink } from './clinitek/link.js';
 import { KermitLink } from './kermit/link.js';
 import { Hl7Link } from './hl7/link.js';
+import { Gh900Link } from './gh900/link.js';
 
 // Factory for the pluggable protocol layer.
 export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transport, logger: Logger): ProtocolLink {
@@ -53,6 +54,13 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
         idleFlushMs: analyzer.hl7.idleFlushMs,
         hostQuery: analyzer.hostQuery,
         logger: logger.child({ codec: 'hl7' }),
+      });
+    case 'gh900':
+      // Lifotronic GH900 Plus HbA1c analyzer — proprietary fixed-width
+      // STX…ETX block, results-only, the analyzer dials in. See src/codec/gh900/.
+      return new Gh900Link(transport, {
+        fileOnSamplingError: analyzer.gh900.fileOnSamplingError,
+        logger: logger.child({ codec: 'gh900' }),
       });
     case 'kermit':
       // The VITROS 250/350 chemistry systems do NOT speak ASTM on this link —

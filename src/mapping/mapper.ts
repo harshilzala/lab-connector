@@ -121,7 +121,8 @@ export function toResultUploads(analyzer: AnalyzerConfig, msg: ParsedMessage): H
       equipmentId: analyzer.equipmentId ?? null,
       eqCode: analyzer.equipmentCode,
       barcode,
-      isQc: isQcSample(sampleId, analyzer.qc),
+      // Either the protocol said so (HL7 MSH-11 = Q) or the barcode shape does.
+      isQc: msg.isQc === true || isQcSample(sampleId, analyzer.qc),
       results: payload,
       raw: msg.raw,
       messageId: deterministicMessageId(analyzer.equipmentCode, barcode, payload),
@@ -252,10 +253,12 @@ export function toLisResultRows(
   const ignoreExact = new Set<string>();
   const ignoreSuffix: string[] = [];
   const ignorePrefix: string[] = [];
+  const ignoreContains: string[] = [];
   for (const pattern of ignoreTestCodes) {
     const raw = (pattern || '').trim();
-    if (!raw || raw === '*') continue; // "*" would silence the whole analyzer
-    if (raw.startsWith('*')) ignoreSuffix.push(key(raw.slice(1)));
+    if (!raw || raw === '*' || raw === '**') continue; // would silence the whole analyzer
+    if (raw.startsWith('*') && raw.endsWith('*')) ignoreContains.push(key(raw.slice(1, -1)));
+    else if (raw.startsWith('*')) ignoreSuffix.push(key(raw.slice(1)));
     else if (raw.endsWith('*')) ignorePrefix.push(key(raw.slice(0, -1)));
     else ignoreExact.add(key(raw));
   }
@@ -263,7 +266,11 @@ export function toLisResultRows(
     const k = key(code);
     if (!k) return false;
     if (ignoreExact.has(k)) return true;
-    return ignoreSuffix.some((s) => s && k.endsWith(s)) || ignorePrefix.some((p) => p && k.startsWith(p));
+    return (
+      ignoreSuffix.some((s) => s && k.endsWith(s)) ||
+      ignorePrefix.some((p) => p && k.startsWith(p)) ||
+      ignoreContains.some((c) => c && k.includes(c))
+    );
   };
 
   const allow = new Set<string>();
