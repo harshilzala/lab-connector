@@ -170,4 +170,69 @@ console.log(`✓ link ACKed: ${ackText.replace(/\r/g, ' / ')}`);
   assert.deepEqual(dec.push(wrapMllp('MSH|^~\\&|A\rMSA|AA|1\r')), ['MSH|^~\\&|A\rMSA|AA|1']);
 }
 
+// ---- 5) bidirectional: host query → worklist reply ----------------------
+// We have no captured H360 query, so this pins the standard QRY^Q02 → ORM^O01
+// behaviour the code implements. It also proves the link stays results-only
+// (ACK, no worklist) when hostQuery is off.
+{
+  const QRY =
+    'MSH|^~\\&|H360|Erba|LIS||20260905120000||QRY^Q02|QID123|P|2.3.1||||||UNICODE\r' +
+    'QRD|20260905120000|R|D|QID123|||1^RD|SF2609050099|OTH|\r';
+
+  // hostQuery ON: a query is recognised, emitted for lookup, and NOT ACKed
+  // (the worklist reply is the acknowledgement).
+  const t = new FakeTransport();
+  const bidi = new Hl7Link(t as never, { logger, hostQuery: true });
+  const qmsgs: ParsedMessage[] = [];
+  bidi.on('message', (m: ParsedMessage) => qmsgs.push(m));
+  bidi.on('error', (e: Error) => {
+    throw e;
+  });
+  await bidi.start();
+  t.feed(wrapMllp(QRY, 'utf8'));
+  await new Promise((r) => setTimeout(r, 20));
+
+  assert.equal(qmsgs.length, 1, 'query emitted as one message');
+  assert.equal(qmsgs[0]!.results.length, 0, 'a query carries no results');
+  assert.equal(qmsgs[0]!.queries.length, 1, 'one host query');
+  assert.equal(qmsgs[0]!.queries[0]!.sampleId, 'SF2609050099', 'barcode read from QRD-8');
+  assert.equal(t.writes.length, 0, 'no generic ACK — the worklist is the reply');
+
+  // Orchestrator would now look up the order and call sendOrders. Simulate it.
+  await bidi.sendOrders([
+    { sampleId: 'SF2609050099', testCodes: ['CBC', 'ESR'], priority: 'R', patient: null },
+  ]);
+  await bidi.stop();
+
+  assert.equal(t.writes.length, 1, 'one worklist message written');
+  const orm = t.writes[0]!;
+  assert.equal(orm[0], 0x0b, 'ORM framed with VT');
+  assert.equal(orm[orm.length - 2], 0x1c, 'ORM ends FS CR');
+  const ormText = orm.subarray(1, orm.length - 2).toString('utf8');
+  const seg = Object.fromEntries(ormText.split('\r').filter(Boolean).map((s) => [s.split('|')[0], s]));
+  const mf = seg['MSH']!.split('|');
+  assert.equal(mf[8], 'ORM^O01', 'MSH-9 ORM^O01');
+  assert.equal(mf[4], 'H360', 'MSH-5 addresses the reply back to the querying app');
+  assert.equal(mf[9], 'QID123', 'MSH-10 echoes the query control id');
+  assert.ok(seg['ORC']!.startsWith('ORC|NW|SF2609050099'), 'ORC new order for the sample');
+  assert.ok(ormText.includes('OBR|1|SF2609050099|SF2609050099|CBC'), 'OBR carries the ordered test');
+  console.log(`✓ bidirectional: QRY^Q02(SF2609050099) → ${ormText.split('\r')[0]}`);
+
+  // hostQuery OFF: same query is only ACKed, never turned into a worklist.
+  const t2 = new FakeTransport();
+  const uni = new Hl7Link(t2 as never, { logger, hostQuery: false });
+  const umsgs: ParsedMessage[] = [];
+  uni.on('message', (m: ParsedMessage) => umsgs.push(m));
+  await uni.start();
+  t2.feed(wrapMllp(QRY, 'utf8'));
+  await new Promise((r) => setTimeout(r, 20));
+  await uni.stop();
+  assert.equal(umsgs.length, 0, 'unidirectional: query not acted on');
+  assert.equal(t2.writes.length, 1, 'unidirectional: query is ACKed so the analyzer is released');
+  const uniText = t2.writes[0]!.subarray(1).toString('utf8');
+  assert.ok(uniText.includes('ACK^') && uniText.includes('MSA|AA'), 'plain ACK, no worklist');
+  assert.ok(!uniText.includes('ORM^O01'), 'no worklist emitted when hostQuery is off');
+  console.log('✓ unidirectional: host query acknowledged, no worklist sent');
+}
+
 console.log('\nALL HL7 / H360 CODEC TESTS PASSED');

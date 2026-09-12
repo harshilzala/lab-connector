@@ -40,6 +40,14 @@ export interface HmisAuditEntry {
   /** Barcode(s) the call concerns — the grep key. */
   sampleId: string | string[] | null;
   eqCode?: string | null;
+  /**
+   * Result uploads only: one flat line per value —
+   *   "SF2609050017 1.000000+032+1 = 395 -> labResultId 92768304"
+   * The same facts are inside `request`, but only as nested JSON. This is the
+   * readable index into it, so a transfer can be traced by grepping whichever
+   * handle the operator has: barcode, assay identifier, value, or labResultId.
+   */
+  filed?: string[];
   method: 'GET' | 'POST';
   url: string;
   /** Request body, parsed. Absent on GET. */

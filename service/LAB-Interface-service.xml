@@ -1,0 +1,58 @@
+<service>
+  <!--
+    Windows service definition for the LAB-Interface HMIS lab connector.
+
+    WHY A SERVICE (and not PM2 any more)
+    A Windows service started by the Service Control Manager comes up at BOOT,
+    before and independent of any interactive logon, and the SCM restarts it on
+    failure. That closes the one gap the PM2 + logon-shortcut + watchdog setup
+    had: a machine that reboots and sits at the login screen with nobody logged
+    on. The connector now runs whether or not anyone is signed in, and the PC
+    can stay locked.
+
+    Recovery here mirrors what PM2 used to do:
+      * startmode Automatic + delayedAutoStart  -> starts at boot once the
+        network stack is up (so the analyzer TCP dials and the HMIS HTTPS calls
+        do not fail on a cold boot);
+      * onfailure restart                        -> SCM brings it straight back
+        if the process ever exits unexpectedly.
+    Network drops between analyzer and connector are handled inside the app
+    itself (the transport re-dials every 3s), so they need nothing here.
+
+    It runs as LocalSystem (the WinSW default): no stored password, and the
+    connector only needs the project directory (set as the working directory
+    below) plus outbound network, both of which LocalSystem has.
+  -->
+  <id>LAB-Interface</id>
+  <name>LAB-Interface (HMIS Lab Connector)</name>
+  <description>Bidirectional LIS middleware between the lab analyzers (VITROS ECiQ, VITROS 250, Erba H360) and the HMIS lab API.</description>
+
+  <executable>C:\Users\LAB1\AppData\Local\nodejs\node.exe</executable>
+  <arguments>dist\index.js</arguments>
+  <workingdirectory>C:\lab\lab-connector</workingdirectory>
+
+  <!-- Start at boot, but only once the network is ready. -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Crash recovery: keep restarting, never give up. resetfailure keeps the
+       failure count from latching after a long healthy run. -->
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- Give the connector time to close sockets and flush the spool on stop
+       (its SIGTERM/Ctrl+C handler does this). -->
+  <stoptimeout>10 sec</stoptimeout>
+  <stopparentprocessfirst>false</stopparentprocessfirst>
+
+  <env name="NODE_ENV" value="production"/>
+
+  <!-- WinSW's own wrapper log (separate from the app's pino logs in logs/). -->
+  <logpath>C:\lab\lab-connector\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+</service>

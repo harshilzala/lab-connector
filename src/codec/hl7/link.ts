@@ -4,7 +4,14 @@ import type { Logger } from '../../logger.js';
 import type { OrderDownload } from '../../types.js';
 import type { ProtocolLink } from '../types.js';
 import { MllpDecoder, wrapMllp } from './mllp.js';
-import { hl7ToParsedMessage, parseHl7, type Hl7Message } from './parser.js';
+import {
+  hl7ToParsedMessage,
+  hl7ToQueryMessage,
+  isQueryMessage,
+  parseHl7,
+  type Hl7Encoding,
+  type Hl7Message,
+} from './parser.js';
 
 // =============================================================================
 // Hl7Link — HL7 v2 over MLLP, the interface the Erba H360 hematology analyzer
@@ -22,9 +29,18 @@ import { hl7ToParsedMessage, parseHl7, type Hl7Message } from './parser.js';
 // MSA-2 — byte-for-byte what the legacy middleware sent and the analyzer has
 // accepted in production.
 //
-// The analyzer never host-queries over this link, so sendOrders is a no-op
-// (keep hostQuery:false in config). Results arrive unsolicited and are joined to
-// their pending order rows at upload time by the orchestrator.
+// BIDIRECTIONAL (host query). When the analyzer is switched to host-query mode
+// it asks the LIS for a worklist as each tube is loaded, instead of only
+// broadcasting results. With hostQuery enabled this link recognises that query,
+// lets the orchestrator look up the order, and replies with an ORM^O01
+// worklist. It stays fully inert while the analyzer runs unidirectional: a
+// results-only H360 never sends a query, so the result/ACK path below is
+// unchanged and no worklist is ever emitted.
+//
+// The H360 here has only ever run unidirectional, so we have NO captured sample
+// of its query or the reply shape it expects. The reply is therefore built to
+// the HL7 v2 standard (QRY^Q02 → ORM^O01) and the raw inbound query is logged
+// verbatim, so the first real query confirms — or corrects — the exact layout.
 // =============================================================================
 
 export interface Hl7LinkOptions {
@@ -43,6 +59,21 @@ export interface Hl7LinkOptions {
   encoding?: BufferEncoding;
   /** Flush an unterminated buffer after this long. 0 disables. */
   idleFlushMs?: number;
+  /** Answer inbound host queries with a worklist. When false, a query is only
+   *  acknowledged and the link stays results-only. */
+  hostQuery?: boolean;
+}
+
+/** Correlation context captured from an inbound query, used to address and
+ *  correlate the worklist reply the orchestrator asks us to send back. */
+interface QueryContext {
+  controlId: string;
+  encoding: Hl7Encoding;
+  version: string;
+  charset: string;
+  /** The query's sender — becomes the receiver (MSH-5/6) on our reply. */
+  replyToApp: string;
+  replyToFacility: string;
 }
 
 export class Hl7Link extends EventEmitter implements ProtocolLink {
@@ -55,6 +86,9 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
 
   private readonly onDataBound = (c: Buffer) => this.onData(c);
   private readonly onCloseBound = () => this.decoder.reset();
+
+  /** Set when a host query arrives; consumed by the next sendOrders reply. */
+  private queryCtx: QueryContext | null = null;
 
   constructor(private readonly transport: Transport, private readonly opts: Hl7LinkOptions) {
     super();
@@ -78,14 +112,47 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
     await this.transport.stop();
   }
 
-  // Results-only interface: the H360 pulls its worklist from its own screen or
-  // from a separate query channel, never over this ORU link.
+  // Worklist reply to a host query. Called by the orchestrator's answerQuery
+  // after it has looked up the pending order for the queried barcode. Uses the
+  // context captured from the query so the reply is addressed and correlated
+  // back to it. Only reachable after a query arrived while hostQuery is on, so
+  // a results-only analyzer never triggers this.
   async sendOrders(orders: OrderDownload[]): Promise<void> {
-    if (orders.length > 0) {
-      this.opts.logger.warn(
-        { count: orders.length },
-        'HL7 order-download not supported on this results-only ORU link — ignoring',
+    const ctx = this.queryCtx;
+    this.queryCtx = null;
+    if (!ctx) {
+      if (orders.length > 0) {
+        this.opts.logger.warn(
+          { count: orders.length },
+          'HL7 sendOrders with no pending query context — a worklist can only be sent in reply to a query; ignoring',
+        );
+      }
+      return;
+    }
+
+    if (orders.length === 0) {
+      // No pending order for the queried barcode. Acknowledge the query so the
+      // analyzer is released rather than left waiting, but send no worklist.
+      this.sendQueryAck(ctx);
+      this.opts.logger.info(
+        { controlId: ctx.controlId },
+        'HL7 host query had no pending order — acknowledged, no worklist sent',
       );
+      return;
+    }
+
+    for (const order of orders) {
+      const text = this.buildOrderMessage(order, ctx);
+      this.emit('wire', { direction: 'OUT', text: printable(text) });
+      try {
+        await this.transport.write(wrapMllp(text, this.encoding));
+        this.opts.logger.info(
+          { barcode: order.sampleId, tests: order.testCodes, controlId: ctx.controlId },
+          'HL7 worklist sent to analyzer',
+        );
+      } catch (e) {
+        this.emit('error', e instanceof Error ? e : new Error(String(e)));
+      }
     }
   }
 
@@ -130,6 +197,13 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       return;
     }
 
+    // A host query is answered by the worklist reply, not by a generic ACK, so
+    // it is handled on its own path before the results branch.
+    if (isQueryMessage(msg)) {
+      this.handleQuery(msg);
+      return;
+    }
+
     // ACK first: the analyzer holds the line waiting for it, and a parse that
     // yields nothing filable is still a message it delivered successfully.
     if (this.opts.ack !== false) this.sendAck(msg);
@@ -147,6 +221,151 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       'HL7 results parsed',
     );
     this.emit('message', parsed);
+  }
+
+  // ---- host query -----------------------------------------------------------
+  private handleQuery(msg: Hl7Message): void {
+    const parsed = hl7ToQueryMessage(msg);
+    // Log the raw query verbatim: this is the first time we see this analyzer's
+    // query shape, and it is what confirms the reply layout.
+    this.opts.logger.info(
+      {
+        controlId: msg.controlId,
+        messageType: msg.messageType,
+        barcode: parsed?.queries[0]?.sampleId ?? null,
+        raw: printable(msg.raw).slice(0, 400),
+      },
+      'HL7 host query received',
+    );
+
+    // Capture context for the reply the orchestrator will ask us to send.
+    this.queryCtx = {
+      controlId: msg.controlId,
+      encoding: msg.encoding,
+      version: msg.version || '2.3.1',
+      charset: msg.charset,
+      replyToApp: msg.sendingApp,
+      replyToFacility: msg.sendingFacility,
+    };
+
+    if (!this.opts.hostQuery) {
+      // Bidirectional is not enabled for this analyzer: acknowledge so it is not
+      // left hanging, and stay results-only.
+      this.queryCtx = null;
+      if (this.opts.ack !== false) this.sendAck(msg);
+      this.opts.logger.warn(
+        { controlId: msg.controlId },
+        'HL7 host query received but hostQuery is disabled — acknowledged, staying unidirectional',
+      );
+      return;
+    }
+
+    if (!parsed) {
+      // hostQuery is on but we could not read a barcode to look up.
+      this.queryCtx = null;
+      if (this.opts.ack !== false) this.sendAck(msg);
+      this.opts.logger.warn(
+        { controlId: msg.controlId },
+        'HL7 host query carried no readable barcode — acknowledged, no worklist',
+      );
+      return;
+    }
+
+    // Hand the query to the orchestrator; it looks up the order and calls
+    // sendOrders, which sends the worklist (the reply IS the acknowledgement).
+    this.emit('message', parsed);
+  }
+
+  /** Build the ORM^O01 worklist reply to a query. Layout follows HL7 v2.3.1;
+   *  confirm against the analyzer's first real query. */
+  private buildOrderMessage(order: OrderDownload, ctx: QueryContext): string {
+    const enc = ctx.encoding;
+    const f = enc.field;
+    const cc = enc.component;
+    const app = this.opts.sendingApp ?? 'LIS';
+    const facility = this.opts.sendingFacility ?? '';
+    const charset = this.opts.charset ?? ctx.charset ?? '';
+    const now = hl7Now();
+    const sid = order.sampleId;
+    const encField = cc + enc.repeat + enc.escape + enc.subcomponent;
+
+    const msh = [
+      'MSH',
+      encField,
+      app,
+      facility,
+      ctx.replyToApp || '',
+      ctx.replyToFacility || '',
+      now,
+      '',
+      `ORM${cc}O01`,
+      ctx.controlId || now,
+      'P',
+      ctx.version,
+      '',
+      '',
+      '',
+      '',
+      '',
+      charset,
+    ].join(f);
+
+    const segs = [msh];
+
+    // PID only when demographics were supplied (sendDemographics on).
+    const p = order.patient;
+    if (p) {
+      const name = [p.lastName ?? '', p.firstName ?? '', p.middleName ?? ''].join(cc);
+      segs.push(['PID', '1', '', p.patientId ?? '', '', name, '', p.birthDate ?? '', p.sex ?? ''].join(f));
+    }
+
+    // One ORC/OBR per ordered test; "ALL" when HMIS listed no specific codes.
+    const codes = order.testCodes.length ? order.testCodes : ['ALL'];
+    const priority = order.priority === 'S' ? 'S' : 'R';
+    let setId = 0;
+    for (const code of codes) {
+      setId += 1;
+      segs.push(['ORC', 'NW', sid, sid, '', '', '', '', '', now].join(f));
+      segs.push(['OBR', String(setId), sid, sid, code, priority, now].join(f));
+    }
+    return segs.join('\r') + '\r';
+  }
+
+  /** Acknowledge a query we are not answering with a worklist (no order found,
+   *  or unreadable), so the analyzer is released instead of timing out. */
+  private sendQueryAck(ctx: QueryContext): void {
+    const enc = ctx.encoding;
+    const f = enc.field;
+    const cc = enc.component;
+    const app = this.opts.sendingApp ?? 'LIS';
+    const facility = this.opts.sendingFacility ?? '';
+    const charset = this.opts.charset ?? ctx.charset ?? '';
+    const msh = [
+      'MSH',
+      cc + enc.repeat + enc.escape + enc.subcomponent,
+      app,
+      facility,
+      ctx.replyToApp || '',
+      ctx.replyToFacility || '',
+      hl7Now(),
+      '',
+      `ACK${cc}R01`,
+      ctx.controlId,
+      'P',
+      ctx.version,
+      '',
+      '',
+      '',
+      '',
+      '',
+      charset,
+    ].join(f);
+    const msa = ['MSA', 'AA', ctx.controlId].join(f);
+    const ack = `${msh}\r${msa}\r`;
+    this.emit('wire', { direction: 'OUT', text: printable(ack) });
+    this.transport
+      .write(wrapMllp(ack, this.encoding))
+      .catch((e) => this.emit('error', e instanceof Error ? e : new Error(String(e))));
   }
 
   // ---- outbound ACK ---------------------------------------------------------

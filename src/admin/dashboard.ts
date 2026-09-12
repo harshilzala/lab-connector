@@ -235,7 +235,41 @@ ${FONT_LINK}
 <script>
 // state.max is the id of the maximized machine, or null for the normal grid.
 // state.analyzers caches the last poll so toggling repaints without a fetch.
-const state = { open: null, tab: 'wire', max: null, analyzers: [] };
+// state.scroll remembers where the operator had scrolled each panel, keyed by
+// analyzer+tab. Needed because the 5s poll rebuilds the whole card grid, which
+// destroys the panel element and would otherwise snap the view back to the top
+// mid-read.
+const state = { open: null, tab: 'wire', max: null, analyzers: [], scroll: {} };
+
+const scrollKey = (id) => id + '|' + state.tab;
+
+/**
+ * Keep the operator's place across a re-render.
+ *
+ * The wire log is newest-first, so a new frame is PREPENDED and everything the
+ * operator was reading shifts down. Restoring the raw pixel offset would still
+ * move the text under their eyes, so the offset is corrected by however much
+ * the content grew above it — the frame they were looking at stays put.
+ *
+ * Sitting at the very top is treated as "follow the latest": the view is left
+ * at 0 so incoming frames appear naturally, which is the one case where NOT
+ * moving is what the operator wants.
+ */
+function keepScroll(el, id) {
+  const key = scrollKey(id);
+  const prev = state.scroll[key];
+  if (prev && prev.top > 0) {
+    el.scrollTop = prev.top + (el.scrollHeight - prev.height);
+  }
+  const save = () => { state.scroll[key] = { top: el.scrollTop, height: el.scrollHeight }; };
+  save();
+  // One listener per element: this runs twice per poll (once when the grid is
+  // rebuilt, once when the fetch lands) and the element outlives both calls.
+  if (!el.dataset.scrollBound) {
+    el.dataset.scrollBound = '1';
+    el.addEventListener('scroll', save, { passive: true });
+  }
+}
 
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function time(iso) { return iso ? new Date(iso).toLocaleTimeString() : '\u2014'; }
@@ -256,6 +290,15 @@ function queuePill(sp) {
   if (sp.failed > 0)  return '<span class="pill bad">' + sp.failed + ' failed</span>';
   if (sp.pending > 0) return '<span class="pill warn">' + sp.pending + ' pending</span>';
   return '<span class="pill ok">Clear</span>';
+}
+// Order store + poller state. A poll error is the thing an operator must see:
+// it means new orders are not reaching this analyzer.
+function ordersLine(o) {
+  if (!o) return '—';
+  var stored = o.stored + ' stored';
+  if (!o.pollEnabled) return esc(stored) + ' · poll off';
+  if (o.lastPollError) return '<span class="pill bad">poll failing</span> ' + esc(stored) + ' · ' + esc(o.lastPollError);
+  return esc(stored) + ' · polled ' + time(o.lastPollAt);
 }
 
 function renderStats(analyzers) {
@@ -289,6 +332,15 @@ function renderCards(analyzers) {
 
   const grid = document.getElementById('cards');
   grid.classList.toggle('has-max', !!state.max);
+
+  // Rebuilding the grid throws away the open panel and replaces it with the
+  // "Pick a view above" placeholder, and renderPanel only refills it once its
+  // fetch returns. On the 5s poll that collapsed the panel and flashed the
+  // operator's reading position away several times a minute. Carry the current
+  // contents across so the panel is never empty in between.
+  const openPanel = state.open ? document.getElementById('panel-' + state.open) : null;
+  const carried = openPanel ? openPanel.innerHTML : null;
+
   grid.innerHTML = analyzers.map(a => \`
     <article class="card \${state.max === a.id ? 'is-max' : ''}">
       <div class="card-top">
@@ -313,6 +365,7 @@ function renderCards(analyzers) {
       <div class="card-body">
         <div class="kv"><span class="k">Last message</span><span class="v">\${time(a.lastMessageAt)}</span></div>
         <div class="kv"><span class="k">Upload queue</span><span class="v">\${queuePill(a.spool)}</span></div>
+        <div class="kv"><span class="k">Orders</span><span class="v">\${ordersLine(a.orders)}</span></div>
         <div class="tabs">
           <button type="button" data-a="\${esc(a.id)}" data-t="wire"
                   class="\${state.open === a.id && state.tab === 'wire' ? 'active' : ''}">Wire log</button>
@@ -325,6 +378,16 @@ function renderCards(analyzers) {
         </div>
       </div>
     </article>\`).join('');
+
+  // Put the carried contents back before the browser paints, so the panel keeps
+  // both its text and the operator's scroll position while renderPanel refetches.
+  if (carried !== null) {
+    const fresh = document.getElementById('panel-' + state.open);
+    if (fresh) {
+      fresh.innerHTML = carried;
+      keepScroll(fresh, state.open);
+    }
+  }
 
   document.querySelectorAll('button[data-max]').forEach(b => {
     b.onclick = () => setMax(state.max === b.dataset.max ? null : b.dataset.max);
@@ -384,6 +447,7 @@ async function renderPanel(id) {
           '<li><div class="head"><span class="dir ' + esc(w.direction) + '">' + esc(w.direction) + '</span>' +
           '<span>' + time(w.at) + '</span></div><pre>' + esc(w.text) + '</pre></li>').join('') + '</ul>'
       : '<div class="empty">No traffic on the wire yet.</div>';
+    keepScroll(el, id);
     return;
   }
 
@@ -411,6 +475,7 @@ async function renderPanel(id) {
   el.querySelectorAll('[data-q-remove]').forEach(b => {
     b.onclick = () => removeQueued(id, b.dataset.qRemove, b.dataset.qBarcode);
   });
+  keepScroll(el, id);
 }
 
 async function retry(id, msgId) {

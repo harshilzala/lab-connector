@@ -103,6 +103,16 @@ const AnalyzerSchema = z.object({
   /** Sent as the `eqCode` query parameter — this is what identifies the machine
    *  now that there is no id/secret pair. */
   equipmentCode: z.string(),
+  /** Other eqCodes HMIS raises this SAME physical machine's orders under.
+   *
+   *  The gateway maps each test to an equipment code, and a machine that was
+   *  re-registered keeps its old code on the tests nobody re-mapped: the Shela
+   *  VITROS ECiQ receives PSA under ZYCAPIFC01 and TSH/FT3/FT4 under the
+   *  retired middleware's ZHFC01. Orders and result-time lookups are made
+   *  against every code listed here as well as `equipmentCode`, and the rows
+   *  are merged, so one tube's tests are found whichever code they sit under.
+   *  Uniqueness still holds: a code may belong to exactly one analyzer. */
+  extraEquipmentCodes: z.array(z.string()).default([]),
   /** Numeric HMIS equipment id. Optional: used as a fallback in the acknowledge
    *  body and the results upload when a pending row does not carry one. */
   equipmentId: z.union([z.string(), z.number()]).optional(),
@@ -123,6 +133,32 @@ const AnalyzerSchema = z.object({
   transport: TransportSchema,
   sendDemographics: z.boolean().default(false),
   hostQuery: z.boolean().default(true),
+  /** Proactive order download — what makes the interface real-time.
+   *
+   *  Without it an order only reaches the analyzer when the analyzer asks
+   *  (host query), and only analyzers that ask get one. With it the connector
+   *  polls the pending endpoint for this machine's codes, remembers every row
+   *  in the order store, and pushes each sample's tests to the instrument as
+   *  soon as they appear in HMIS — the way the retired middleware's Orders
+   *  service did, minus the acknowledge-at-download that hid orders from
+   *  everything else.
+   *
+   *  Rows are NEVER acknowledged here; that still happens after the result is
+   *  filed. Re-polling therefore sees the same rows again, and the order store
+   *  is what stops them being downloaded twice. */
+  orderPoll: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Poll period. The gateway is cheap to ask; 30–60s is real-time enough. */
+      intervalMs: z.number().int().min(5000).default(60000),
+      /** Days before today to ask about as well — an order raised late
+       *  yesterday for a tube run this morning. 0 = today only. */
+      lookbackDays: z.number().int().min(0).max(7).default(1),
+      /** Push new tests to the analyzer. Off for a results-only link (HL7
+       *  H360): the rows are still stored so results can be filed. */
+      download: z.boolean().default(true),
+    })
+    .default({}),
   qc: z
     .object({
       sampleIdPrefixes: z.array(z.string()).default([]),
@@ -327,13 +363,21 @@ export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.
     throw new Error(`Invalid config:\n${issues}`);
   }
   // Two analyzers sharing an equipmentCode would acknowledge each other's rows.
-  const seen = new Set<string>();
+  // Extra codes count too: an extra on one analyzer that is another's primary
+  // (or extra) would have both machines downloading the same order.
+  const seen = new Map<string, string>();
   for (const a of parsed.data.analyzers) {
-    const code = a.equipmentCode.trim().toUpperCase();
-    if (seen.has(code)) {
-      throw new Error(`Two analyzers share equipmentCode "${a.equipmentCode}" — eqCode must identify exactly one machine.`);
+    for (const raw of [a.equipmentCode, ...a.extraEquipmentCodes]) {
+      const code = raw.trim().toUpperCase();
+      const owner = seen.get(code);
+      if (owner && owner !== a.id) {
+        throw new Error(`Analyzers "${owner}" and "${a.id}" both claim equipment code "${raw}" — a code must identify exactly one machine.`);
+      }
+      if (owner === a.id) {
+        throw new Error(`Analyzer "${a.id}" lists equipment code "${raw}" twice.`);
+      }
+      seen.set(code, a.id);
     }
-    seen.add(code);
   }
   return parsed.data;
 }

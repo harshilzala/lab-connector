@@ -38,10 +38,23 @@ export function isQcSample(sampleId: string, cfg: AnalyzerConfig['qc']): boolean
 }
 
 /** Group a parsed message's results into one upload per sample barcode. */
+/**
+ * The placeholder the VITROS family reports when an assay produced no value —
+ * "No Result" on the ECi/ECiQ, "NO RESULT" on the 250 — is not a result. Filing
+ * it would put text where a number belongs, and worse, acknowledge the order
+ * row, so the rerun that follows would have nothing to be filed against. It is
+ * dropped at intake; the rerun files. Callers log the drop.
+ */
+export function isVoidResult(value: string | null | undefined): boolean {
+  const v = (value ?? '').trim().toUpperCase();
+  return v === '' || v === 'NO RESULT' || v === 'NORESULT';
+}
+
 export function toResultUploads(analyzer: AnalyzerConfig, msg: ParsedMessage): HmisResultUpload[] {
   const bySample = new Map<string, ParsedMessage['results']>();
   for (const r of msg.results) {
     if (!r.sampleId) continue;
+    if (isVoidResult(r.value)) continue;
     const arr = bySample.get(r.sampleId) ?? [];
     arr.push(r);
     bySample.set(r.sampleId, arr);
@@ -113,7 +126,7 @@ export function toLisResultRows(
    * than after the instrument. Matching is case-insensitive.
    */
   aliases: Record<string, string> = {},
-): { rows: LisInboundResultRow[]; unmatched: string[]; matched: MirthAcknowledgeItem[] } {
+): { rows: LisInboundResultRow[]; unmatched: string[]; matched: MirthAcknowledgeItem[]; voided: string[] } {
   // Analyzers are inconsistent about case and padding on assay codes; the
   // pending row is authoritative for the spelling actually sent on the wire.
   const key = (id: string) => canonicalCode((id || '').trim()).trim().toUpperCase();
@@ -136,8 +149,15 @@ export function toLisResultRows(
   // body must echo once the upload has actually succeeded.
   const matched: MirthAcknowledgeItem[] = [];
   const seen = new Set<MirthAcknowledgeItem>();
+  // Placeholders that slipped into the spool before intake filtered them — an
+  // item parked under the old code. Neither filed nor counted as unmatched.
+  const voided: string[] = [];
 
   for (const r of upload.results) {
+    if (isVoidResult(r.value)) {
+      voided.push(r.testCode);
+      continue;
+    }
     const own = key(r.testCode);
     // Try the analyzer's own code first: an alias must never shadow a code that
     // already matches a pending row.
@@ -171,5 +191,5 @@ export function toLisResultRows(
     });
   }
 
-  return { rows, unmatched, matched };
+  return { rows, unmatched, matched, voided };
 }

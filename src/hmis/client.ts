@@ -183,12 +183,19 @@ export class HmisClient {
    * silently-ignored (mis-keyed or unmatched) row looks like, and swallowing it
    * would drop a patient result on the floor while reporting it as filed.
    */
-  async postResults(rows: LisInboundResultRow[]): Promise<HmisResultUploadResponse> {
+  async postResults(rows: LisInboundResultRow[], eqCode?: string): Promise<HmisResultUploadResponse> {
     if (rows.length === 0) return { status: 'success', message: 'nothing to send', successData: [], filed: 0 };
 
     const path = this.opts.resultsPath;
     const startedAt = Date.now();
     const sampleId = [...new Set(rows.map((r) => r.sampleId))];
+    // One flat line per value, so a transfer can be traced by grepping any of
+    // the four things an operator actually has to hand — the barcode, the
+    // analyzer's assay identifier, the value, or the labResultId. The same data
+    // is in `request`, but only as nested JSON: this is the readable index into
+    // it, and it is what makes "which value went to which row" answerable
+    // without a parser.
+    const filed = rows.map((r) => `${r.sampleId} ${r.identifier} = ${r.resultValue} -> labResultId ${r.labResultId}`);
     let httpStatus: number | null = null;
     let response: unknown = null;
     try {
@@ -221,6 +228,8 @@ export class HmisClient {
         response,
         outcome: 'filed',
         rows: successData.length,
+        eqCode,
+        filed,
       });
       return { status: 'success', message, successData, filed: successData.length };
     } catch (err) {
@@ -240,6 +249,10 @@ export class HmisClient {
         outcome: httpStatus === 200 ? 'none-matched' : 'error',
         rows: 0,
         error: message,
+        eqCode,
+        // Logged on the failure path too: a none-matched upload is exactly when
+        // you need to see which identifier the gateway refused to place.
+        filed,
       });
       throw err;
     }
@@ -251,6 +264,7 @@ export class HmisClient {
     kind: HmisAuditKind;
     sampleId: string | string[] | null;
     eqCode?: string | null;
+    filed?: string[];
     method: 'GET' | 'POST';
     path: string;
     startedAt: number;

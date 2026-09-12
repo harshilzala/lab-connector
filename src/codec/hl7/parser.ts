@@ -187,6 +187,86 @@ export function hl7ToParsedMessage(msg: Hl7Message, opts: Hl7ParseOptions = {}):
   };
 }
 
+// ---- host query (bidirectional worklist) -----------------------------------
+//
+// When the H360 is switched to bidirectional/host-query mode it stops just
+// broadcasting results and instead ASKS the LIS for a worklist as each tube is
+// loaded. That request is a query message — classically `QRY^Q02` carrying a
+// `QRD` segment whose "Who Subject Filter" (QRD-8) is the scanned barcode.
+//
+// We have no captured sample of THIS analyzer's query (it has only ever run
+// unidirectional here), so recognition is deliberately broad: any message whose
+// trigger is a known query event, or that carries a query segment, counts. The
+// barcode is pulled from the first plausible query field. The raw message is
+// logged verbatim by the link so the exact shape can be confirmed the first
+// time a real query arrives.
+
+/** Query trigger events we answer (HL7 v2 query family). */
+const QUERY_TRIGGERS = new Set(['Q02', 'Q05', 'Q11', 'Q21', 'Q22', 'R02', 'R04', 'Q03']);
+/** Segment names that only appear in a query message. */
+const QUERY_SEGMENTS = new Set(['QRD', 'QPD', 'SPR', 'QRF']);
+
+/** Is this inbound message a host query rather than a result upload? */
+export function isQueryMessage(msg: Hl7Message): boolean {
+  const type = msg.messageType.split(msg.encoding.component)[0]?.toUpperCase() ?? '';
+  if (type === 'QRY' || type === 'QBP' || type === 'QCK' || type === 'SPQ' || type === 'VQQ') return true;
+  if (QUERY_TRIGGERS.has(msg.triggerEvent.toUpperCase())) return true;
+  return msg.segments.some((s) => QUERY_SEGMENTS.has(s.name.toUpperCase()));
+}
+
+/**
+ * Pull the sample barcode out of a query. Different query flavours carry it in
+ * different places, so try each in turn: QRD-8 (QRY^Q02 who-subject-filter),
+ * QPD-3 (QBP^Q11 demographics/query parameter), then any OBR/SPM specimen id.
+ * Returns '' when nothing barcode-shaped is present.
+ */
+export function hl7QueryBarcode(msg: Hl7Message): string {
+  const enc = msg.encoding;
+  const seg = (name: string) => msg.segments.find((s) => s.name.toUpperCase() === name);
+
+  const qrd = seg('QRD');
+  if (qrd) {
+    const who = component(fieldOf(qrd, 8), 1, enc) || fieldOf(qrd, 8);
+    if (who) return who;
+  }
+  const qpd = seg('QPD');
+  if (qpd) {
+    const who = component(fieldOf(qpd, 3), 1, enc) || fieldOf(qpd, 3);
+    if (who) return who;
+  }
+  // Some analyzers phrase the query as an OBR/SPM with no OBX. Reuse the same
+  // specimen-id positions the result parser trusts.
+  const obr = seg('OBR');
+  if (obr) {
+    const id = component(fieldOf(obr, 3), 1, enc) || component(fieldOf(obr, 2), 1, enc);
+    if (id) return id;
+  }
+  const spm = seg('SPM');
+  if (spm) {
+    const id = component(fieldOf(spm, 2), 1, enc);
+    if (id) return id;
+  }
+  return '';
+}
+
+/**
+ * Turn a parsed query into the connector's neutral ParsedMessage — results
+ * empty, one HostQuery carrying the barcode. Returns null when no barcode could
+ * be read (an empty/keep-alive query we cannot act on).
+ */
+export function hl7ToQueryMessage(msg: Hl7Message): ParsedMessage | null {
+  const sampleId = hl7QueryBarcode(msg);
+  if (!sampleId) return null;
+  return {
+    protocol: 'hl7',
+    sender: msg.sendingApp || null,
+    patient: null,
+    queries: [{ sampleId, testCodes: [] }],
+    results: [],
+    raw: msg.raw,
+  };
+}
+
 // ---- field helpers ---------------------------------------------------------
 export function fieldOf(seg: Hl7Segment, n: number): string {
   return (seg.fields[n] ?? '').trim();

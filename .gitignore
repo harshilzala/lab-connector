@@ -29,3 +29,6 @@ captures/
 
 # throwaway scratch files (scripts, staged samples) — never committed
 .scratch/
+
+# Set by LAB-Interface-stop.bat; tells the watchdog the stop was deliberate.
+.lab-interface-maintenance

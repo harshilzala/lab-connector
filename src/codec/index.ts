@@ -37,6 +37,7 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
         valueTypes: analyzer.hl7.valueTypes,
         encoding: analyzer.hl7.encoding,
         idleFlushMs: analyzer.hl7.idleFlushMs,
+        hostQuery: analyzer.hostQuery,
         logger: logger.child({ codec: 'hl7' }),
       });
     case 'kermit':

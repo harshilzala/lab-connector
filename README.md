@@ -95,9 +95,25 @@ Edit `config.json`:
   `/mirth/pending`, `/mirth/acknowledge`, `/mirth/results`.
 - One entry per analyzer under `analyzers[]`:
   - `equipmentCode` — **required**; sent as `eqCode` to identify the machine.
+  - `extraEquipmentCodes` — other `eqCode`s HMIS raises this *same* machine's
+    orders under (a re-registered analyzer keeps its old code on the tests
+    nobody re-mapped). Polled and merged with `equipmentCode`; a code may
+    belong to one analyzer only.
   - `equipmentId` — optional numeric HMIS id, used as a fallback in the
     acknowledge body and the results upload when a pending row omits it.
   - `siteId` / `showCulture` — optional pass-through query parameters.
+  - `orderPoll` — proactive order download, the real-time half of the
+    interface. `{ enabled, intervalMs (default 60000), lookbackDays (default 1),
+    download (default true) }`. Every tick asks the pending endpoint for each
+    of the machine's codes × each day in the window, folds the rows into the
+    **order store** (`spool/<id>/orders/`, one JSON per barcode), and pushes to
+    the analyzer only the tests it has not been given. Rows are *not*
+    acknowledged at download — that still happens after the result is filed —
+    so the store is what stops a sample being programmed twice. `download:
+    false` keeps the row cache for a results-only link (HL7 H360).
+    The store also answers result-time lookups, which is what makes a result
+    filable after its row was acknowledged (rerun, correction, restart) — HMIS
+    never returns an acknowledged row again.
   - `sendDate` — send today's date (`dd-MM-yyyy`) as the `date` parameter.
     Default **false**, so an order raised yesterday for a tube run today is
     still found.
@@ -115,6 +131,12 @@ npm run build      # compile to dist/
 npm start          # run compiled
 
 npm run simulator  # offline self-test of the ASTM codec (no hardware/HMIS)
+npm run orders     # order-store / poll bookkeeping self-test
+
+# One-off, when taking over from the retired middleware: seed the order store
+# with the rows its Orders service pulled (and acknowledged) so results for
+# those tubes can still be filed. Reads E:\API_Integration\Services\Orders.
+npm run import:old-orders -- --days 7
 ```
 
 Open the local dashboard at **http://127.0.0.1:7070** (`admin.host` / `admin.port`)
