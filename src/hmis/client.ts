@@ -46,6 +46,13 @@ export interface PendingQuery {
 }
 
 export class HmisClient {
+  /** The site-wide `siteId` (config `hmis.siteId`) a pending call falls back
+   *  to when the analyzer has none of its own — so callers can log the site
+   *  they will actually query with. */
+  get defaultSiteId(): string | undefined {
+    return this.opts.siteId;
+  }
+
   constructor(private readonly opts: HmisClientOptions) {
     if (!opts.tlsRejectUnauthorized) {
       // Blunt but effective for a self-signed cert on a hospital LAN. Scope it

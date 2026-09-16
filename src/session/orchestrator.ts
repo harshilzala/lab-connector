@@ -389,8 +389,16 @@ export class AnalyzerRuntime {
         void this.pollOrders();
         this.pollTimer = setInterval(() => void this.pollOrders(), intervalMs);
       }, FIRST_POLL_DELAY_MS);
+      // Log the site the pending call will really carry: the analyzer's own
+      // siteId if set, else the site-wide hmis.siteId.
       this.log.info(
-        { codes: this.equipmentCodes(), siteId: this.cfg.siteId ?? null, intervalMs, lookbackDays, download },
+        {
+          codes: this.equipmentCodes(),
+          siteId: this.cfg.siteId ?? this.hmis.defaultSiteId ?? null,
+          intervalMs,
+          lookbackDays,
+          download,
+        },
         'order polling enabled',
       );
     }
