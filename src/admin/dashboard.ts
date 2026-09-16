@@ -78,6 +78,7 @@ main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40
 .kv:first-of-type { border-top:0; }
 .kv .k { color:var(--mut); }
 .kv .v { color:var(--ink); font-weight:600; }
+.kv .v.err { color:var(--bad); font-weight:600; font-size:12px; text-align:right; word-break:break-word; }
 .card-body { padding:14px 18px 18px; }
 
 /* ---- maximize: one machine fills the view, the rest step aside ---- */
@@ -108,6 +109,7 @@ main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40
 .panel-tools { display:flex; align-items:center; gap:8px; margin:0 0 8px; }
 .panel-tools .note { flex:1; min-width:0; font-size:12px; color:var(--mut); }
 .btn.btn-danger { color:var(--bad); }
+.btn.btn-force { color:var(--warn, #b45309); font-weight:600; }
 .btn.btn-danger:hover { background:rgba(199,58,58,.08); }
 .btn[disabled] { opacity:.45; cursor:not-allowed; }
 
@@ -129,6 +131,27 @@ main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40
 .q .barcode { font:700 13px/1.3 "Cascadia Mono",Consolas,monospace; color:var(--ink); }
 .q .err { font-size:11.5px; color:var(--bad); margin-top:3px; word-break:break-word; }
 .q .grow { flex:1; min-width:0; }
+
+/* ---- per-sample parameter list (staged analyzers) ---- */
+.params { margin-top:6px; }
+.params summary { cursor:pointer; font-size:11.5px; color:var(--mut); user-select:none; }
+.params-t { border-collapse:collapse; margin-top:4px; font-size:12px; }
+.params-t td { padding:2px 10px 2px 0; white-space:nowrap; vertical-align:baseline; }
+.params-t .p-code { font:700 12px/1.3 "Cascadia Mono",Consolas,monospace; color:var(--ink); }
+.params-t .p-val { font-family:"Cascadia Mono",Consolas,monospace; color:var(--ink); text-align:right; }
+.params-t .p-unit { color:var(--mut); font-size:11px; }
+.params-t .p-flag { color:var(--warn); font-weight:700; }
+.params-t .p-state { color:var(--mut); font-size:11px; }
+.params-t tr.p-filed .p-state { color:var(--ok); }
+.params-t tr.p-void .p-state { color:var(--bad); }
+.params-t tr.o-sync .p-state { color:var(--ok); }
+.params-t tr.o-nosync .p-state { color:var(--warn); }
+.params-t tr.o-nosync .p-code { color:var(--mut); font-weight:400; }
+.params-t .p-id { color:var(--mut); font-size:11px; }
+.plist summary { cursor:pointer; user-select:none; }
+.plist-body { margin-top:4px; font:12px/1.8 "Cascadia Mono",Consolas,monospace; color:var(--ink); white-space:normal; }
+.plist-body .sep { color:var(--mut); padding:0 5px; }
+.plist-body .p-as { color:var(--mut); font-size:11px; }
 
 /* ---- change-password dialog ---- */
 .backdrop { position:fixed; inset:0; background:rgba(54,50,50,.45); display:none; align-items:center; justify-content:center; padding:20px; z-index:50; }
@@ -282,10 +305,16 @@ async function j(url, opts) {
   return r.json();
 }
 
+// Three states, because two of the site's machines behave differently: the
+// BC-5150 keeps a socket open (the connector dials it), so no socket means it
+// is unreachable; the GH900 dials the connector only when it has a result and
+// hangs up afterwards, so no socket is the NORMAL state between samples and
+// the honest word is "Listening", not "Offline".
 function statusPill(a) {
-  return a.connected
-    ? '<span class="pill ok">Connected</span>'
-    : '<span class="pill bad">Offline</span>';
+  const link = a.link || (a.connected ? 'connected' : 'offline');
+  if (link === 'connected') return '<span class="pill ok">Connected</span>';
+  if (link === 'listening') return '<span class="pill mut" title="Port open — the instrument connects when it has a result to send">Listening</span>';
+  return '<span class="pill bad"' + (a.linkError ? ' title="' + esc(a.linkError) + '"' : '') + '>Offline</span>';
 }
 function queuePill(a) {
   const sp = a.spool || { pending: 0, failed: 0 };
@@ -310,8 +339,24 @@ function ordersLine(o) {
   return esc(stored) + ' · polled ' + time(o.lastPollAt);
 }
 
+// The parameters this machine is scoped to send, from its config: the
+// allow-list (with the HMIS name each is filed as, where that differs), the
+// HMIS rows it must never touch, and the instrument channels it ignores.
+function paramsLine(i) {
+  if (!i) return '—';
+  const n = i.syncCodes.length;
+  const alias = i.aliases || {};
+  const codes = i.syncCodes.map(c => alias[c] ? esc(c) + '<span class="p-as">&rarr;' + esc(alias[c]) + '</span>' : esc(c));
+  const head = n ? n + ' sync' : 'all sent (no allow-list)';
+  const more = (i.excluded && i.excluded.length ? ' · never into ' + esc(i.excluded.join(', ')) : '') +
+    (i.ignored && i.ignored.length ? ' · ' + i.ignored.length + ' channel' + (i.ignored.length === 1 ? '' : 's') + ' ignored' : '');
+  return n
+    ? '<details class="plist"><summary>' + head + more + '</summary><div class="plist-body">' + codes.join('<span class="sep">·</span>') + '</div></details>'
+    : head + more;
+}
+
 function renderStats(analyzers) {
-  const online  = analyzers.filter(a => a.connected).length;
+  const online  = analyzers.filter(a => a.connected || a.link === 'listening').length;
   const pending = analyzers.reduce((n, a) => n + a.spool.pending, 0);
   const failed  = analyzers.reduce((n, a) => n + a.spool.failed, 0);
   const last    = analyzers.map(a => a.lastMessageAt).filter(Boolean).sort().pop() || null;
@@ -373,13 +418,17 @@ function renderCards(analyzers) {
       </div>
       <div class="card-body">
         <div class="kv"><span class="k">Last message</span><span class="v">\${time(a.lastMessageAt)}</span></div>
+        \${a.link === 'offline' && a.linkError ? '<div class="kv"><span class="k">Link</span><span class="v err">' + esc(a.linkError) + '</span></div>' : ''}
         <div class="kv"><span class="k">\${a.filing === 'staged' ? 'Results' : 'Upload queue'}</span><span class="v">\${queuePill(a)}</span></div>
         <div class="kv"><span class="k">Orders</span><span class="v">\${ordersLine(a.orders)}</span></div>
+        <div class="kv"><span class="k">Parameters</span><span class="v">\${paramsLine(a.interface)}</span></div>
         <div class="tabs">
           <button type="button" data-a="\${esc(a.id)}" data-t="wire"
                   class="\${state.open === a.id && state.tab === 'wire' ? 'active' : ''}">Wire log</button>
           <button type="button" data-a="\${esc(a.id)}" data-t="spool"
                   class="\${state.open === a.id && state.tab === 'spool' ? 'active' : ''}">\${a.filing === 'staged' ? 'Results' : 'Upload queue'}</button>
+          <button type="button" data-a="\${esc(a.id)}" data-t="orders"
+                  class="\${state.open === a.id && state.tab === 'orders' ? 'active' : ''}">Orders</button>
         </div>
         <div id="tools-\${esc(a.id)}"></div>
         <div class="panel" id="panel-\${esc(a.id)}">
@@ -461,6 +510,7 @@ async function renderPanel(id) {
   }
 
   if (tools) tools.innerHTML = '';
+  if (state.tab === 'orders') return renderOrders(id, el);
   const an = (state.analyzers || []).find(a => a.id === id);
   if (an && an.filing === 'staged') return renderStaged(id, el);
   const s = await j('/api/analyzers/' + encodeURIComponent(id) + '/spool');
@@ -505,10 +555,38 @@ async function renderPanel(id) {
   keepScroll(el, id);
 }
 
+// The order store: one row per barcode HMIS has raised work for, each of its
+// parameter rows marked SYNC (this analyzer files into it — directly or via an
+// alias) or NO SYNC (an HMIS row the interface is not scoped to: a smear-review
+// line, a parameter registered under a name no instrument code maps to). The
+// no-sync rows are the ones the lab must expect to complete by hand.
+async function renderOrders(id, el) {
+  const { orders } = await j('/api/analyzers/' + encodeURIComponent(id) + '/orders');
+  const rows = (orders || []).map(o => {
+    const pill = o.noSyncCount === 0
+      ? '<span class="pill ok">' + o.syncCount + ' sync</span>'
+      : '<span class="pill mut">' + o.syncCount + ' sync</span> <span class="pill warn">' + o.noSyncCount + ' no sync</span>';
+    const list = '<details class="params"><summary>' + o.rows.length + ' HMIS row' + (o.rows.length === 1 ? '' : 's') + '</summary>' +
+      '<table class="params-t"><tbody>' +
+      o.rows.map(r =>
+        '<tr class="' + (r.sync ? 'o-sync' : 'o-nosync') + '"><td class="p-code">' + esc(r.identifier) + '</td>' +
+        '<td class="p-state">' + (r.sync ? 'sync' : 'no sync') + (r.downloaded ? ' · sent to analyzer' : '') + '</td>' +
+        '<td class="p-id">' + (r.parameterId != null ? 'param ' + esc(String(r.parameterId)) : '') + '</td></tr>'
+      ).join('') + '</tbody></table></details>';
+    const when = 'seen ' + time(o.firstSeenAt) + ' · updated ' + time(o.updatedAt) + ' · ' + esc(o.source);
+    return '<li><div class="grow"><div class="barcode">' + esc(o.sampleId || o.barcode) + '</div>' +
+      '<div class="err">' + esc(when) + '</div>' + list + '</div>' + pill + '</li>';
+  }).join('');
+  el.innerHTML = rows
+    ? '<ul class="q">' + rows + '</ul>'
+    : '<div class="empty">No orders in the store &mdash; nothing pending in the HMIS for this machine (or polling is off).</div>';
+  keepScroll(el, id);
+}
+
 // Staged analyzers (filing.mode "staged"): one row per sample, showing how
 // much of it has reached HMIS and what is still waiting for an order row.
 async function renderStaged(id, el) {
-  const { samples } = await j('/api/analyzers/' + encodeURIComponent(id) + '/staged');
+  const { samples, force } = await j('/api/analyzers/' + encodeURIComponent(id) + '/staged');
   const rows = (samples || []).map(s => {
     const pill = s.complete
       ? '<span class="pill ok">filed</span>'
@@ -526,14 +604,37 @@ async function renderStaged(id, el) {
     const actions = s.complete ? '' :
       '<button class="btn btn-ghost btn-sm" type="button" data-s-file="' + esc(s.barcode) + '">File now</button>' +
       '<button class="btn btn-ghost btn-sm" type="button" data-s-rekey="' + esc(s.barcode) + '">Re-key</button>';
+    // "Force" — only once HMIS has taken at least one value (filed or partly
+    // filed): re-push the whole sample straight to the results endpoint,
+    // pending rows unchecked. Password-gated (config Force_Hmis); offered only
+    // when that password is set.
+    const forceBtn = (force && s.filed > 0)
+      ? '<button class="btn btn-ghost btn-sm btn-force" type="button" data-s-force="' + esc(s.barcode) + '" title="Push every value to HMIS now, without checking the pending rows. Password required.">Force</button>'
+      : '';
+    // The interfaced parameters, as the analyzer sent them: code, value, unit,
+    // flag, and whether HMIS has taken each one. Only what the interface is
+    // scoped to (allowTestCodes) is held for the sample, so this IS the list
+    // the lab expects to see on the report.
+    const vals = (s.values || []);
+    const params = vals.length
+      ? '<details class="params"' + (s.complete ? '' : ' open') + '><summary>' + vals.length + ' parameter' + (vals.length === 1 ? '' : 's') + '</summary>' +
+        '<table class="params-t"><tbody>' +
+        vals.map(v =>
+          '<tr class="p-' + v.state + '"><td class="p-code">' + esc(v.testCode) + '</td>' +
+          '<td class="p-val">' + esc(v.value) + (v.unit ? ' <span class="p-unit">' + esc(v.unit) + '</span>' : '') + '</td>' +
+          '<td class="p-flag">' + esc(v.abnormalFlag || '') + '</td>' +
+          '<td class="p-state">' + (v.state === 'filed' ? 'filed' + (v.identifier && v.identifier !== v.testCode ? ' as ' + esc(v.identifier) : '') : v.state === 'void' ? 'no value' : 'waiting') + '</td></tr>'
+        ).join('') + '</tbody></table></details>'
+      : '';
     return '<li><div class="grow"><div class="barcode">' + esc(s.barcode) + '</div>' +
-      '<div class="err">' + detail + '</div><div class="err">' + esc(when) + '</div>' + from + err + '</div>' +
-      pill + actions +
+      '<div class="err">' + detail + '</div><div class="err">' + esc(when) + '</div>' + from + err + params + '</div>' +
+      pill + actions + forceBtn +
       '<button class="btn btn-ghost btn-sm btn-danger" type="button" data-s-remove="' + esc(s.barcode) + '">Remove</button></li>';
   }).join('');
   el.innerHTML = rows
     ? '<ul class="q">' + rows + '</ul>'
     : '<div class="empty">No staged results &mdash; everything received has reached the HMIS.</div>';
+  el.querySelectorAll('[data-s-force]').forEach(b => { b.onclick = () => stagedForce(id, b.dataset.sForce); });
   el.querySelectorAll('[data-s-file]').forEach(b => { b.onclick = () => stagedFile(id, b.dataset.sFile); });
   el.querySelectorAll('[data-s-rekey]').forEach(b => { b.onclick = () => stagedRekey(id, b.dataset.sRekey); });
   el.querySelectorAll('[data-s-remove]').forEach(b => { b.onclick = () => stagedRemove(id, b.dataset.sRemove); });
@@ -542,6 +643,26 @@ async function renderStaged(id, el) {
 
 async function stagedFile(id, barcode) {
   await j('/api/analyzers/' + encodeURIComponent(id) + '/staged/' + encodeURIComponent(barcode) + '/file', { method: 'POST' });
+  renderPanel(id);
+}
+
+// Force: every value of the sample goes to the HMIS results endpoint now —
+// filed ones again, waiting ones mapped from the cached order rows and the
+// parameter catalogue — without asking HMIS for its pending rows first.
+async function stagedForce(id, barcode) {
+  const password = prompt('FORCE push ' + barcode + ' to HMIS?\\n\\nEvery value is sent again, and the pending rows are NOT checked.\\nEnter the Force password to continue.');
+  if (password === null || !password) return;
+  const r = await j('/api/analyzers/' + encodeURIComponent(id) + '/staged/' + encodeURIComponent(barcode) + '/force',
+    { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }) });
+  if (!r || r.error) { alert('Force failed: ' + (r && r.error ? r.error : 'no answer')); return; }
+  const lines = [
+    barcode + ': ' + r.accepted + ' of ' + r.sent + ' accepted by HMIS (' + r.values + ' values held)',
+    r.message ? 'HMIS: ' + r.message : '',
+    (r.rows || []).map(x => '  ' + x.testCode + ' → ' + x.identifier + ' (' + (x.parameterId == null ? '?' : x.parameterId) + ') = ' + x.value).join('\\n'),
+    (r.unresolved && r.unresolved.length) ? 'NOT sent — no HMIS parameter known for: ' + r.unresolved.join(', ') : '',
+  ].filter(Boolean);
+  alert(lines.join('\\n'));
+  refresh();
   renderPanel(id);
 }
 

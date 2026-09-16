@@ -1,7 +1,7 @@
 import http from 'node:http';
 import os from 'node:os';
 import type { Logger } from '../logger.js';
-import type { AnalyzerStatus, WireLogEntry } from '../session/orchestrator.js';
+import type { AnalyzerStatus, ForceReport, WireLogEntry } from '../session/orchestrator.js';
 import type { SpoolEnvelope } from '../queue/spool.js';
 import type { HmisResultUpload } from '../types.js';
 import { renderDashboard } from './dashboard.js';
@@ -29,12 +29,20 @@ export interface AdminBackend {
   remove(id: string, msgId: string): boolean;
   /** filing.mode "staged" analyzers — null for a queued one. */
   staged(id: string): StagedSummary[] | null;
+  /** The order store, each HMIS row marked sync / no-sync. */
+  ordersView(id: string): OrderView[] | null;
   fileNow(id: string, barcode: string): Promise<boolean>;
   /** Returns the barcode the sample now sits under, or null. */
   rekey(id: string, from: string, to: string): string | null;
   removeStaged(id: string, barcode: string): boolean;
+  /** The console's "Force" push (config Force_Hmis) — offered only when a
+   *  password is set, and only run when it matches. */
+  forceEnabled(): boolean;
+  forcePasswordOk(given: string): boolean;
+  force(id: string, barcode: string): Promise<ForceReport | null>;
 }
 import type { StagedSummary } from '../results/store.js';
+import type { OrderView } from '../session/orchestrator.js';
 
 /** Plenty for a login form; anything larger is not a request we serve. */
 const MAX_BODY_BYTES = 16 * 1024;
@@ -185,11 +193,54 @@ export class AdminServer {
         return this.json(res, ok ? { ok } : { error: 'unknown queue item' }, ok ? 200 : 404);
       }
 
+      // ---- order store, annotated for the console ----
+      const ordersList = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/orders$/);
+      if (method === 'GET' && ordersList) {
+        const o = this.backend.ordersView(ordersList[1]!);
+        return o ? this.json(res, { orders: o }) : this.json(res, { error: 'unknown analyzer' }, 404);
+      }
+
       // ---- staged result store (filing.mode "staged") ----
       const stagedList = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/staged$/);
       if (method === 'GET' && stagedList) {
         const s = this.backend.staged(stagedList[1]!);
-        return s ? this.json(res, { samples: s }) : this.json(res, { error: 'not a staged analyzer' }, 404);
+        return s
+          ? this.json(res, { samples: s, force: this.backend.forceEnabled() })
+          : this.json(res, { error: 'not a staged analyzer' }, 404);
+      }
+
+      // "Force": push a sample straight to the HMIS results endpoint, pending
+      // rows unchecked. Password-gated (config Force_Hmis) and logged on every
+      // attempt, because it writes patient results past the normal proof that
+      // HMIS asked for them.
+      const stagedForce = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/staged\/([^/]+)\/force$/);
+      if (method === 'POST' && stagedForce) {
+        if (!this.sameOrigin(req)) return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        const id = stagedForce[1]!;
+        const barcode = decodeURIComponent(stagedForce[2]!);
+        if (!this.backend.forceEnabled()) {
+          return this.json(res, { error: 'Force is not enabled — set Force_Hmis.password in config.json' }, 404);
+        }
+        let password = '';
+        try {
+          const body = JSON.parse((await readBody(req)) || '{}') as { password?: unknown };
+          password = String(body.password ?? '');
+        } catch {
+          /* not JSON — treated as no password */
+        }
+        if (!this.backend.forcePasswordOk(password)) {
+          this.logger.warn({ analyzer: id, barcode }, 'FORCE push refused — wrong password');
+          return this.json(res, { error: 'wrong password' }, 403);
+        }
+        this.logger.warn({ analyzer: id, barcode }, 'FORCE push requested from the admin console');
+        try {
+          const report = await this.backend.force(id, barcode);
+          return report ? this.json(res, report) : this.json(res, { error: 'unknown sample' }, 404);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.logger.error({ analyzer: id, barcode, err: message }, 'FORCE push failed');
+          return this.json(res, { error: message }, 502);
+        }
       }
 
       const stagedAction = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/staged\/([^/]+)\/(file|rekey)$/);

@@ -28,6 +28,15 @@ export class TcpTransport extends EventEmitter implements Transport {
     return !!this.socket && !this.socket.destroyed;
   }
 
+  get listening(): boolean {
+    return this.opts.mode === 'server' && !!this.server && this.server.listening;
+  }
+
+  private dialError: string | null = null;
+  get lastDialError(): string | null {
+    return this.dialError;
+  }
+
   get describe(): string {
     return `tcp://${this.opts.host}:${this.opts.port} (${this.opts.mode})`;
   }
@@ -56,8 +65,18 @@ export class TcpTransport extends EventEmitter implements Transport {
   private listen(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const server = net.createServer((socket) => this.adoptSocket(socket));
-      server.on('error', (err) => {
-        this.opts.logger.error({ err }, 'TCP server error');
+      server.on('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE') {
+          // Almost always a second copy of the connector: the PM2 service is
+          // already up and someone ran "npm run dev" beside it (2026-09-16).
+          this.opts.logger.error(
+            { endpoint: this.describe },
+            'port already in use — another Lab-Interface is probably running (PM2 service or a second "npm run dev"). ' +
+              'Only one instance can run: stop the other one first (Lab-Interface-stop.bat for the PM2 service).',
+          );
+        } else {
+          this.opts.logger.error({ err }, 'TCP server error');
+        }
         this.emit('error', err);
         reject(err);
       });
@@ -72,10 +91,12 @@ export class TcpTransport extends EventEmitter implements Transport {
   private async dial(): Promise<void> {
     const socket = net.connect({ host: this.opts.host, port: this.opts.port });
     socket.on('connect', () => {
+      this.dialError = null;
       this.opts.logger.info({ endpoint: this.describe }, 'TCP client connected');
       this.adoptSocket(socket);
     });
     socket.on('error', (err) => {
+      this.dialError = err.message;
       this.opts.logger.warn({ err: err.message }, 'TCP client connection error');
       // Not 'error': a refused dial is routine while an analyzer is off, and the
       // protocol links treat 'error' as a link fault. Anyone who needs to know

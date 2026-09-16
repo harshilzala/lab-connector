@@ -79,6 +79,7 @@ async function main(): Promise<void> {
   const uploads = toResultUploads(analyzer, msg);
   const hmis = new HmisClient({
     baseUrl: cfg.hmis.baseUrl,
+    siteId: cfg.hmis.siteId,
     pendingPath: cfg.hmis.pendingPath,
     acknowledgePath: cfg.hmis.acknowledgePath,
     resultsPath: cfg.hmis.resultsPath,

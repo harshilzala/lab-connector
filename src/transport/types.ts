@@ -13,6 +13,13 @@ import type { EventEmitter } from 'node:events';
 export interface Transport extends EventEmitter {
   readonly kind: 'tcp' | 'serial';
   readonly connected: boolean;
+  /** TCP server mode: the listener is up and an analyzer may dial in at any
+   *  moment. Distinguishes "waiting for the instrument" (normal between
+   *  transmissions for a machine that connects only to send) from "offline". */
+  readonly listening?: boolean;
+  /** TCP client mode: why the last dial failed (ETIMEDOUT, ECONNREFUSED …),
+   *  or null once connected. */
+  readonly lastDialError?: string | null;
   /** Human-readable endpoint, e.g. "tcp://0.0.0.0:5001" or "serial://COM3@9600". */
   readonly describe: string;
   start(): Promise<void>;

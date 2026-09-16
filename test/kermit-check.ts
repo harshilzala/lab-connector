@@ -9,6 +9,8 @@ import {
   unquote,
 } from '../src/codec/kermit/packets.js';
 import { buildOrderRecord, orderFileName, parseResultFile } from '../src/codec/kermit/vitros250.js';
+import { KermitLink } from '../src/codec/kermit/link.js';
+import { EventEmitter } from 'node:events';
 
 // =============================================================================
 // VITROS 250 (Kermit) — golden tests replayed from the PRODUCTION capture of
@@ -147,6 +149,48 @@ const split = new KermitDecoder();
 const halves = [Buffer.concat([NOISE, real.subarray(0, 5)]), Buffer.concat([real.subarray(5), NOISE])];
 eq('a packet split across reads still decodes',
    halves.flatMap((h) => split.push(h)).map((f) => [f.packet.type, f.valid]), [['F', true]]);
+
+console.log('\n[10] A transfer nobody acknowledges says WHY — silence vs. a wrong-baud answer');
+// Shela VITROS 250, 2026-09-16: every send-init timed out, 5 x 10 s, with an
+// empty inbound wire log. That log could not tell a dead cable from an
+// analyzer answering at the wrong baud rate — now the failure says which.
+class FakeTransport extends EventEmitter {
+  readonly kind = 'tcp' as const;
+  readonly describe = 'fake://vitros250';
+  connected = true;
+  writes: Buffer[] = [];
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  async write(d: Buffer): Promise<void> { this.writes.push(d); }
+}
+const quiet = { info() {}, warn() {}, error() {}, debug() {}, child() { return this; } } as never;
+const silentOrder = { sampleId: 'ZC2609160012', testCodes: ['Z'], priority: 'R', patient: null, specimenType: 'Serum' };
+{
+  const t = new FakeTransport();
+  const link = new KermitLink(t as never, { ackTimeoutMs: 20, maxRetries: 2, interPacketDelayMs: 0, interTransferDelayMs: 0, logger: quiet });
+  const wire: string[] = [];
+  link.on('wire', (w: { direction: string; text: string }) => wire.push(w.direction + ' ' + w.text));
+  await link.start();
+  let err = '';
+  try { await link.sendOrders([silentOrder]); } catch (e) { err = (e as Error).message; }
+  eq('silent analyzer: the error names the cable / host-comms check', /nothing at all was received/.test(err), true);
+  eq('silent analyzer: no inbound wire line is invented', wire.filter((w) => w.startsWith('IN')).length, 0);
+}
+{
+  const t = new FakeTransport();
+  const link = new KermitLink(t as never, { ackTimeoutMs: 20, maxRetries: 2, interPacketDelayMs: 0, interTransferDelayMs: 0, logger: quiet });
+  const wire: string[] = [];
+  link.on('wire', (w: { direction: string; text: string }) => wire.push(w.direction + ' ' + w.text));
+  await link.start();
+  // Answer every packet with what a 9600-baud reply looks like when read at
+  // the wrong rate: framing garbage, never an SOH.
+  const origWrite = t.write.bind(t);
+  t.write = async (d: Buffer) => { await origWrite(d); t.emit('data', Buffer.from([0xf8, 0x00, 0xfe, 0x80, 0x00])); };
+  let err = '';
+  try { await link.sendOrders([silentOrder]); } catch (e) { err = (e as Error).message; }
+  eq('wrong-baud analyzer: the error names the baud/parity check', /not Kermit packets: check baud\/parity/.test(err), true);
+  eq('wrong-baud analyzer: the bytes it sent are in the wire log', wire.some((w) => w.startsWith('IN (not Kermit') && w.includes('<F8>')), true);
+}
 
 console.log(failures ? `\n${B} ${failures} assertion(s) failed\n` : `\n${G} all assertions passed\n`);
 process.exit(failures ? 1 : 0);

@@ -141,6 +141,114 @@ function deterministicMessageId(equipmentCode: string, sampleId: string, results
 }
 
 // -----------------------------------------------------------------------------
+// Which of an analyzer's codes are interfaced to HMIS at all.
+//
+// One decision, made in one place, used twice: at INTAKE, so the staged store
+// and the upload queue only ever hold the parameters the lab has scoped the
+// interface to (a BC-5150 sends 60 numeric channels of which 22 are
+// interfaced — the other 38 must not sit in the store, count on the console
+// or be waited for), and again at FILING, where it also guards results that
+// were stored before this filter existed.
+// -----------------------------------------------------------------------------
+export interface InterfacedCodeFilter {
+  /** Inside allowTestCodes (or no allow-list configured). */
+  isAllowed(code: string): boolean;
+  /** Matches an ignoreTestCodes entry (exact, "*suffix", "prefix*", "*contains*"). */
+  isIgnored(code: string): boolean;
+  /** Allowed and not ignored — what may reach the store and HMIS. */
+  isInterfaced(code: string): boolean;
+}
+
+export function interfacedCodeFilter(opts: {
+  allowTestCodes: readonly string[];
+  ignoreTestCodes: readonly string[];
+  canonicalCode?: (identifier: string) => string;
+}): InterfacedCodeFilter {
+  const canonical = opts.canonicalCode ?? ((id) => id);
+  const key = (id: string) => canonical((id || '').trim()).trim().toUpperCase();
+
+  const ignoreExact = new Set<string>();
+  const ignoreSuffix: string[] = [];
+  const ignorePrefix: string[] = [];
+  const ignoreContains: string[] = [];
+  for (const pattern of opts.ignoreTestCodes) {
+    const raw = (pattern || '').trim();
+    if (!raw || raw === '*' || raw === '**') continue; // would silence the whole analyzer
+    if (raw.startsWith('*') && raw.endsWith('*')) ignoreContains.push(key(raw.slice(1, -1)));
+    else if (raw.startsWith('*')) ignoreSuffix.push(key(raw.slice(1)));
+    else if (raw.endsWith('*')) ignorePrefix.push(key(raw.slice(0, -1)));
+    else ignoreExact.add(key(raw));
+  }
+  const isIgnored = (code: string): boolean => {
+    const k = key(code);
+    if (!k) return false;
+    if (ignoreExact.has(k)) return true;
+    return (
+      ignoreSuffix.some((s) => s && k.endsWith(s)) ||
+      ignorePrefix.some((p) => p && k.startsWith(p)) ||
+      ignoreContains.some((c) => c && k.includes(c))
+    );
+  };
+
+  const allow = new Set<string>();
+  for (const code of opts.allowTestCodes) {
+    const k = key(code);
+    if (k) allow.add(k);
+  }
+  const isAllowed = (code: string): boolean => allow.size === 0 || allow.has(key(code));
+
+  return { isAllowed, isIgnored, isInterfaced: (code) => isAllowed(code) && !isIgnored(code) };
+}
+
+/**
+ * For an HMIS pending row, will this analyzer ever file into it? True when the
+ * row's identifier is an interfaced instrument code (directly) or the alias
+ * target of one, and is not excluded. With no allow-list configured every
+ * non-excluded row counts as "will sync" — the connector cannot know better
+ * until a result arrives. Used by the console to mark each order row.
+ */
+export function willSyncIdentifier(
+  identifier: string,
+  cfg: {
+    allowTestCodes: readonly string[];
+    ignoreTestCodes: readonly string[];
+    testCodeAliases: Readonly<Record<string, string>>;
+    excludeIdentifiers: readonly string[];
+    excludeParameterIds?: readonly number[];
+    canonicalCode?: (identifier: string) => string;
+  },
+  parameterId?: number | string | null,
+): boolean {
+  const canonical = cfg.canonicalCode ?? ((id) => id);
+  const key = (id: string) => canonical((id || '').trim()).trim().toUpperCase();
+  const k = key(identifier);
+  if (!k) return false;
+  if (cfg.excludeIdentifiers.some((x) => key(x) === k)) return false;
+  if (parameterId != null && (cfg.excludeParameterIds ?? []).includes(Number(parameterId))) return false;
+  const filter = interfacedCodeFilter(cfg);
+  if (cfg.allowTestCodes.length === 0) return !filter.isIgnored(identifier);
+  // Directly: an interfaced instrument code spelled like the row.
+  if (cfg.allowTestCodes.some((code) => key(code) === k && filter.isInterfaced(code))) return true;
+  // Through an alias: an interfaced instrument code mapped to this row.
+  return Object.entries(cfg.testCodeAliases).some(([code, target]) => key(target) === k && filter.isInterfaced(code));
+}
+
+/**
+ * Keep only the interfaced results of an upload. Returns the upload unchanged
+ * when nothing is filtered, otherwise a copy with the reduced result list and
+ * the codes that were left out. The raw wire text is kept as-is.
+ */
+export function keepInterfacedResults(
+  upload: HmisResultUpload,
+  filter: InterfacedCodeFilter,
+): { upload: HmisResultUpload; dropped: string[] } {
+  const dropped = upload.results.filter((r) => !filter.isInterfaced(r.testCode)).map((r) => r.testCode);
+  if (dropped.length === 0) return { upload, dropped };
+  const results = upload.results.filter((r) => filter.isInterfaced(r.testCode));
+  return { upload: { ...upload, results }, dropped };
+}
+
+// -----------------------------------------------------------------------------
 // Result upload → wire rows.
 //
 // The results endpoint files against `labResultId`, which only the PENDING ROW
@@ -232,9 +340,34 @@ export function toLisResultRows(
    * exist. Exact, case-insensitive, no wildcards.
    */
   allowTestCodes: string[] = [],
+  /**
+   * HMIS `eqIdntifier` values this analyzer must NEVER file into, whatever
+   * the instrument's own code happens to be called. Needed where HMIS carries
+   * a row whose identifier collides with an instrument mnemonic but means a
+   * different thing: ZHPN001's CBC service has "WBC COUNT" (2123) for the
+   * count AND a peripheral-smear row literally named "WBC" (2166), and the
+   * BC-5150 sends its count as "WBC" — on 2026-09-12 sample PL2609120001's
+   * WBC 4.76 and RBC 5.09 were filed into the smear rows 2166 and 2152. With
+   * the smear identifiers excluded here the instrument code matches nothing,
+   * the alias ("WBC" → "WBC COUNT") is consulted, and the count lands on the
+   * count row. Matching is exact and case-insensitive.
+   */
+  excludeIdentifiers: string[] = [],
+  /**
+   * HMIS parameterIds this analyzer must never file into. The stable form of
+   * excludeIdentifiers: when the lab renames rows in the HMIS master a name
+   * can suddenly cover two parameters (ZHPN001, 2026-09-12 14:13Z: "WBC" on
+   * both the count 2123 and the smear row 2166), but the smear row's id does
+   * not change. Rows listed here are simply never offered to the join.
+   */
+  excludeParameterIds: number[] = [],
 ): {
   rows: LisInboundResultRow[];
   unmatched: string[];
+  /** Codes whose HMIS identifier maps to MORE THAN ONE parameter on this
+   *  sample after exclusions — never filed (which row would be right?), left
+   *  waiting and reported so the master gets fixed. Also in `unmatched`. */
+  ambiguous: string[];
   matched: MirthAcknowledgeItem[];
   voided: string[];
   ignored: string[];
@@ -249,36 +382,7 @@ export function toLisResultRows(
   // Analyzers are inconsistent about case and padding on assay codes; the
   // pending row is authoritative for the spelling actually sent on the wire.
   const key = (id: string) => canonicalCode((id || '').trim()).trim().toUpperCase();
-
-  const ignoreExact = new Set<string>();
-  const ignoreSuffix: string[] = [];
-  const ignorePrefix: string[] = [];
-  const ignoreContains: string[] = [];
-  for (const pattern of ignoreTestCodes) {
-    const raw = (pattern || '').trim();
-    if (!raw || raw === '*' || raw === '**') continue; // would silence the whole analyzer
-    if (raw.startsWith('*') && raw.endsWith('*')) ignoreContains.push(key(raw.slice(1, -1)));
-    else if (raw.startsWith('*')) ignoreSuffix.push(key(raw.slice(1)));
-    else if (raw.endsWith('*')) ignorePrefix.push(key(raw.slice(0, -1)));
-    else ignoreExact.add(key(raw));
-  }
-  const isIgnored = (code: string): boolean => {
-    const k = key(code);
-    if (!k) return false;
-    if (ignoreExact.has(k)) return true;
-    return (
-      ignoreSuffix.some((s) => s && k.endsWith(s)) ||
-      ignorePrefix.some((p) => p && k.startsWith(p)) ||
-      ignoreContains.some((c) => c && k.includes(c))
-    );
-  };
-
-  const allow = new Set<string>();
-  for (const code of allowTestCodes) {
-    const k = key(code);
-    if (k) allow.add(k);
-  }
-  const isAllowed = (code: string): boolean => allow.size === 0 || allow.has(key(code));
+  const { isAllowed, isIgnored } = interfacedCodeFilter({ allowTestCodes, ignoreTestCodes, canonicalCode });
 
   const aliasOf = new Map<string, string>();
   for (const [from, to] of Object.entries(aliases)) {
@@ -292,14 +396,28 @@ export function toLisResultRows(
     if (k && Number.isFinite(factor) && factor > 0 && factor !== 1) scaleOf.set(k, factor);
   }
 
+  const excluded = new Set(excludeIdentifiers.map(key).filter(Boolean));
+  const excludedIds = new Set(excludeParameterIds);
   const byCode = new Map<string, MirthAcknowledgeItem>();
+  // One identifier → several parameterIds is an HMIS master in flux, not a
+  // choice the connector may make: such a key is withheld from byCode.
+  const ambiguousKeys = new Set<string>();
+  const seenIds = new Map<string, Set<string>>();
   for (const row of orderRows) {
     const k = key(row.identifier);
-    if (k && !byCode.has(k)) byCode.set(k, row); // first row wins
+    if (!k || excluded.has(k)) continue; // a row this analyzer may not touch
+    if (row.parameterId != null && excludedIds.has(Number(row.parameterId))) continue;
+    const ids = seenIds.get(k) ?? new Set<string>();
+    ids.add(String(row.parameterId ?? row.labResultId ?? ''));
+    seenIds.set(k, ids);
+    if (ids.size > 1) ambiguousKeys.add(k);
+    if (!byCode.has(k)) byCode.set(k, row); // first row wins among identical parameters (a re-order)
   }
+  for (const k of ambiguousKeys) byCode.delete(k);
 
   const rows: LisInboundResultRow[] = [];
   const unmatched: string[] = [];
+  const ambiguous: string[] = [];
   // The pending rows these results were filed against — what the acknowledge
   // body must echo once the upload has actually succeeded.
   const matched: MirthAcknowledgeItem[] = [];
@@ -330,6 +448,7 @@ export function toLisResultRows(
     // already matches a pending row.
     const ctx = byCode.get(own) ?? (aliasOf.has(own) ? byCode.get(aliasOf.get(own)!) : undefined);
     if (!ctx) {
+      if (ambiguousKeys.has(own) || (aliasOf.has(own) && ambiguousKeys.has(aliasOf.get(own)!))) ambiguous.push(r.testCode);
       unmatched.push(r.testCode);
       continue;
     }
@@ -367,5 +486,5 @@ export function toLisResultRows(
     });
   }
 
-  return { rows, unmatched, matched, voided, ignored, scaled, filedCodes };
+  return { rows, unmatched, ambiguous, matched, voided, ignored, scaled, filedCodes };
 }

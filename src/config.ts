@@ -250,6 +250,20 @@ const AnalyzerSchema = z.object({
    *  this is the escape hatch when the parameter is named after the report
    *  line rather than the instrument. */
   testCodeAliases: z.record(z.string()).default({}),
+  /** HMIS `eqIdntifier` values this analyzer must NEVER file into, even when
+   *  the instrument's own code is spelled exactly the same. For an HMIS
+   *  service that carries both "WBC COUNT" and a smear-review row named "WBC"
+   *  (ZHPN001, parameterIds 2123 and 2166): list "WBC" here and alias the
+   *  instrument's WBC to "WBC COUNT", otherwise the count files into the
+   *  morphology row — which happened on PL2609120001, 2026-09-12. Exact,
+   *  case-insensitive. */
+  excludeIdentifiers: z.array(z.string()).default([]),
+  /** HMIS parameterIds this analyzer must never file into — the stable form
+   *  of excludeIdentifiers, for when the lab renames rows in the HMIS master
+   *  and a name comes to cover two parameters (ZHPN001: "WBC" on the count
+   *  2123 AND the smear row 2166 after the 2026-09-12 edit). A parameterId
+   *  does not change when its name does. Prefer this over names. */
+  excludeParameterIds: z.array(z.number().int().positive()).default([]),
   /** Assay codes this analyzer emits that are not reportable results and will
    *  never have a pending row — research-only channels and flag scores. They
    *  are dropped at delivery time instead of being re-queued as an unfilable
@@ -359,6 +373,12 @@ const ConfigSchema = z.object({
   spoolDir: z.string().default('./spool'),
   hmis: z.object({
     baseUrl: z.string().url(),
+    /** HMIS site this installation serves. Sent as `siteId` on every pending
+     *  call so the gateway returns only this site's orders — on a multi-site
+     *  HMIS the eqCode alone does not pick the right order. Leave it unset
+     *  where one connector serves several sites (see the CANCER config).
+     *  An analyzer's own `siteId` still overrides it. */
+    siteId: z.union([z.string(), z.number()]).transform(String).optional(),
     /** GET — load orders. Query: sampleId, eqCode, siteId, showCulture, date. */
     pendingPath: z.string().default('/mirth/pending'),
     /** POST — acknowledge the rows handed to the analyzer. */
@@ -407,6 +427,19 @@ const ConfigSchema = z.object({
       authFile: z.string().default('./admin-auth.json'),
     })
     .default({ host: '127.0.0.1', port: 7070, authFile: './admin-auth.json' }),
+  /** The console's "Force" button: push a staged sample's values straight to
+   *  the HMIS results endpoint WITHOUT asking HMIS for its pending rows —
+   *  every value is mapped from the order rows already cached for the sample
+   *  and the parameter catalogue, and re-sent, filed or not. It exists for the
+   *  day HMIS withdraws a sample's rows before the interface has filed them
+   *  (seen on PL2609120001, 2026-09-12). Guarded by a password because it
+   *  writes patient results while bypassing the check that normally proves
+   *  HMIS asked for them. Empty password = the button is not offered. */
+  Force_Hmis: z
+    .object({
+      password: z.string().default(''),
+    })
+    .default({ password: '' }),
   analyzers: z.array(AnalyzerSchema).min(1),
 });
 

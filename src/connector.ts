@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { AppConfig } from './config.js';
 import type { Logger } from './logger.js';
@@ -28,6 +29,7 @@ export class Connector implements AdminBackend {
 
     this.hmis = new HmisClient({
       baseUrl: cfg.hmis.baseUrl,
+      siteId: cfg.hmis.siteId,
       pendingPath: cfg.hmis.pendingPath,
       acknowledgePath: cfg.hmis.acknowledgePath,
       resultsPath: cfg.hmis.resultsPath,
@@ -148,6 +150,10 @@ export class Connector implements AdminBackend {
     return this.runtimes.get(id)?.stagedSummaries() ?? null;
   }
 
+  ordersView(id: string) {
+    return this.runtimes.get(id)?.ordersView() ?? null;
+  }
+
   fileNow(id: string, barcode: string) {
     return this.runtimes.get(id)?.stagedFileNow(barcode) ?? Promise.resolve(false);
   }
@@ -158,5 +164,22 @@ export class Connector implements AdminBackend {
 
   removeStaged(id: string, barcode: string) {
     return this.runtimes.get(id)?.stagedRemove(barcode) ?? false;
+  }
+
+  forceEnabled() {
+    return this.cfg.Force_Hmis.password.length > 0;
+  }
+
+  /** Constant-time check of the console's Force password (config Force_Hmis). */
+  forcePasswordOk(given: string) {
+    const want = this.cfg.Force_Hmis.password;
+    if (!want) return false;
+    const a = createHash('sha256').update(given).digest();
+    const b = createHash('sha256').update(want).digest();
+    return timingSafeEqual(a, b);
+  }
+
+  force(id: string, barcode: string) {
+    return this.runtimes.get(id)?.stagedForce(barcode) ?? Promise.resolve(null);
   }
 }
