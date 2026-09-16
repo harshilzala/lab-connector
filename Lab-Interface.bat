@@ -324,6 +324,16 @@ echo        PM2 still restarts crashes; only the backstop is missing.
 exit /b 0
 
 rem ---- error paths ----------------------------------------------------------
+rem ---------------------------------------------------------------------------
+rem  Service mode. Not starting under PM2 - a PM2 copy beside the service would
+rem  fight it for the analyzer and dashboard ports.
+rem
+rem  "Start it again with Lab-Interface.bat" is what both force-stop scripts
+rem  tell the operator, so this branch has to actually undo a force stop, not
+rem  just print status: the flag, the disabled watchdog tasks and the Manual
+rem  start type all have to go back. service\resume-service.ps1 does all three
+rem  and elevates itself once for the service part.
+rem ---------------------------------------------------------------------------
 :service_mode
 echo  Lab-Interface is installed as a Windows service here - not starting under PM2.
 echo.
@@ -332,6 +342,15 @@ echo   Logs     : logs\LAB-Interface-service.out.log
 echo   Redeploy : npm run build, then run (as administrator)
 echo              service\restart-service.ps1
 echo   Dashboard: http://127.0.0.1:7071
+echo.
+if not exist "%~dp0service\resume-service.ps1" goto service_status_only
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0service\resume-service.ps1"
+goto stop
+
+:service_status_only
+echo  NOTE: service\resume-service.ps1 is missing, so this script can only
+echo        report the service state. Start it by hand (as administrator):
+echo        sc.exe start LAB-Interface
 echo.
 sc query LAB-Interface | findstr STATE
 goto stop

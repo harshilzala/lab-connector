@@ -1,16 +1,38 @@
 # magic — start and stop the lab connector
 
-Four double-clickable scripts. Nothing here needs **Run as administrator**.
+Five double-clickable scripts. Only `magic-force-stop.bat` ever asks for
+**Run as administrator**, and only when this machine runs the connector as a
+Windows service.
 
 | Script | What it does |
 |---|---|
-| `magic-start.bat` | Starts the connector under PM2. If it is already registered, restarts it — so this is also how you redeploy after a code change. |
-| `magic-stop.bat` | Stops it, and makes it **stay** stopped. |
+| `magic-start.bat` | Starts the connector under PM2. If it is already registered, restarts it — so this is also how you redeploy after a code change. Where the connector is a Windows service, it resumes that service instead. |
+| `magic-stop.bat` | Stops it, and makes it **stay** stopped. The gentle one — try this first. |
+| `magic-force-stop.bat` | Stops **everything**, however it was started: the Windows service, the watchdog tasks, PM2, and any stray `npm run dev`. |
 | `magic-add-to-startup.bat` | Run once. The connector then starts at Windows logon and is checked every 5 minutes. |
 | `magic-remove-from-startup.bat` | Undoes the above. |
 
 `magic-startup.cmd` is the worker the logon entry and the watchdog run. It is
 not meant to be double-clicked — it never pauses and never builds.
+
+## When `magic-stop.bat` is not enough
+
+`magic-stop.bat` only speaks to PM2. On a machine where the connector is
+installed as the **LAB-Interface Windows service** (see `..\service\`), PM2 knows
+nothing about it: the stop script reports "not registered with PM2 — nothing to
+stop" while the connector keeps running, still holding the analyzer ports.
+
+Killing its `node.exe` from Task Manager does not work either. The Service
+Control Manager reads that as a crash and starts it again ten seconds later.
+That is what kept taking port 3010 back from `npm run dev`.
+
+`magic-force-stop.bat` is for that case. It raises the same `.lab-maintenance`
+flag, **disables** the 5-minute watchdog tasks, stops the service properly
+through the SCM and sets it to Manual start so a reboot does not revive it, then
+sweeps up anything still listening. `magic-start.bat` puts all of it back.
+
+Both force-stop wrappers drive the same engine,
+`..\Lab-Interface-force-stop.ps1`, so the two sets of scripts cannot drift apart.
 
 Dashboard: **http://127.0.0.1:7071** · Live logs: `pm2 logs Lab-Interface`
 

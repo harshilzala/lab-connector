@@ -52,6 +52,20 @@ if not exist "ecosystem.config.cjs" goto no_ecosystem
 if not exist "config.json" goto no_config
 
 rem ---------------------------------------------------------------------------
+rem  Service mode. Some sites run the connector as the "LAB-Interface" Windows
+rem  service (service\, WinSW) so it is up at the login screen with nobody
+rem  signed in. A PM2 copy beside it would fight for the analyzer and dashboard
+rem  ports and crash-loop on EADDRINUSE, so hand over to the service instead -
+rem  the same guard Lab-Interface.bat has.
+rem
+rem  resume-service.ps1 is what undoes a force stop: it clears the maintenance
+rem  flag, re-enables the watchdog tasks and puts the service back to Automatic
+rem  (delayed) before starting it. It elevates itself once for that.
+rem ---------------------------------------------------------------------------
+sc query LAB-Interface >nul 2>&1
+if not errorlevel 1 goto service_mode
+
+rem ---------------------------------------------------------------------------
 rem  Clear the maintenance flag. magic-stop.bat and Lab-Interface-stop.bat both
 rem  raise it to tell the 5-minute watchdog "this is down on purpose". Starting
 rem  by hand means the opposite, so the flag has to go or the watchdog would
@@ -121,6 +135,32 @@ echo.
 pause
 exit /b 1
 
+rem ---------------------------------------------------------------------------
+:service_mode
+echo  Lab-Interface is installed as a Windows service here - not starting it
+echo  under PM2 (two copies would fight for the same ports).
+echo.
+echo   Status   : sc query LAB-Interface
+echo   Logs     : logs\LAB-Interface-service.out.log
+echo   Dashboard: http://127.0.0.1:7071
+echo.
+if not exist "%~dp0..\service\resume-service.ps1" goto service_status_only
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\service\resume-service.ps1"
+set "RC=%ERRORLEVEL%"
+pause
+exit /b %RC%
+
+:service_status_only
+echo  NOTE: service\resume-service.ps1 is missing, so this script can only
+echo        report the service state. Start it by hand (as administrator):
+echo        sc.exe start LAB-Interface
+echo.
+sc query LAB-Interface | findstr STATE
+echo.
+pause
+exit /b 0
+
+rem ---------------------------------------------------------------------------
 :no_pm2
 echo  ERROR: PM2 was not found on PATH.
 echo         Install it once with:   npm install -g pm2

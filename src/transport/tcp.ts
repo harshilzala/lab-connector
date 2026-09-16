@@ -67,12 +67,17 @@ export class TcpTransport extends EventEmitter implements Transport {
       const server = net.createServer((socket) => this.adoptSocket(socket));
       server.on('error', (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE') {
-          // Almost always a second copy of the connector: the PM2 service is
-          // already up and someone ran "npm run dev" beside it (2026-09-16).
+          // Almost always a second copy of the connector: the LAB-Interface
+          // Windows service is already up and someone ran "npm run dev" beside
+          // it (2026-09-16). Note that killing the service's node process is
+          // not a stop — the SCM restarts it 10s later and takes the port back,
+          // which is why the hint points at the force-stop script and not at
+          // Task Manager or the PM2-only Lab-Interface-stop.bat.
           this.opts.logger.error(
             { endpoint: this.describe },
-            'port already in use — another Lab-Interface is probably running (PM2 service or a second "npm run dev"). ' +
-              'Only one instance can run: stop the other one first (Lab-Interface-stop.bat for the PM2 service).',
+            'port already in use — another Lab-Interface is probably running (the LAB-Interface Windows service, or a second "npm run dev"). ' +
+              'Only one instance can run: stop the other one first with Lab-Interface-force-stop.bat ' +
+              '(or magic\\magic-force-stop.bat), which stops the service, the watchdog and any stray process.',
           );
         } else {
           this.opts.logger.error({ err }, 'TCP server error');
