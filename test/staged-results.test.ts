@@ -146,7 +146,10 @@ check(sum('ZC2609080001').complete && posted.length === 1 && posted[0]![0]!.samp
 orders.set('D1', [row('D1', 'WBC', 501)]);
 store.upsert(upload('D1', { WBC: '3.3', 'Blasts-IM': '12' }));
 await filer.run('message', 'D1');
-check(sum('D1').complete && sum('D1').dropped === 1 && sum('D1').filed === 1, 'the "*-IM" flag score is dropped and the sample is complete');
+// A non-interfaced channel is not part of the sample at all: the console
+// counts "1 of 1", not "1 of 2 — 1 not interfaced" (intake filters it before
+// staging; a value stored earlier is left out of the summary the same way).
+check(sum('D1').complete && sum('D1').dropped === 0 && sum('D1').total === 1 && sum('D1').filed === 1, 'the "*-IM" flag score is not counted and the sample is complete');
 
 // ---- 7: gateway outage ---------------------------------------------------------
 for (const b of ['E1', 'E2', 'E3', 'E4']) {

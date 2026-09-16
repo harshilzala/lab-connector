@@ -15,6 +15,7 @@ import {
   type KermitParams,
 } from './packets.js';
 import { buildOrderRecord, orderFileName, parseResultFile, unencodableTestCodes } from './vitros250.js';
+import { renderBytes } from '../../probe/identify.js';
 
 // =============================================================================
 // KermitLink — the VITROS 250/350 protocol state machine.
@@ -58,6 +59,8 @@ const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * single-character checksum. These mirror what the VITROS itself announces.
  */
 const OUR_PARAMS_DATA = '~* @-#N1';
+/** How much non-packet input to keep, per transfer, for the failure report. */
+const UNPARSED_KEEP = 200;
 
 export class KermitLink extends EventEmitter implements ProtocolLink {
   readonly name = 'kermit' as const;
@@ -68,6 +71,8 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
 
   private sending = false;
   private ackWaiter: ((p: KermitPacket) => void) | null = null;
+  /** Non-packet bytes heard while waiting for an ACK — see onData. */
+  private unparsedWhileSending: Buffer = Buffer.alloc(0);
 
   // Receive-session accumulators.
   private rxFileName = '';
@@ -98,7 +103,20 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
 
   // ---- inbound routing ------------------------------------------------------
   private onData(chunk: Buffer): void {
-    for (const { packet, valid } of this.decoder.push(chunk)) {
+    const decoded = this.decoder.push(chunk);
+    if (decoded.length === 0 && this.decoder.buffered === 0) {
+      // Bytes that cannot begin a Kermit packet. Idle, the VITROS 250 line
+      // dribbles 0x80/0x00 constantly (test/kermit-check.ts [9]), so this is
+      // only worth keeping while we are waiting for an acknowledgement: then
+      // it is the difference between an analyzer that never answered (cable,
+      // host comms off) and one that answered in a serial format the NPort is
+      // not set to (baud/parity). Reported once, when the transfer fails.
+      if (this.sending && this.unparsedWhileSending.length < UNPARSED_KEEP) {
+        this.unparsedWhileSending = Buffer.concat([this.unparsedWhileSending, chunk]).subarray(0, UNPARSED_KEEP);
+      }
+      return;
+    }
+    for (const { packet, valid } of decoded) {
       if (this.sending) {
         // Mid-transmit: every packet is an answer to what we just sent.
         this.ackWaiter?.(packet);
@@ -210,6 +228,7 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
     await this.awaitIdle();
     await this.awaitTransferGap();
     this.sending = true;
+    this.unparsedWhileSending = Buffer.alloc(0);
     this.emit('wire', { direction: 'OUT', text: `${fileName}: ${payload}` });
     try {
       let seq = 0;
@@ -270,7 +289,20 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
       );
       await delay(200);
     }
-    throw new Error(`VITROS 250 did not acknowledge a ${p.type} packet after ${this.opts.maxRetries} attempts`);
+    const heard = this.unparsedWhileSending;
+    if (heard.length > 0) {
+      // It answered, just not in Kermit: almost always a baud/parity mismatch
+      // between the analyzer and the NPort's serial port.
+      this.emit('wire', { direction: 'IN', text: `(not Kermit, ${heard.length}+ bytes while waiting for ACK) ${renderBytes(heard)}` });
+      throw new Error(
+        `VITROS 250 did not acknowledge a ${p.type} packet after ${this.opts.maxRetries} attempts — ` +
+          `it sent ${heard.length}+ bytes that are not Kermit packets: check baud/parity on the NPort serial port and the analyzer`,
+      );
+    }
+    throw new Error(
+      `VITROS 250 did not acknowledge a ${p.type} packet after ${this.opts.maxRetries} attempts — ` +
+        'nothing at all was received from it: check the serial cable and that host communication is enabled on the analyzer',
+    );
   }
 
   private waitAck(timeoutMs: number): Promise<KermitPacket | null> {

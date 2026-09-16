@@ -1,5 +1,5 @@
 import type { Logger } from '../logger.js';
-import type { MirthAcknowledgeItem, LisInboundResultRow, HmisResultUploadResponse } from '../types.js';
+import type { MirthAcknowledgeItem, LisInboundResultRow, HmisResultUploadResponse, MirthPendingRow } from '../types.js';
 import type { HmisAudit, HmisAuditKind, HmisAuditOutcome } from './audit.js';
 import { unwrapRows } from './pending.js';
 
@@ -24,6 +24,9 @@ export interface HmisClientOptions {
   resultsPath: string;
   timeoutMs: number;
   tlsRejectUnauthorized: boolean;
+  /** Site-wide `siteId` for the pending call (config `hmis.siteId`), used
+   *  whenever the query itself does not name one. */
+  siteId?: string;
   logger: Logger;
   /** Records every call to the gateway — request, response and verdict. */
   audit?: HmisAudit;
@@ -62,7 +65,8 @@ export class HmisClient {
     const params = new URLSearchParams();
     if (q.sampleId) params.set('sampleId', q.sampleId);
     if (q.eqCode) params.set('eqCode', q.eqCode);
-    if (q.siteId) params.set('siteId', q.siteId);
+    const siteId = q.siteId ?? this.opts.siteId;
+    if (siteId) params.set('siteId', siteId);
     if (q.showCulture !== undefined) params.set('showCulture', String(q.showCulture));
     if (q.date) params.set('date', q.date);
 
@@ -72,7 +76,8 @@ export class HmisClient {
       const { status, text } = await this.send('GET', path);
       const body = this.parse(text, path);
       // The question this log exists to answer: did the sample get work back?
-      const rows = unwrapRows(body).length;
+      const rowList = unwrapRows(body);
+      const rows = rowList.length;
       this.record({
         kind: 'query',
         sampleId: q.sampleId ?? null,
@@ -81,7 +86,15 @@ export class HmisClient {
         path,
         startedAt,
         httpStatus: status,
-        response: body,
+        // A per-sample lookup is logged verbatim: it is what the lab reads to
+        // see what HMIS said about a tube. A BULK poll (no sampleId) is the
+        // whole equipment worklist — ~500 rows / 300 KB for ZHPN001 — and it
+        // repeats every 30 s per day in the window; logged whole it filled
+        // 450 MB a day (2026-09-15, 45 parts). It is logged as a digest: how
+        // many rows, and per barcode which identifiers were offered — enough
+        // to trace whether an order was ever visible, without the columns
+        // that never change between polls.
+        response: q.sampleId ? body : digestBulkPoll(rowList, body),
         outcome: rows > 0 ? 'orders-found' : 'no-orders',
         rows,
       });
@@ -363,4 +376,25 @@ function toAcknowledgeWire(item: MirthAcknowledgeItem): Record<string, unknown> 
     portNo: item.portNo,
     parameterId: item.parameterId,
   };
+}
+
+/**
+ * The bulk-poll response as the audit log keeps it: row count, and for every
+ * barcode the identifiers HMIS offered (with their parameterIds), grouped by
+ * service. Anything that is not a recognisable row list is kept as-is,
+ * truncated, so an unexpected reply shape is still visible.
+ */
+export function digestBulkPoll(rows: MirthPendingRow[], body: unknown): unknown {
+  if (rows.length === 0) {
+    const text = JSON.stringify(body);
+    return text.length > 2000 ? { truncated: text.slice(0, 2000) } : body;
+  }
+  const samples: Record<string, Record<string, string[]>> = {};
+  for (const r of rows) {
+    const sid = String(r.SampleID ?? r.sampleID ?? r.sampleId ?? '?');
+    const svc = String(r.serviceCode ?? r.labServiceId ?? '?');
+    const id = `${r.eqIdntifier ?? r.identifier ?? '?'}${r.parameterId != null ? '#' + r.parameterId : ''}`;
+    ((samples[sid] ??= {})[svc] ??= []).push(id);
+  }
+  return { digest: true, rows: rows.length, samples: Object.keys(samples).length, bySample: samples };
 }

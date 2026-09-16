@@ -331,6 +331,18 @@ Each analyzer chooses how its results reach HMIS with `filing.mode`:
   sample is looked up at HMIS directly once when first seen and then no more
   often than `recheckMs`; the order poll covers the normal case.
 
+  **Force** ("Results" tab, shown on a sample once HMIS has taken at least one
+  of its values — filed or partly filed) pushes *every* value of that sample to
+  the HMIS results endpoint again, **without** asking HMIS for its pending
+  rows: parameter ids come from the order rows already cached for the barcode
+  and the parameter catalogue, values that resolve to nothing are listed back
+  rather than guessed, and the rows sent are acknowledged as usual. It exists
+  for the day HMIS withdraws a sample's rows before the interface has filed
+  them (PL2609120001, 2026-09-12). Because it writes patient results past the
+  normal proof that HMIS asked for them, it asks for the password in
+  `Force_Hmis.password` every time and is logged on every use; with the
+  password empty the button is not shown.
+
 The Cancer site runs the ABL9 and the BC-6000 staged and both VITROS queued.
 Switching an analyzer to staged migrates whatever its queue still holds into
 the store on the next start, so nothing already received is lost.

@@ -86,10 +86,17 @@ const post = src.lastIndexOf('this.hmis.postResults(');
 const ack = src.lastIndexOf('this.hmis.acknowledge(');
 assert.ok(post !== -1 && ack !== -1, 'both calls present');
 assert.ok(ack > post, 'acknowledge is called after postResults in the queued delivery');
+{
+  // The console force-push is its own path: it must post before it acknowledges too.
+  const fp = src.indexOf('FORCE push to HMIS from the admin console');
+  const fpPost = src.indexOf('this.hmis.postResults(', fp);
+  const fpAck = src.indexOf('this.hmis.acknowledge(', fp);
+  assert.ok(fp !== -1 && fpPost !== -1 && fpAck > fpPost, 'force-push acknowledges only after postResults');
+}
 assert.equal(
   src.split('this.hmis.acknowledge(').length - 1,
-  2,
-  'acknowledge is wired from exactly two places: the queued delivery and the staged filer',
+  3,
+  'acknowledge is wired from exactly three places: the queued delivery, the staged filer, and the console force-push (which also posts first)',
 );
 // The staged filer (filing.mode "staged") must keep the same order: post, then
 // acknowledge, and only once.

@@ -10,7 +10,16 @@ import { createProtocolLink } from '../codec/index.js';
 import { SpoolQueue } from '../queue/spool.js';
 import { ResultStore, type StagedSummary } from '../results/store.js';
 import { StagedFiler } from '../results/filer.js';
-import { isQcSample, isVoidResult, normalizeBarcode, toLisResultRows, toResultUploads } from '../mapping/mapper.js';
+import {
+  interfacedCodeFilter,
+  isQcSample,
+  isVoidResult,
+  keepInterfacedResults,
+  normalizeBarcode,
+  toLisResultRows,
+  toResultUploads,
+  willSyncIdentifier,
+} from '../mapping/mapper.js';
 import {
   formatApiDate,
   formatApiDateDaysAgo,
@@ -59,6 +68,14 @@ export interface AnalyzerStatus {
   protocol: string;
   endpoint: string;
   connected: boolean;
+  /** "connected"  — a socket to the instrument is open now;
+   *  "listening"  — server mode, no socket right now, but the port is open and
+   *                 the instrument dials in when it has something to send (the
+   *                 GH900 does exactly that — normal, not a fault);
+   *  "offline"    — client mode and the dial is failing, or the listener is
+   *                 down. `linkError` says why when known. */
+  link: 'connected' | 'listening' | 'offline';
+  linkError: string | null;
   lastMessageAt: string | null;
   spool: { pending: number; failed: number };
   /** See config `filing.mode`. */
@@ -66,6 +83,56 @@ export interface AnalyzerStatus {
   /** Staged analyzers only: samples still waiting / fully filed. */
   staged: { waiting: number; complete: number } | null;
   orders: OrderPollStatus;
+  /** What this machine is scoped to send — the console's "parameters" line. */
+  interface: InterfaceScope;
+}
+
+export interface InterfaceScope {
+  /** allowTestCodes as configured; empty means "everything the instrument
+   *  sends that is not ignored". */
+  syncCodes: string[];
+  /** Instrument code → HMIS identifier it is filed as, where they differ. */
+  aliases: Record<string, string>;
+  /** HMIS identifiers this machine never files into. */
+  excluded: string[];
+  /** Instrument channels configured as non-results. */
+  ignored: string[];
+}
+
+/** What the console's "Force" push did for one sample. */
+export interface ForceReport {
+  barcode: string;
+  /** Interfaced values the sample holds (filed + waiting). */
+  values: number;
+  /** How many of them resolved to an HMIS parameter and were sent. */
+  sent: number;
+  /** How many HMIS reported accepted. */
+  accepted: number;
+  /** The gateway's message, or why nothing was sent. */
+  message: string;
+  /** Analyzer codes that resolved to no parameter — not sent, not guessed. */
+  unresolved: string[];
+  rows: Array<{ testCode: string; identifier: string; parameterId: number | null; value: string }>;
+}
+
+/** One order (barcode) as the console shows it: every HMIS row, marked. */
+export interface OrderView {
+  barcode: string;
+  sampleId: string;
+  firstSeenAt: string;
+  updatedAt: string;
+  source: string;
+  rows: Array<{
+    identifier: string;
+    parameterId: number | null;
+    labResultId: number | null;
+    /** Will this analyzer file into this row? */
+    sync: boolean;
+    /** Already sent to the instrument (download). */
+    downloaded: boolean;
+  }>;
+  syncCount: number;
+  noSyncCount: number;
 }
 
 export interface OrderPollStatus {
@@ -351,12 +418,20 @@ export class AnalyzerRuntime {
       protocol: this.cfg.protocol,
       endpoint: describeTransport(this.cfg),
       connected: this.transport.connected,
+      link: this.transport.connected ? 'connected' : this.transport.listening ? 'listening' : 'offline',
+      linkError: this.transport.connected ? null : (this.transport.lastDialError ?? null),
       lastMessageAt: this.lastMessageAt,
       // On a staged analyzer "pending" is the samples still waiting for an
       // order row, so the console tiles keep meaning "not yet in HMIS".
       spool: stagedCounts ? { pending: stagedCounts.waiting, failed: this.spool.counts().failed } : this.spool.counts(),
       filing: this.cfg.filing.mode,
       staged: stagedCounts,
+      interface: {
+        syncCodes: [...this.cfg.allowTestCodes],
+        aliases: { ...this.cfg.testCodeAliases },
+        excluded: [...this.cfg.excludeIdentifiers, ...this.cfg.excludeParameterIds.map((id) => `param ${id}`)],
+        ignored: [...this.cfg.ignoreTestCodes],
+      },
       orders: {
         stored: this.orders.count(),
         pollEnabled: this.cfg.orderPoll.enabled,
@@ -413,7 +488,7 @@ export class AnalyzerRuntime {
             samples++;
             // The poll is where a complete panel is most likely to be seen, so
             // it is the catalogue's main source.
-            this.parameters.learn(pending.ackItems);
+            this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
             const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll');
             if (!download || newCodes.length === 0) continue;
             if (!downloadable(order.sampleId)) {
@@ -556,6 +631,51 @@ export class AnalyzerRuntime {
   // ---- staged result store (filing.mode "staged") ---------------------------
 
   /** Null on a queued analyzer. */
+  /** allowTestCodes / ignoreTestCodes as one predicate — see mapper.ts. */
+  private get codeFilter() {
+    return interfacedCodeFilter({
+      allowTestCodes: this.cfg.allowTestCodes,
+      ignoreTestCodes: this.cfg.ignoreTestCodes,
+      canonicalCode: this.cfg.protocol === 'astm' ? assayKey(this.cfg.astm.dialect) : undefined,
+    });
+  }
+
+  /** The stored orders, newest first, each HMIS row marked sync / no-sync. */
+  ordersView(limit = 50): OrderView[] {
+    const cfg = {
+      allowTestCodes: this.cfg.allowTestCodes,
+      ignoreTestCodes: this.cfg.ignoreTestCodes,
+      testCodeAliases: this.cfg.testCodeAliases,
+      excludeIdentifiers: this.cfg.excludeIdentifiers,
+      excludeParameterIds: this.cfg.excludeParameterIds,
+      canonicalCode: this.cfg.protocol === 'astm' ? assayKey(this.cfg.astm.dialect) : undefined,
+    };
+    return this.orders
+      .list()
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, limit)
+      .map((o) => {
+        const downloaded = new Set(o.downloaded.map((d) => d.trim().toUpperCase()));
+        const rows = o.rows.map((r) => ({
+          identifier: r.identifier,
+          parameterId: r.parameterId ?? null,
+          labResultId: r.labResultId ?? null,
+          sync: willSyncIdentifier(r.identifier, cfg, r.parameterId),
+          downloaded: downloaded.has((r.identifier ?? '').trim().toUpperCase()),
+        }));
+        return {
+          barcode: o.barcode,
+          sampleId: o.sampleId,
+          firstSeenAt: o.firstSeenAt,
+          updatedAt: o.updatedAt,
+          source: o.source,
+          rows,
+          syncCount: rows.filter((r) => r.sync).length,
+          noSyncCount: rows.filter((r) => !r.sync).length,
+        };
+      });
+  }
+
   stagedSummaries(): StagedSummary[] | null {
     return this.staged?.summaries() ?? null;
   }
@@ -585,6 +705,64 @@ export class AnalyzerRuntime {
     const ok = this.staged?.remove(normalizeBarcode(barcode)) ?? false;
     if (ok) this.log.warn({ barcode: normalizeBarcode(barcode) }, 'staged sample removed by an operator');
     return ok;
+  }
+
+  /**
+   * Operator "Force": push EVERY interfaced value of a staged sample to the
+   * HMIS results endpoint now, filed or not, without asking HMIS for the
+   * sample's pending rows. The parameter ids come from the order rows already
+   * cached for the barcode and, for anything those do not cover, from the
+   * parameter catalogue (the way fillMissingOrderRows rebuilds a withdrawn
+   * row) — so a value HMIS has stopped offering a row for can still be filed
+   * against the parameter it belongs to. Values that resolve to nothing are
+   * reported back, not guessed. The rows sent are acknowledged afterwards, as
+   * a normal filing is. Returns null for an unknown barcode.
+   */
+  async stagedForce(barcode: string): Promise<ForceReport | null> {
+    if (!this.staged) return null;
+    const s = this.staged.get(normalizeBarcode(barcode));
+    if (!s) return null;
+    const upload = this.staged.forceUpload(s, `${s.barcode}-force-${Date.now()}`);
+    const cached = this.orders.get(s.barcode)?.rows ?? [];
+    const joined = this.joinRows(upload, cached, { force: true });
+    const report: ForceReport = {
+      barcode: s.barcode,
+      values: upload.results.length,
+      sent: joined.rows.length,
+      accepted: 0,
+      message: '',
+      unresolved: joined.unmatched,
+      // rows and filedCodes are built in lockstep by the mapper: index i of
+      // each is the same value.
+      rows: joined.rows.map((r, i) => ({
+        testCode: joined.filedCodes[i]?.testCode ?? r.identifier,
+        identifier: r.identifier,
+        parameterId: r.parameterId,
+        value: r.resultValue,
+      })),
+    };
+    this.log.warn(
+      { barcode: s.barcode, values: report.values, sending: report.sent, unresolved: joined.unmatched, cachedRows: cached.length },
+      'FORCE push to HMIS from the admin console — pending rows NOT checked; ids from the cached order rows and the parameter catalogue',
+    );
+    if (joined.rows.length === 0) {
+      report.message = 'nothing could be mapped to an HMIS parameter from the cached order rows or the catalogue';
+      return report;
+    }
+    const res = await this.hmis.postResults(joined.rows, this.cfg.equipmentCode);
+    report.accepted = res.filed;
+    report.message = res.message;
+    this.staged.markFiled(s.barcode, joined.filedCodes);
+    try {
+      await this.hmis.acknowledge(joined.matched);
+    } catch (err) {
+      this.log.error(
+        { barcode: s.barcode, err: err instanceof Error ? err.message : String(err) },
+        'acknowledge failed AFTER a forced push — results are filed, rows may still show pending',
+      );
+    }
+    this.log.warn({ barcode: s.barcode, accepted: res.filed, sent: joined.rows.length, message: res.message }, 'FORCE push: HMIS answered');
+    return report;
   }
 
   /**
@@ -619,7 +797,7 @@ export class AnalyzerRuntime {
    *  unit scaling, and the dialect's canonical assay key — HMIS spells a
    *  VITROS identifier as the full "1.000000+032+1" where the codec reports
    *  "032", so the two meet on the canonical form. */
-  private joinRows(payload: HmisResultUpload, orderRows: MirthAcknowledgeItem[]) {
+  private joinRows(payload: HmisResultUpload, orderRows: MirthAcknowledgeItem[], opts: { force?: boolean } = {}) {
     const canonical = this.cfg.protocol === 'astm' ? assayKey(this.cfg.astm.dialect) : undefined;
     const join = (rows: MirthAcknowledgeItem[]) =>
       toLisResultRows(
@@ -630,10 +808,22 @@ export class AnalyzerRuntime {
         this.cfg.ignoreTestCodes,
         this.cfg.testCodeScale,
         this.cfg.allowTestCodes,
+        this.cfg.excludeIdentifiers,
+        this.cfg.excludeParameterIds,
       );
 
     const joined = join(orderRows);
-    if (!this.cfg.fillMissingOrderRows || joined.unmatched.length === 0) return joined;
+    if (joined.ambiguous.length) {
+      // Loud on purpose: values are being held back because the HMIS master
+      // offers the same identifier on more than one parameter for this sample.
+      this.log.warn(
+        { barcode: payload.barcode, ambiguous: joined.ambiguous },
+        'HMIS names several parameters the same — these values are NOT filed until the master is unambiguous (or the wrong row is listed in excludeParameterIds)',
+      );
+    }
+    // A forced push always tries the catalogue: the whole point of it is a
+    // row HMIS is no longer offering.
+    if ((!this.cfg.fillMissingOrderRows && !opts.force) || joined.unmatched.length === 0) return joined;
 
     // Every value here is one HMIS is not currently offering a row for. If the
     // catalogue has seen the parameter on this service before, the row can be
@@ -649,7 +839,9 @@ export class AnalyzerRuntime {
       if (alias) candidates.push(alias);
     }
 
-    const { rows: rebuilt, unknown } = this.parameters.synthesize(orderRows, candidates, canonical);
+    const { rows: rebuilt, unknown } = this.parameters.synthesize(orderRows, candidates, canonical, {
+      excludeParameterIds: this.cfg.excludeParameterIds,
+    });
     if (rebuilt.length === 0) return joined;
 
     const filled = join([...orderRows, ...rebuilt]);
@@ -703,13 +895,29 @@ export class AnalyzerRuntime {
         );
       }
       const uploads = toResultUploads(this.cfg, msg);
-      for (const u of uploads) {
+      for (const full of uploads) {
         // A control run has no order row in HMIS. Filing it would query pending
         // for a barcode the gateway has never heard of, find nothing, and retry
         // the upload for as long as the spool allows — which is exactly what
         // sample 89772 did. The legacy app dropped these at the same point.
-        if (u.isQc && !this.cfg.qc.upload) {
-          this.log.info({ barcode: u.barcode, count: u.results.length }, 'QC/control run — not sent to HMIS');
+        if (full.isQc && !this.cfg.qc.upload) {
+          this.log.info({ barcode: full.barcode, count: full.results.length }, 'QC/control run — not sent to HMIS');
+          continue;
+        }
+
+        // Only the parameters the interface is scoped to go any further. The
+        // instrument's other channels (a BC-5150 sends 60 numeric values, 22
+        // interfaced) are dropped here — not stored, not counted, not waited
+        // for — so the console shows "x of 22", not "x of 60".
+        const { upload: u, dropped } = keepInterfacedResults(full, this.codeFilter);
+        if (dropped.length) {
+          this.log.debug({ barcode: u.barcode, dropped }, 'codes not interfaced to HMIS dropped at intake — not stored');
+        }
+        if (u.results.length === 0) {
+          this.log.info(
+            { barcode: u.barcode, received: full.results.length },
+            'message carried no interfaced parameter — nothing to file',
+          );
           continue;
         }
         if (this.staged && this.filer) {
@@ -803,7 +1011,7 @@ export class AnalyzerRuntime {
       );
     }
     const merged = mergePending(parts);
-    this.parameters.learn(merged.ackItems);
+    this.parameters.learn(merged.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
     return merged;
   }
 

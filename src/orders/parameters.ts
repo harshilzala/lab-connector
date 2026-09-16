@@ -111,41 +111,73 @@ export class ParameterCatalogue {
    * a row is the exact situation this exists for, so a shrinking pending list
    * must not shrink the catalogue with it.
    */
-  learn(rows: MirthAcknowledgeItem[]): number {
+  learn(rows: MirthAcknowledgeItem[], opts: { excludeParameterIds?: readonly number[] } = {}): number {
     if (rows.length === 0) return 0;
+    const excluded = new Set(opts.excludeParameterIds ?? []);
     const cat = this.read();
     const now = new Date().toISOString();
     let learned = 0;
 
+    // First pass: what this reply says per (service, identifier). An identifier
+    // that HMIS offers on TWO parameters in the same reply (ZHPN001 after the
+    // 2026-09-12 rename: "WBC" on the count 2123 AND the smear row 2166) is
+    // not a re-key, it is an ambiguity — the catalogue must not pick one, and
+    // must not flip between them on every poll as the old code did (thousands
+    // of "re-keyed" warnings on 2026-09-16). Rows the analyzer is configured
+    // never to file into are left out before this is judged, which is what
+    // resolves the ZHPN001 case.
+    const seen = new Map<string, Map<string, { pid: number; identifier: string; resultType: string | null; svc: number }>>();
     for (const row of rows) {
       if (row.synthesized) continue; // never learn from our own reconstruction
       const svc = row.labServiceId;
       const pid = row.parameterId;
       const key = codeKey(row.identifier);
       if (svc === null || pid === null || !key) continue;
-
+      if (excluded.has(Number(pid))) continue;
       const svcKey = String(svc);
+      const perSvc = seen.get(svcKey) ?? new Map();
+      seen.set(svcKey, perSvc);
+      const prev = perSvc.get(key);
+      if (prev && prev.pid !== pid) {
+        perSvc.set(key, { ...prev, pid: NaN }); // NaN marks "ambiguous in this reply"
+        continue;
+      }
+      if (!prev) perSvc.set(key, { pid: Number(pid), identifier: row.identifier, resultType: row.resultType ?? null, svc });
+    }
+
+    for (const [svcKey, perSvc] of seen) {
       let entry = cat.services[svcKey];
       if (!entry) {
         entry = { resultType: null, parameters: {}, updatedAt: now };
         cat.services[svcKey] = entry;
       }
-      if (row.resultType) entry.resultType = row.resultType;
-
-      const have = entry.parameters[key];
-      if (have && have.parameterId === pid && have.identifier === row.identifier) continue;
-      if (have && have.parameterId !== pid) {
-        // Never seen live — 164 pairs, no conflicts — but if HMIS ever re-keys
-        // a parameter, the newest reply is authoritative and the change is
-        // worth seeing in the log, because it moves where a value lands.
-        this.logger.warn(
-          { labServiceId: svc, identifier: row.identifier, was: have.parameterId, now: pid },
-          'HMIS re-keyed a parameter — the catalogue now points at the new parameterId',
-        );
+      for (const [key, info] of perSvc) {
+        if (info.resultType) entry.resultType = info.resultType;
+        if (Number.isNaN(info.pid)) {
+          // Ambiguous: forget what we had so no row is rebuilt from a guess,
+          // and say so once per process rather than once per poll.
+          if (entry.parameters[key]) {
+            delete entry.parameters[key];
+            entry.updatedAt = now;
+            learned++;
+          }
+          this.warnOnce(`ambiguous:${svcKey}:${key}`, { labServiceId: info.svc, identifier: info.identifier },
+            'HMIS offers this identifier on more than one parameter — not catalogued; fix the HMIS master or list the wrong parameterId in excludeParameterIds');
+          continue;
+        }
+        const have = entry.parameters[key];
+        if (have && have.parameterId === info.pid && have.identifier === info.identifier) continue;
+        if (have && have.parameterId !== info.pid) {
+          // A genuine re-key: the newest reply is authoritative and the change
+          // is worth seeing, because it moves where a value lands — once.
+          this.warnOnce(`rekey:${svcKey}:${key}:${have.parameterId}>${info.pid}`,
+            { labServiceId: info.svc, identifier: info.identifier, was: have.parameterId, now: info.pid },
+            'HMIS re-keyed a parameter — the catalogue now points at the new parameterId');
+        }
+        entry.parameters[key] = { parameterId: info.pid, identifier: info.identifier };
+        entry.updatedAt = now;
+        learned++;
       }
-      entry.parameters[key] = { parameterId: pid, identifier: row.identifier };
-      entry.updatedAt = now;
-      learned++;
     }
 
     if (learned > 0) {
@@ -164,11 +196,23 @@ export class ParameterCatalogue {
    * whose codec reports "032" against an HMIS `eqIdntifier` of "1.000000+032+1"
    * still matches.
    */
+  /** Warnings that describe a standing condition are logged once per process,
+   *  not once per poll — the condition is visible in the log, and the log
+   *  stays readable. */
+  private readonly warned = new Set<string>();
+  private warnOnce(key: string, ctx: Record<string, unknown>, msg: string): void {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    this.logger.warn(ctx, msg);
+  }
+
   synthesize(
     known: MirthAcknowledgeItem[],
     wanted: string[],
     canonical: (identifier: string) => string = (id) => id,
+    opts: { excludeParameterIds?: readonly number[] } = {},
   ): SynthesisResult {
+    const excluded = new Set(opts.excludeParameterIds ?? []);
     const out: SynthesisResult = { rows: [], unknown: [] };
     if (wanted.length === 0) return out;
     if (known.length === 0) {
@@ -211,6 +255,9 @@ export class ParameterCatalogue {
       for (const [svcKey, template] of templates) {
         const param = cat.services[svcKey]?.parameters[k];
         if (!param) continue;
+        // A row the analyzer may never file into is never rebuilt either — the
+        // join would refuse it anyway, but the catalogue must not offer it.
+        if (excluded.has(param.parameterId)) continue;
         // Two services on one sample must never file against the same parameter
         // twice, and a parameter already covered by a real row is never rebuilt.
         if (haveParameterIds.has(param.parameterId)) continue;

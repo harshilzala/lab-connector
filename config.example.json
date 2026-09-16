@@ -46,6 +46,18 @@
     "authFile": "./admin-auth.json"
   },
 
+  // The console's "Force" button (Results tab, shown on a sample once HMIS has
+  // taken at least one of its values): pushes EVERY value of that sample to the
+  // HMIS results endpoint again, WITHOUT asking HMIS for its pending rows —
+  // ids come from the order rows already cached for the barcode and the
+  // parameter catalogue. For the day HMIS withdraws a sample's rows before the
+  // interface has filed them (PL2609120001, 2026-09-12). It writes patient
+  // results past the normal check, so it asks for this password every time
+  // and is logged on every use. Empty = the button is not shown.
+  "Force_Hmis": {
+    "password": ""
+  },
+
   "analyzers": [
     {
       // ---------------------------------------------------------------------

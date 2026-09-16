@@ -39,6 +39,7 @@ console.log(`Barcode:   ${barcode}${lookup === barcode ? '' : ` → looked up as
 
 const client = new HmisClient({
   baseUrl: cfg.hmis.baseUrl,
+  siteId: cfg.hmis.siteId,
   pendingPath: cfg.hmis.pendingPath,
   acknowledgePath: cfg.hmis.acknowledgePath,
   resultsPath: cfg.hmis.resultsPath,

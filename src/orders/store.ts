@@ -82,6 +82,16 @@ export class OrderStore {
     return this.read(key);
   }
 
+  /** Every stored order. Reads the directory — for the console, not the poll loop. */
+  list(): StoredOrder[] {
+    const out: StoredOrder[] = [];
+    for (const file of this.listFiles()) {
+      const o = this.read(file.replace(/\.json$/, ''));
+      if (o) out.push(o);
+    }
+    return out;
+  }
+
   /**
    * Merge freshly fetched pending rows into the stored order for a barcode.
    *

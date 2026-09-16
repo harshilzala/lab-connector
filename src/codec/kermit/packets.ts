@@ -234,4 +234,10 @@ export class KermitDecoder {
   reset(): void {
     this.buf = '';
   }
+
+  /** Bytes held back as the possible start of a packet (an SOH seen, the rest
+   *  not yet arrived). Zero after a push means the chunk yielded nothing. */
+  get buffered(): number {
+    return this.buf.length;
+  }
 }

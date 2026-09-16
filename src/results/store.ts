@@ -93,6 +93,24 @@ export interface StagedSummary {
   dropped: number;
   waitingCodes: string[];
   complete: boolean;
+  /** The interfaced parameters of this sample, in the order received — what
+   *  the console lists under the barcode. Values the interface is not scoped
+   *  to (dropped as "ignored") are left out; a void placeholder is shown so
+   *  the lab can see the analyzer withheld that value. */
+  values: StagedValueView[];
+}
+
+export interface StagedValueView {
+  testCode: string;
+  value: string;
+  unit: string | null;
+  abnormalFlag: string | null;
+  /** "filed" — accepted by HMIS; "waiting" — no order row yet; "void" — the
+   *  analyzer sent a placeholder instead of a number. */
+  state: 'filed' | 'waiting' | 'void';
+  filedAt: string | null;
+  /** The HMIS identifier it was filed against, once filed. */
+  identifier: string | null;
 }
 
 export interface UpsertResult {
@@ -108,7 +126,10 @@ function isWaiting(v: StagedValue): boolean {
 }
 
 export function summarize(s: StagedSample): StagedSummary {
-  const values = Object.values(s.values);
+  // Channels the interface is not scoped to are not part of the sample: they
+  // are filtered before intake now, and a sample stored before that filter
+  // existed still shows as "x of 22", not "x of 60".
+  const values = Object.values(s.values).filter((v) => v.dropped !== 'ignored');
   const waiting = values.filter(isWaiting);
   const filed = values.filter((v) => v.filedAt !== null).length;
   const dropped = values.filter((v) => v.dropped !== null).length;
@@ -128,6 +149,17 @@ export function summarize(s: StagedSample): StagedSummary {
     dropped,
     waitingCodes: waiting.map((v) => v.testCode),
     complete: waiting.length === 0,
+    values: values
+      .filter((v) => v.dropped !== 'ignored')
+      .map((v) => ({
+        testCode: v.testCode,
+        value: v.value,
+        unit: v.unit,
+        abnormalFlag: v.abnormalFlag,
+        state: v.filedAt !== null ? 'filed' : v.dropped === 'void' ? 'void' : 'waiting',
+        filedAt: v.filedAt,
+        identifier: v.identifier,
+      })),
   };
 }
 
@@ -159,6 +191,16 @@ export class ResultStore {
       raw: null,
     };
 
+    // Values a previous build stored for channels outside the interface are
+    // dead weight: forget them on the first re-transmit or rerun.
+    let pruned = 0;
+    for (const [code, v] of Object.entries(sample.values)) {
+      if (v.dropped === 'ignored') {
+        delete sample.values[code];
+        pruned += 1;
+      }
+    }
+
     const changed: string[] = [];
     const unchanged: string[] = [];
     for (const r of upload.results) {
@@ -186,7 +228,7 @@ export class ResultStore {
       changed.push(r.testCode);
     }
 
-    if (changed.length || !existing) {
+    if (changed.length || pruned || !existing) {
       sample.updatedAt = receivedAt;
       sample.raw = upload.raw ?? sample.raw;
       // A new value re-opens the sample: the last error described a state
@@ -234,8 +276,18 @@ export class ResultStore {
 
   /** The values still to be filed, in the shape the join wants. */
   pendingUpload(sample: StagedSample, messageId: string): HmisResultUpload {
+    return this.uploadOf(sample, messageId, isWaiting);
+  }
+
+  /** Every interfaced value the sample holds, filed or not — what the console's
+   *  "Force" push sends. Void placeholders and non-interfaced codes stay out. */
+  forceUpload(sample: StagedSample, messageId: string): HmisResultUpload {
+    return this.uploadOf(sample, messageId, (v) => v.dropped === null);
+  }
+
+  private uploadOf(sample: StagedSample, messageId: string, pick: (v: StagedValue) => boolean): HmisResultUpload {
     const results = Object.values(sample.values)
-      .filter(isWaiting)
+      .filter(pick)
       .map((v) => ({
         testCode: v.testCode,
         value: v.value,
