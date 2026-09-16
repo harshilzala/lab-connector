@@ -31,9 +31,11 @@
        clean stop, so it is NOT restarted as a crash) and sets its start type
        to Manual so a reboot does not bring it back while it is meant to be
        down. Lab-Interface.bat restores Automatic (delayed) start.
-       Stopping a LocalSystem service needs administrator rights, so the
-       script relaunches itself elevated (one UAC prompt) when the service is
-       installed and the current session is not elevated.
+       Windows lets only administrators stop a service by default.
+       service\grant-user-control.ps1 (run once, elevated) gives BUILTIN\Users
+       start/stop/config rights on this one service; after that this script
+       runs entirely unelevated. Only when the account still lacks those
+       rights does it relaunch itself elevated (one UAC prompt).
     4. Stops the PM2 apps if PM2 has them (SIGTERM, kill_timeout 8s to flush),
        under the current name and the retired "GENEX-Interface" / "lab-connector";
        pm2 save, so a logon does not resurrect it.
@@ -88,6 +90,33 @@ function Test-Elevated {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Can THIS account start, stop and reconfigure the service without elevation?
+#
+# service\grant-user-control.ps1 adds an allow-ACE for BUILTIN\Users to the
+# service's security descriptor. Reading that descriptor back (sc sdshow) needs
+# nothing special, so look for an allow-ACE granting start (RP), stop (WP) and
+# change-config (DC) to a SID this token carries. Administrators have their own
+# ACE and an elevated session always qualifies.
+function Test-ServiceControlRights {
+  if (Test-Elevated) { return $true }
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $sddl = (& sc.exe sdshow $serviceName 2>&1 | Out-String) } finally { $ErrorActionPreference = $previous }
+  if (-not $sddl) { return $false }
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $mine = @($identity.User.Value) + @($identity.Groups | ForEach-Object { $_.Value })
+  $wellKnown = @{ BU = 'S-1-5-32-545'; BA = 'S-1-5-32-544'; AU = 'S-1-5-11'; IU = 'S-1-5-4'; WD = 'S-1-1-0'; SY = 'S-1-5-18'; SU = 'S-1-5-6' }
+  foreach ($m in [regex]::Matches($sddl, '\(A;[^;]*;([A-Z]+);;;([^)]+)\)')) {
+    $rights = $m.Groups[1].Value
+    $sid = $m.Groups[2].Value
+    if ($wellKnown.ContainsKey($sid)) { $sid = $wellKnown[$sid] }
+    if ($mine -notcontains $sid) { continue }
+    $pairs = @(); for ($i = 0; $i + 1 -lt $rights.Length; $i += 2) { $pairs += $rights.Substring($i, 2) }
+    if (($pairs -contains 'RP') -and ($pairs -contains 'WP') -and ($pairs -contains 'DC')) { return $true }
+  }
+  return $false
 }
 
 # Run a console tool with its chatter suppressed, and report only its exit code.
@@ -263,11 +292,8 @@ function Stop-ConnectorService {
   if ($svc.Status -eq 'Stopped') {
     Write-Step "[3/6] service: $serviceName is already stopped."
   } else {
-    if (-not (Test-Elevated)) {
-      Write-Step "[3/6] service: $serviceName is $($svc.Status) and this session is not elevated - it CANNOT be stopped from here."
-      Write-Step '       Run Lab-Interface-force-stop.bat again and accept the administrator prompt.'
-      return $false
-    }
+    # Just try. With the BUILTIN\Users grant in place this works unelevated;
+    # without it the SCM answers "access denied" and we say what to do.
     Write-Step "[3/6] service: stopping $serviceName (clean SCM stop - it will not be restarted as a crash)..."
     try {
       Stop-Service -Name $serviceName -Force -ErrorAction Stop
@@ -275,6 +301,10 @@ function Stop-ConnectorService {
       Write-Step "[3/6] service: $serviceName stopped."
     } catch {
       Write-Step ("[3/6] service: stop FAILED - {0}" -f $_.Exception.Message.Trim())
+      if (-not (Test-Elevated)) {
+        Write-Step '       This account has no stop rights on the service. Run service\grant-user-control.ps1 once'
+        Write-Step '       (as administrator) and this never needs elevation again - or accept the administrator prompt.'
+      }
       return $false
     }
   }
@@ -284,13 +314,23 @@ function Stop-ConnectorService {
     return $true
   }
 
-  if (-not (Test-Elevated)) {
-    Write-Step '[3/6] service: not elevated, so the start type stays Automatic - a reboot WILL start it again.'
+  # Already Manual (DEMAND_START)? Then there is nothing to change, and no
+  # point reporting a rights problem on a no-op. Reading the start type needs
+  # no rights at all.
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $qc = (& sc.exe qc $serviceName 2>&1 | Out-String) } finally { $ErrorActionPreference = $previous }
+  if ($qc -match 'START_TYPE\s*:\s*3\s+DEMAND_START') {
+    Write-Step '[3/6] service: start type is already Manual - a reboot will not bring it back.'
     return $true
   }
+
   $rc = Invoke-Quiet sc.exe config $serviceName start= demand
   if ($rc -eq 0) {
     Write-Step '[3/6] service: start type set to Manual - a reboot will not bring it back. Lab-Interface.bat restores Automatic.'
+  } elseif ($rc -eq 5 -and -not (Test-Elevated)) {
+    Write-Step '[3/6] service: no rights to change the start type, so it stays Automatic - a reboot WILL start it again.'
+    Write-Step '       An administrator can set it to Manual once: sc config LAB-Interface start= demand'
   } else {
     Write-Step ("[3/6] service: could not change the start type (sc.exe exit {0}) - a reboot may start it again." -f $rc)
   }
@@ -298,15 +338,18 @@ function Stop-ConnectorService {
 }
 
 # ---- elevation --------------------------------------------------------------
-# Only the service needs administrator rights. If it is installed and running
-# and we are not elevated, hand the whole job to an elevated copy of this
+# Only the service can need administrator rights, and only on a machine where
+# service\grant-user-control.ps1 has not been run. If it is installed and this
+# account cannot control it, hand the whole job to an elevated copy of this
 # script - one UAC prompt, and everything (flag, watchdog, service, sweep)
-# happens in that window.
+# happens in that window. With the grant in place this block is skipped and
+# the script runs as the operator, start to finish.
 $serviceInstalled = [bool] (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
-if ($serviceInstalled -and -not $NoElevate -and -not $Elevated -and -not (Test-Elevated)) {
+if ($serviceInstalled -and -not $NoElevate -and -not $Elevated -and -not (Test-ServiceControlRights)) {
   Write-Host ''
-  Write-Host "  $serviceName is installed as a Windows service. Stopping it needs administrator rights -"
+  Write-Host "  $serviceName is installed as a Windows service and this account has no stop rights on it -"
   Write-Host '  relaunching this script elevated (accept the prompt; a second window opens).'
+  Write-Host '  To never see this again, run service\grant-user-control.ps1 once as administrator.'
   Write-Host ''
   $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath),
                '-GraceSeconds', $GraceSeconds, '-Elevated')
@@ -408,7 +451,7 @@ if ($left.Count -eq 0 -and -not $serviceStillUp -and $watchdogFailed.Count -eq 0
   } else {
     Write-Host '  Lab-Interface is stopped and will STAY stopped'
     Write-Host '  (service stopped + Manual, watchdog disabled, flag raised).'
-    Write-Host '  Start it again with Lab-Interface.bat'
+    Write-Host '  Start it again with magic\magic-start.bat (PM2) or Lab-Interface.bat (service).'
   }
   Write-Host ' =========================================================='
   Write-Host ''

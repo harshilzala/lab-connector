@@ -52,18 +52,15 @@ if not exist "ecosystem.config.cjs" goto no_ecosystem
 if not exist "config.json" goto no_config
 
 rem ---------------------------------------------------------------------------
-rem  Service mode. Some sites run the connector as the "LAB-Interface" Windows
-rem  service (service\, WinSW) so it is up at the login screen with nobody
-rem  signed in. A PM2 copy beside it would fight for the analyzer and dashboard
-rem  ports and crash-loop on EADDRINUSE, so hand over to the service instead -
-rem  the same guard Lab-Interface.bat has.
-rem
-rem  resume-service.ps1 is what undoes a force stop: it clears the maintenance
-rem  flag, re-enables the watchdog tasks and puts the service back to Automatic
-rem  (delayed) before starting it. It elevates itself once for that.
+rem  One copy only. The LAB-Interface Windows service may still be installed on
+rem  this PC (left stopped, start type Manual - the operator account cannot
+rem  start it and does not need to). It is only a problem if an administrator
+rem  has it RUNNING right now: a PM2 copy beside it would fight for the analyzer
+rem  and dashboard ports and crash-loop on EADDRINUSE. Refuse in that one case;
+rem  an installed-but-stopped service is ignored and PM2 runs as the operator.
 rem ---------------------------------------------------------------------------
-sc query LAB-Interface >nul 2>&1
-if not errorlevel 1 goto service_mode
+sc query LAB-Interface 2>nul | "%SystemRoot%\System32\find.exe" "RUNNING" >nul 2>&1
+if not errorlevel 1 goto service_running
 
 rem ---------------------------------------------------------------------------
 rem  Clear the maintenance flag. magic-stop.bat and Lab-Interface-stop.bat both
@@ -76,19 +73,19 @@ if exist ".lab-maintenance" del ".lab-maintenance" >nul 2>&1
 rem ---- build ----------------------------------------------------------------
 if /I "%~1"=="/build" goto build
 if not exist "dist\index.js" goto build
-echo  [1/3] using the existing build in dist\
+echo  [1/4] using the existing build in dist\
 echo        run  magic-start.bat /build  to recompile first
 goto start_app
 
 :build
-echo  [1/3] building...
+echo  [1/4] building...
 if not exist "node_modules\typescript\package.json" call npm install
 call npm run build
 if errorlevel 1 goto build_failed
 if not exist "logs" mkdir "logs"
 
 :start_app
-echo  [2/3] starting under PM2 as Lab-Interface...
+echo  [2/4] starting under PM2 as Lab-Interface...
 call pm2 describe Lab-Interface >nul 2>&1
 if errorlevel 1 goto fresh_start
 call pm2 restart ecosystem.config.cjs --update-env
@@ -102,8 +99,18 @@ if errorlevel 1 goto pm2_failed
 :save
 rem `pm2 save` writes the dump that `pm2 resurrect` reads at logon. Without it
 rem the startup entry would come up and find nothing to bring back.
-echo  [3/3] saving the PM2 process list...
+echo  [3/4] saving the PM2 process list...
 call pm2 save >nul 2>&1
+
+rem ---------------------------------------------------------------------------
+rem  Logon entry + 5-minute watchdog, every start. magic-add-to-startup.bat
+rem  does the work (/quiet: no banner, no pause). Re-running it is what brings
+rem  the watchdog task back after magic-force-stop.bat disabled it - the task
+rem  is re-created with /F, which also re-enables it. Everything it registers
+rem  is per-operator and needs no administrator rights.
+rem ---------------------------------------------------------------------------
+echo  [4/4] registering the logon entry and the 5-minute watchdog...
+if exist "%~dp0magic-add-to-startup.bat" call "%~dp0magic-add-to-startup.bat" /quiet
 
 echo.
 call pm2 list
@@ -113,8 +120,9 @@ echo   Lab-Interface is running.
 echo.
 echo   Dashboard : http://127.0.0.1:7071
 echo   Live logs : pm2 logs Lab-Interface
-echo   Stop      : magic-stop.bat
-echo   At logon  : magic-add-to-startup.bat
+echo   Stop      : magic-stop.bat  (everything: magic-force-stop.bat)
+echo   Comes back after a crash, a logoff/logon and a reboot
+echo   (once an operator signs in); checked every 5 minutes.
 echo  ==========================================================
 echo.
 pause
@@ -136,29 +144,20 @@ pause
 exit /b 1
 
 rem ---------------------------------------------------------------------------
-:service_mode
-echo  Lab-Interface is installed as a Windows service here - not starting it
-echo  under PM2 (two copies would fight for the same ports).
+:service_running
+echo  The LAB-Interface Windows service is RUNNING right now, so the connector
+echo  is already up - not starting a second copy under PM2 (two copies would
+echo  fight for the same ports).
 echo.
-echo   Status   : sc query LAB-Interface
-echo   Logs     : logs\LAB-Interface-service.out.log
 echo   Dashboard: http://127.0.0.1:7071
+echo   Logs     : logs\LAB-Interface-service.out.log
 echo.
-if not exist "%~dp0..\service\resume-service.ps1" goto service_status_only
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\service\resume-service.ps1"
-set "RC=%ERRORLEVEL%"
-pause
-exit /b %RC%
-
-:service_status_only
-echo  NOTE: service\resume-service.ps1 is missing, so this script can only
-echo        report the service state. Start it by hand (as administrator):
-echo        sc.exe start LAB-Interface
-echo.
-sc query LAB-Interface | findstr STATE
+echo  The operator account cannot stop or start that service; only an
+echo  administrator can (sc stop LAB-Interface). Once it is stopped, run this
+echo  script again and the connector runs under PM2 as the operator.
 echo.
 pause
-exit /b 0
+exit /b 1
 
 rem ---------------------------------------------------------------------------
 :no_pm2

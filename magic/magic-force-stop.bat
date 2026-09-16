@@ -30,17 +30,18 @@ rem
 rem  It raises the same .lab-maintenance flag magic-stop.bat uses, so nothing
 rem  restarts it behind your back.
 rem
-rem  Stopping the service needs administrator rights, so Windows will ask once
-rem  and a second window will open. Everything happens in that window. If you
-rem  cancel the prompt, nothing is stopped - say yes, or run magic-stop.bat
-rem  instead for the PM2-only stop.
+rem  It never asks for administrator rights. Everything the operator account
+rem  owns - the PM2 app, the watchdog task, the logon entry's worker, a stray
+rem  "npm run dev" - is stopped as the operator. The one thing a standard user
+rem  cannot touch is the LAB-Interface Windows service: it is normally left
+rem  stopped (start type Manual) on this PC, and if an administrator has it
+rem  running, this script says so and leaves it to them.
 rem
 rem  Results already in the spool stay on disk and are delivered when the
 rem  connector next starts - stopping never loses a result.
 rem
-rem  Start it again with magic-start.bat (PM2), or, on a machine where the
-rem  service is installed, Lab-Interface.bat in the folder above - that one
-rem  restores the service's Automatic start and re-enables the watchdog.
+rem  Start it again with magic-start.bat - it clears the flag, starts PM2 and
+rem  re-registers the logon entry and the watchdog.
 rem ===========================================================================
 setlocal
 title magic-force-stop
@@ -59,7 +60,8 @@ rem ---------------------------------------------------------------------------
 set "ENGINE=%ROOT%\Lab-Interface-force-stop.ps1"
 if not exist "%ENGINE%" goto no_engine
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ENGINE%"
+rem -NoElevate: run as the operator, start to finish. Never a UAC prompt.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ENGINE%" -NoElevate
 set "RC=%ERRORLEVEL%"
 
 echo.
@@ -76,12 +78,11 @@ exit /b 0
 rem ---------------------------------------------------------------------------
 :trouble
 echo  ==========================================================
-echo   Something survived the stop - read the messages above
-echo   (or in the administrator window, if one opened).
+echo   Something survived the stop - read the messages above.
 echo.
-echo   Most common cause: the administrator prompt was cancelled,
-echo   so the LAB-Interface Windows service is still running.
-echo   Run this script again and accept the prompt.
+echo   Most common cause: an administrator started the LAB-Interface
+echo   Windows service, which a standard user cannot stop. Ask an
+echo   administrator to run:  sc stop LAB-Interface
 echo  ==========================================================
 echo.
 pause
