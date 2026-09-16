@@ -14,8 +14,16 @@
   what Lab-Interface.bat and magic\magic-start.bat call when they find the
   connector installed as a Windows service.
 
-  Setting a service's start type and starting it need administrator rights, so
-  this relaunches itself elevated (one UAC prompt) when it is not already.
+  Windows lets only administrators start a service or change its start type by
+  default. service\grant-user-control.ps1 (run once, elevated) gives
+  BUILTIN\Users those rights on this one service, and from then on this script
+  runs as the operator with no prompt. Only when the account still lacks the
+  rights does it relaunch itself elevated (one UAC prompt).
+
+  It refuses to start the service while another copy of the connector already
+  holds the admin dashboard port (an "npm run dev" from a terminal, or a PM2
+  copy): two connectors would fight over the analyzer ports and both post to
+  HMIS. Stop that copy first, then run this again.
 
   Exit code 0 = the service is running. 1 = it is not (the message says why).
 #>
@@ -63,6 +71,47 @@ function Invoke-Quiet {
   }
 }
 
+# Can THIS account start, stop and reconfigure the service without elevation?
+# Same probe as Lab-Interface-force-stop.ps1: read the service's security
+# descriptor and look for an allow-ACE granting RP (start), WP (stop) and DC
+# (change config) to a SID this token carries.
+function Test-ServiceControlRights {
+  if (Test-Elevated) { return $true }
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $sddl = (& sc.exe sdshow $serviceName 2>&1 | Out-String) } finally { $ErrorActionPreference = $previous }
+  if (-not $sddl) { return $false }
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $mine = @($identity.User.Value) + @($identity.Groups | ForEach-Object { $_.Value })
+  $wellKnown = @{ BU = 'S-1-5-32-545'; BA = 'S-1-5-32-544'; AU = 'S-1-5-11'; IU = 'S-1-5-4'; WD = 'S-1-1-0'; SY = 'S-1-5-18'; SU = 'S-1-5-6' }
+  foreach ($m in [regex]::Matches($sddl, '\(A;[^;]*;([A-Z]+);;;([^)]+)\)')) {
+    $rights = $m.Groups[1].Value
+    $sid = $m.Groups[2].Value
+    if ($wellKnown.ContainsKey($sid)) { $sid = $wellKnown[$sid] }
+    if ($mine -notcontains $sid) { continue }
+    $pairs = @(); for ($i = 0; $i + 1 -lt $rights.Length; $i += 2) { $pairs += $rights.Substring($i, 2) }
+    if (($pairs -contains 'RP') -and ($pairs -contains 'WP') -and ($pairs -contains 'DC')) { return $true }
+  }
+  return $false
+}
+
+# The admin dashboard port is the one thing every copy of the connector binds,
+# which makes it the reliable "is something already running" test. config.json
+# is JSONC, so a comment-stripped parse is the fallback; 7071 the last resort.
+function Get-ConnectorPort {
+  $cfgPath = Join-Path $root 'config.json'
+  if (Test-Path -LiteralPath $cfgPath) {
+    $raw = Get-Content -LiteralPath $cfgPath -Raw
+    foreach ($text in @($raw, [regex]::Replace($raw, '(?m)(?<![:"\w])//.*$', ''))) {
+      try {
+        $cfg = $text | ConvertFrom-Json
+        if ($cfg.admin.port) { return [int] $cfg.admin.port }
+      } catch { }
+    }
+  }
+  return 7071
+}
+
 $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
 if (-not $svc) {
   Write-Host ''
@@ -72,10 +121,32 @@ if (-not $svc) {
   exit 1
 }
 
-if (-not $Elevated -and -not (Test-Elevated)) {
+# ---- 0. is another connector already holding the port? ---------------------
+# Checked BEFORE the flag and the watchdog are touched, so refusing here leaves
+# the machine exactly as it was.
+if ($svc.Status -ne 'Running') {
+  $port = Get-ConnectorPort
+  $listener = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($listener) {
+    $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
+    $what = if ($owner) { "PID $($owner.ProcessId) ($($owner.Name))" } else { "PID $($listener.OwningProcess)" }
+    $cmd = if ($owner -and $owner.CommandLine) { $owner.CommandLine } else { '(command line not visible)' }
+    Write-Host ''
+    Write-Step "another connector is already running and holding port ${port}: $what"
+    Write-Step "  $cmd"
+    Write-Step 'Not starting the service beside it - two copies would fight over the analyzer ports.'
+    Write-Step 'Stop that one first (Ctrl+C in its terminal, or magic\magic-force-stop.bat), then run this again.'
+    Write-Host ''
+    Write-Log "refused: port $port held by $what"
+    exit 1
+  }
+}
+
+if (-not $Elevated -and -not (Test-ServiceControlRights)) {
   Write-Host ''
-  Write-Host "  Starting the $serviceName service needs administrator rights -"
+  Write-Host "  This account has no start rights on the $serviceName service -"
   Write-Host '  relaunching elevated (accept the prompt; a second window opens).'
+  Write-Host '  To never see this again, run service\grant-user-control.ps1 once as administrator.'
   Write-Host ''
   try {
     $child = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ErrorAction Stop `
@@ -142,6 +213,8 @@ if ($tasks.Count -eq 0) {
 $rc = Invoke-Quiet sc.exe config $serviceName start= delayed-auto
 if ($rc -eq 0) {
   Write-Step '[3/3] service: start type restored to Automatic (delayed).'
+} elseif ($rc -eq 5) {
+  Write-Step '[3/3] service: no rights to change the start type - it stays as it is. service\grant-user-control.ps1 (once, as administrator) fixes that.'
 } else {
   Write-Step ("[3/3] service: could not restore the start type (sc.exe exit {0}) - set it by hand in services.msc." -f $rc)
 }
