@@ -199,6 +199,21 @@
         // "LYM%": "Lymphocytes"
       },
 
+      // Complete a short sample id keyed on the instrument into the site's
+      // full HMIS barcode (staged filing only). At Shela the H360 operators
+      // type "SF" + the last four digits, or just the digits; HMIS calls the
+      // sample SF<yymmdd><nnnn>. `short` must match the instrument's id whole
+      // (case-insensitive) with ONE capture group = the sequence; `full` builds
+      // the barcode from {yyyy} {yy} {mm} {dd} (the day the result arrived) and
+      // {seq:N} (zero-padded). The built barcode is used only if HMIS has an
+      // order under it; otherwise the sample waits on the console for a Re-key.
+      // There is no suffix search — a wrong completion is a result on the wrong
+      // patient. See src/results/complete.ts.
+      // "barcodeCompletion": {
+      //   "short": "(?:SF)?0*(\\d{1,4})",
+      //   "full": "SF{yy}{mm}{dd}{seq:4}"
+      // },
+
       "hl7": {
         "sendingApp": "LIS",
         "sendingFacility": "",
