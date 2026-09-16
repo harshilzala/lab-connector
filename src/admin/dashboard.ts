@@ -333,7 +333,10 @@ function queuePill(a) {
 // it means new orders are not reaching this analyzer.
 function ordersLine(o) {
   if (!o) return '—';
-  var stored = o.stored + ' stored';
+  // Every pending call carries both the machine's eqCode and this site's id;
+  // an empty answer for that pair is "no work here", never widened.
+  var keyed = (o.eqCodes && o.eqCodes.length ? esc(o.eqCodes.join('+')) : '') + (o.siteId ? ' @ site ' + esc(o.siteId) : ' @ <span class="err">no siteId</span>');
+  var stored = o.stored + ' stored · ' + keyed;
   if (!o.pollEnabled) return esc(stored) + ' · poll off';
   if (o.lastPollError) return '<span class="pill bad">poll failing</span> ' + esc(stored) + ' · ' + esc(o.lastPollError);
   return esc(stored) + ' · polled ' + time(o.lastPollAt);

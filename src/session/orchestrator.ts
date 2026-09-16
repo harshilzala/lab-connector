@@ -136,6 +136,10 @@ export interface OrderView {
 }
 
 export interface OrderPollStatus {
+  /** What the pending calls are keyed on — BOTH are sent, and a reply that
+   *  is empty for this pair is taken as "no work here", never widened. */
+  eqCodes: string[];
+  siteId: string | null;
   /** Barcodes held in the order store. */
   stored: number;
   pollEnabled: boolean;
@@ -433,6 +437,8 @@ export class AnalyzerRuntime {
         ignored: [...this.cfg.ignoreTestCodes],
       },
       orders: {
+        eqCodes: this.equipmentCodes(),
+        siteId: this.cfg.siteId ?? this.hmis.siteId ?? null,
         stored: this.orders.count(),
         pollEnabled: this.cfg.orderPoll.enabled,
         lastPollAt: this.lastPollAt,

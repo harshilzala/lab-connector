@@ -46,6 +46,13 @@ export interface PendingQuery {
 }
 
 export class HmisClient {
+  /** The site-wide siteId every pending call carries unless the analyzer
+   *  block names its own. Read by the status page so the console can show
+   *  what each machine's orders are keyed on. */
+  get siteId(): string | null {
+    return this.opts.siteId ?? null;
+  }
+
   constructor(private readonly opts: HmisClientOptions) {
     if (!opts.tlsRejectUnauthorized) {
       // Blunt but effective for a self-signed cert on a hospital LAN. Scope it
