@@ -138,6 +138,14 @@ Edit `config.json`:
     Use it where the gateway lists more work under an equipment code than the
     instrument actually runs — the VITROS 250 is offered six barcode prefixes
     and returns results only for `ZC`. Empty means download everything.
+    `excludeTestCodes` restricts which *assay codes* are programmed: listed
+    codes are left out of every download (their rows are still cached and a
+    result for them would still be joined). Use it for a test HMIS lists under
+    the machine that the instrument does not have — the VITROS 250 drops a
+    whole sample program that names an assay it lacks (HMIS's derived LFT
+    values 107/108/109), leaving the tube "not programmed".
+    On the VITROS 250 every download carries the *whole* panel, because the
+    instrument keeps one program per sample and a later download replaces it.
   - `sendDate` — send today's date (`dd-MM-yyyy`) as the `date` parameter.
     Default **false**, so an order raised yesterday for a tube run today is
     still found.

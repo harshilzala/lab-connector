@@ -154,6 +154,10 @@ export class Connector implements AdminBackend {
     return this.runtimes.get(id)?.ordersView() ?? null;
   }
 
+  resendOrder(id: string, barcode: string) {
+    return this.runtimes.get(id)?.resendOrder(barcode) ?? Promise.resolve(null);
+  }
+
   fileNow(id: string, barcode: string) {
     return this.runtimes.get(id)?.stagedFileNow(barcode) ?? Promise.resolve(false);
   }

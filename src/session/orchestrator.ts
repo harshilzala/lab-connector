@@ -29,7 +29,7 @@ import {
   normalizePending,
 } from '../hmis/pending.js';
 import { assayKey } from '../codec/astm/records.js';
-import { OrderStore, ORDER_RETENTION_DAYS } from '../orders/store.js';
+import { OrderStore, ORDER_RETENTION_DAYS, codeKey } from '../orders/store.js';
 import { ParameterCatalogue } from '../orders/parameters.js';
 import { WireAudit } from './wire-audit.js';
 
@@ -61,6 +61,8 @@ export interface WireLogEntry {
   at: string;
   direction: 'IN' | 'OUT';
   text: string;
+  /** Packet-level exchange behind the frame, where the protocol has one. */
+  trace?: string;
 }
 
 export interface AnalyzerStatus {
@@ -134,6 +136,17 @@ export interface OrderView {
   }>;
   syncCount: number;
   noSyncCount: number;
+}
+
+/** What the console's "Re-send" did for one barcode. */
+export interface ResendReport {
+  barcode: string;
+  /** Every assay identifier handed to the analyzer — the whole order, not
+   *  just what the poller had not sent yet. */
+  tests: string[];
+  /** 'hmis' when the rows came from a live lookup made for this push; 'store'
+   *  when HMIS offered nothing for the barcode now and the cached order went. */
+  source: 'hmis' | 'store';
 }
 
 export interface OrderPollStatus {
@@ -477,6 +490,7 @@ export class AnalyzerRuntime {
     if (this.polling) return; // a slow gateway must not stack ticks
     this.polling = true;
     const { lookbackDays, download, downloadPrefixes } = this.cfg.orderPoll;
+    const neverDownload = this.neverDownload();
     let samples = 0;
     let pushed = 0;
     let held = 0; // ready to send, but the download breaker is open
@@ -505,7 +519,7 @@ export class AnalyzerRuntime {
             // The poll is where a complete panel is most likely to be seen, so
             // it is the catalogue's main source.
             this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
-            const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll');
+            const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll', { neverDownload });
             if (!download || newCodes.length === 0) continue;
             if (!downloadable(order.sampleId)) {
               // The gateway lists this barcode under our eqCode, but the
@@ -525,28 +539,37 @@ export class AnalyzerRuntime {
               held++;
               continue;
             }
+            // What goes on the wire. An analyzer that keeps ONE program per
+            // sample and lets a later download replace it (VITROS 250, see
+            // KermitLink.downloadReplacesProgram) must be given the whole
+            // panel every time — a delta of the newly seen tests would wipe
+            // the ones it already had. Everything else takes just the delta.
+            const codes = this.link.downloadReplacesProgram ? this.programmable(order.testCodes) : newCodes;
             try {
               await this.link.sendOrders([
                 {
                   sampleId: order.sampleId,
-                  testCodes: newCodes,
+                  testCodes: codes,
                   priority: order.priority,
                   patient: this.cfg.sendDemographics ? order.patient : null,
                   specimenType: order.specimenType,
                 },
               ]);
-              this.orders.markDownloaded(order.sampleId, newCodes);
+              this.orders.markDownloaded(order.sampleId, codes);
               this.downloadedCount++;
               pushed++;
               this.resumeDownloads('an order was accepted');
-              this.log.info({ barcode: order.sampleId, tests: newCodes, eqCode }, 'order downloaded to analyzer');
+              this.log.info(
+                { barcode: order.sampleId, tests: codes, ...(codes.length !== newCodes.length ? { added: newCodes } : {}), eqCode },
+                'order downloaded to analyzer',
+              );
             } catch (err) {
               // Not marked downloaded, so it is retried once the breaker closes.
               this.downloadFailStreak++;
               this.log.error(
                 {
                   barcode: order.sampleId,
-                  tests: newCodes,
+                  tests: codes,
                   consecutiveFailures: this.downloadFailStreak,
                   err: err instanceof Error ? err.message : String(err),
                 },
@@ -574,6 +597,19 @@ export class AnalyzerRuntime {
     } finally {
       this.polling = false;
     }
+  }
+
+  // ---- what may be programmed ---------------------------------------------
+
+  /** orderPoll.excludeTestCodes, normalised the way the order store compares codes. */
+  private neverDownload(): ReadonlySet<string> {
+    return new Set(this.cfg.orderPoll.excludeTestCodes.map(codeKey));
+  }
+
+  /** The codes of a panel that this analyzer may actually be given. */
+  private programmable(codes: readonly string[]): string[] {
+    const skip = this.neverDownload();
+    return codes.filter((c) => !skip.has(codeKey(c)));
   }
 
   // ---- order-download circuit breaker ---------------------------------------
@@ -690,6 +726,71 @@ export class AnalyzerRuntime {
           noSyncCount: rows.filter((r) => !r.sync).length,
         };
       });
+  }
+
+  /**
+   * Operator "Re-send": push one barcode's order to the analyzer again, now.
+   * The poller only ever hands over what the instrument has not been given
+   * yet, so an order the machine lost — a worklist cleared on the instrument,
+   * a download that was ACKed but never took — sits in the store as
+   * "downloaded" and is never offered twice. This is the way to offer it.
+   *
+   * The rows are read from HMIS afresh (a test added since the poll is
+   * included), and the WHOLE order goes, not just the un-downloaded part; the
+   * cached order is the fallback when HMIS has nothing for the barcode now.
+   * Skips the download breaker on purpose — the operator is asking to try —
+   * and a success closes it. Throws with a plain-language reason when the
+   * push cannot be made; returns null for a barcode neither side knows.
+   */
+  async resendOrder(barcode: string): Promise<ResendReport | null> {
+    const lookup = normalizeBarcode(barcode);
+    if (this.cfg.protocol === 'hl7') {
+      // The HL7 link can only answer a query the instrument opened — there is
+      // no unsolicited worklist message it will accept.
+      throw new Error('this analyzer only takes a worklist in reply to its own host query — it cannot be pushed from here');
+    }
+    if (!this.transport.connected) throw new Error('the analyzer link is down');
+    const { downloadPrefixes } = this.cfg.orderPoll;
+    if (downloadPrefixes.length > 0 && !downloadPrefixes.some((p) => lookup.startsWith(p.toUpperCase()))) {
+      throw new Error(`barcode is outside this analyzer's downloadPrefixes (${downloadPrefixes.join(', ')})`);
+    }
+
+    let pending: PendingOrders | null = null;
+    try {
+      // includeTransmitted: a re-send is exactly the case where HMIS may
+      // already have flagged the rows as handed over.
+      pending = await this.fetchPending(lookup, true);
+    } catch (err) {
+      this.log.warn(
+        { barcode: lookup, err: err instanceof Error ? err.message : String(err) },
+        're-send: HMIS lookup failed — using the cached order',
+      );
+    }
+    const source: ResendReport['source'] = pending?.found ? 'hmis' : 'store';
+    const stored = pending?.found ? this.orders.upsert(lookup, pending, 'resend').order : this.orders.get(lookup);
+    if (!stored) return null;
+    const order: OrderDownload = {
+      sampleId: stored.sampleId,
+      testCodes: this.programmable(stored.testCodes),
+      priority: stored.priority,
+      patient: this.cfg.sendDemographics ? stored.patient : null,
+      specimenType: stored.specimenType,
+    };
+    if (order.testCodes.length === 0) throw new Error('the order has no tests to send');
+
+    this.log.warn({ barcode: lookup, tests: order.testCodes, source }, 're-send requested by an operator');
+    try {
+      await this.link.sendOrders([order]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log.error({ barcode: lookup, tests: order.testCodes, err: message }, 're-send failed — the analyzer did not take the order');
+      throw new Error(`the analyzer did not accept the order: ${message}`);
+    }
+    this.orders.markDownloaded(lookup, order.testCodes);
+    this.downloadedCount++;
+    this.resumeDownloads('an operator re-sent an order');
+    this.log.info({ barcode: lookup, tests: order.testCodes, source }, 'order re-sent to analyzer');
+    return { barcode: order.sampleId, tests: order.testCodes, source };
   }
 
   stagedSummaries(): StagedSummary[] | null {
@@ -971,9 +1072,10 @@ export class AnalyzerRuntime {
 
       // Remember the rows: the result comes back in a LATER message and needs
       // their labResultId to be filable.
-      if (pending.ackItems.length) this.orders.upsert(lookup, pending, 'query');
+      if (pending.ackItems.length) this.orders.upsert(lookup, pending, 'query', { neverDownload: this.neverDownload() });
 
-      if (!pending.found) {
+      const codes = this.programmable(pending.testCodes);
+      if (!pending.found || codes.length === 0) {
         this.log.info({ barcode, lookup }, 'no pending orders — sending empty download');
         await this.link.sendOrders([]); // header + terminator = "no work"
         return;
@@ -982,15 +1084,15 @@ export class AnalyzerRuntime {
       const order: OrderDownload = {
         // Reply with the barcode the analyzer sent so it matches its own sample.
         sampleId: barcode,
-        testCodes: pending.testCodes,
+        testCodes: codes,
         priority: pending.priority,
         patient: this.cfg.sendDemographics ? pending.patient : null,
         specimenType: pending.specimenType,
       };
       await this.link.sendOrders([order]);
       // A query answer is a full download, so the poller need not repeat it.
-      this.orders.markDownloaded(lookup, pending.testCodes);
-      this.log.info({ barcode, tests: pending.testCodes }, 'order download sent to analyzer');
+      this.orders.markDownloaded(lookup, codes);
+      this.log.info({ barcode, tests: codes }, 'order download sent to analyzer');
 
       // NOT acknowledged here. A downloaded order is not finished work — the
       // row is retired only once its result has been filed, in the spool
@@ -1067,6 +1169,7 @@ export class AnalyzerRuntime {
 
   private recordWire(w: WireEvent): void {
     const entry: WireLogEntry = { at: new Date().toISOString(), direction: w.direction, text: w.text };
+    if (w.trace) entry.trace = w.trace;
     this.wireLog.push(entry);
     if (this.wireLog.length > 200) this.wireLog.shift();
     this.wireAudit?.record(entry);

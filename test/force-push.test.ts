@@ -79,7 +79,7 @@ const cfg = {
   sendDemographics: false,
   hostQuery: false,
   sendDate: false,
-  orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: false, downloadPrefixes: [] },
+  orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: false, downloadPrefixes: [], excludeTestCodes: [] },
   qc: { sampleIdPrefixes: [], sampleIdRegex: null, patientPrefixes: [], upload: false },
   testCodeAliases: { HGB: 'HAEMOGLOBIN' },
   ignoreTestCodes: [],

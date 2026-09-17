@@ -574,13 +574,40 @@ async function renderOrders(id, el) {
         '<td class="p-id">' + (r.parameterId != null ? 'param ' + esc(String(r.parameterId)) : '') + '</td></tr>'
       ).join('') + '</tbody></table></details>';
     const when = 'seen ' + time(o.firstSeenAt) + ' · updated ' + time(o.updatedAt) + ' · ' + esc(o.source);
+    // "Re-send": the poller never offers an order twice, so a worklist the
+    // instrument lost stays "sent" here forever. This pushes the whole order
+    // again, with the rows read from HMIS afresh.
+    const resendBtn = '<button class="btn btn-ghost btn-sm" type="button" data-o-resend="' + esc(o.barcode) +
+      '" title="Read this order from HMIS again and push every test to the analyzer now.">Re-send</button>';
     return '<li><div class="grow"><div class="barcode">' + esc(o.sampleId || o.barcode) + '</div>' +
-      '<div class="err">' + esc(when) + '</div>' + list + '</div>' + pill + '</li>';
+      '<div class="err">' + esc(when) + '</div>' + list + '</div>' + pill + resendBtn + '</li>';
   }).join('');
   el.innerHTML = rows
     ? '<ul class="q">' + rows + '</ul>'
     : '<div class="empty">No orders in the store &mdash; nothing pending in the HMIS for this machine (or polling is off).</div>';
+  el.querySelectorAll('[data-o-resend]').forEach(b => { b.onclick = () => resendOrder(id, b.dataset.oResend, b); });
   keepScroll(el, id);
+}
+
+// Programs work on the machine, so the operator confirms the barcode first.
+// The button is disabled while the push is in flight: a Kermit download can
+// take a while, and a second click would send the order twice.
+async function resendOrder(id, barcode, btn) {
+  if (!confirm('Re-send order ' + barcode + ' to the analyzer?\\n\\nThe order is read from HMIS again and every test is pushed to the machine.')) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  let r;
+  try {
+    r = await j('/api/analyzers/' + encodeURIComponent(id) + '/orders/' + encodeURIComponent(barcode) + '/resend', { method: 'POST' });
+  } catch (e) {
+    r = { error: String(e && e.message || e) };
+  }
+  if (!r || r.error) {
+    alert('Re-send failed: ' + (r && r.error ? r.error : 'no answer'));
+  } else {
+    alert(r.barcode + ': ' + r.tests.length + ' test' + (r.tests.length === 1 ? '' : 's') + ' sent to the analyzer (' +
+      (r.source === 'hmis' ? 'read from HMIS' : 'HMIS had nothing pending — cached order sent') + ')\\n\\n' + r.tests.join(', '));
+  }
+  renderPanel(id);
 }
 
 // Staged analyzers (filing.mode "staged"): one row per sample, showing how
