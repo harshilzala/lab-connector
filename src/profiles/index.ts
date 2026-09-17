@@ -439,9 +439,28 @@ const SNIBE_MAGLUMI: AnalyzerProfile = {
 // operator quick guides — plus the Sysmex host-interface convention the
 // XN/UF/UC family shares. None of the manuals carries the record layout
 // ("for interface specifications ... contact your local Sysmex service
-// representative", UC-3500 BO §5.3.2, §5.4.2), so the layout is the
-// `sysmex` dialect in src/codec/astm/dialects.ts and is to be CONFIRMED on
-// the first capture — SETUP-SYSMEX-URINE.md is the checklist.
+// representative", UC-3500 BO §5.3.2, §5.4.2). The layout is the `sysmex`
+// dialect in src/codec/astm/dialects.ts, CONFIRMED for the result upload
+// by the Ahmedabad U-WAM capture of 2026-09-17 (route A: the U-WAM dials
+// the PC on 2031, eqCode EC014). SETUP-SYSMEX-URINE.md keeps the
+// assumed-vs-confirmed table.
+//
+// What the capture established (logs/wire-sysmex-uwam-2026-09-17.log):
+//
+//   • the U-WAM sends ONE message per sample with both instruments' values,
+//     R field 14 naming UC-3500 or UF-4000. Strip items carry a "C-" prefix
+//     (C-GLU, C-PRO, C-PH, C-S.G.(Ref), C-COLOR, C-CLOUD, C-Error Code …);
+//     particles are bare (RBC, WBC, EC, Squa.EC, Non SEC, Tran.EC, RTEC,
+//     CAST, Hy.CAST, Path.CAST, BACT, X'TAL, YLC, SPERM, MUCUS, NL RBC,
+//     WBC Clumps) plus RBC-Info. / UTI-Info. / BACT-Info. judgements and
+//     seven scattergram image records.
+//   • every value comes twice, RAW and MAINFORMAT (astm.valueFormat picks;
+//     the profile files MAINFORMAT — what the U-WAM shows the lab).
+//   • HMIS (EC014, "Urine examination", labServiceId 414) registers its
+//     identifiers in exactly the wire spelling: WBC Clumps, SPERM, MUCUS,
+//     Lysed RBC, SRC, NL RBC, YLC, Tran.EC. Lysed RBC and SRC are research
+//     parameters by the manual, but the lab has registered them, so they
+//     are NOT ignore-listed here.
 //
 // What the manuals DO establish:
 //
@@ -486,12 +505,10 @@ const SNIBE_MAGLUMI: AnalyzerProfile = {
 //     are set by service; 9600 8-N-1 is the family default and an
 //     assumption until read off that screen.
 //
-// No allow-list on any of the three: the wire spelling of the mnemonics is
-// unconfirmed, and an allow-list written from the manual's display names
-// would silently drop every value if the wire spells one differently. The
-// scope is set by which parameters HMIS registers under the equipment code;
-// once the first capture shows the real codes, promote them to an
-// allow-list here.
+// No allow-list on any of the three: the scope is set by which parameters
+// HMIS registers under the equipment code, and the site is still mapping
+// them (8 of the ~35 wire codes were registered on 2026-09-17). An
+// allow-list here would have to be edited each time HMIS adds one.
 const SYSMEX_ASTM = {
   ackTimeoutMs: 15000,
   frameMaxData: 240,
@@ -499,6 +516,7 @@ const SYSMEX_ASTM = {
   receiverId: '',
   dialect: 'sysmex',
   sampleIdFrom: 'order',
+  valueFormat: 'main',
 } as const;
 
 /** Sysmex QC material ids as they can appear as a sample number. The UF
@@ -506,12 +524,17 @@ const SYSMEX_ASTM = {
  *  §2.6) — the operator's convention for those goes in the site block. */
 const SYSMEX_QC_PREFIXES = ['QC', 'QC-', 'CTRL', 'CONTROL', 'UF CONTROL', 'UF-CONTROL', 'UFCONTROL', 'UF CTRL', 'UC CONTROL', 'UC-CONTROL'];
 
-/** UF-4000 lines that are not reportable results: research parameters (GI
- *  §8.1.1), the RBC-Info / UTI? / BACT-Info judgement items (GI §5.6.4) and
- *  any "?"-suffixed suspect flag. */
+/** Lines that are not reportable results: the RBC-Info. / UTI-Info. /
+ *  BACT-Info. judgement items (GI §5.6.4, "0" on the wire), any
+ *  "?"-suffixed suspect flag, the UC-3500's error code and colour-rank
+ *  bookkeeping, and the research parameters the manual marks "not for
+ *  diagnosis" (GI §8.1.1) that HMIS has NOT registered. Lysed RBC and SRC
+ *  are research parameters too, but HMIS registers both under EC014, so
+ *  they file. The scattergram image records never reach this list — the
+ *  dialect drops them. */
 const UF_IGNORE_CODES = [
-  '*Info*', '*?',
-  'RBC-P70Fsc', 'RBC-Fsc-DW', 'Large RBC', 'Small RBC', 'Lysed RBC', 'SRC', 'Atyp.C', 'DEBRIS', 'Cond.', 'Osmo.',
+  '*Info*', '*?', 'C-Error Code', 'C-ColorRANK',
+  'RBC-P70Fsc', 'RBC-Fsc-DW', 'Large RBC', 'Small RBC', 'Atyp.C', 'DEBRIS', 'Cond.', 'Osmo.',
 ];
 
 const SYSMEX_UF4000: AnalyzerProfile = {
@@ -549,7 +572,7 @@ const SYSMEX_UC3500: AnalyzerProfile = {
     filing: { mode: 'staged' },
     fillMissingOrderRows: true,
     qc: { sampleIdPrefixes: SYSMEX_QC_PREFIXES, upload: false },
-    ignoreTestCodes: [],
+    ignoreTestCodes: ['C-Error Code', 'C-ColorRANK'],
     testCodeScale: {},
     astm: SYSMEX_ASTM,
   },

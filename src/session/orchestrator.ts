@@ -397,12 +397,11 @@ export class AnalyzerRuntime {
         void this.pollOrders();
         this.pollTimer = setInterval(() => void this.pollOrders(), intervalMs);
       }, FIRST_POLL_DELAY_MS);
-      // Log the site the pending call will really carry: the analyzer's own
-      // siteId if set, else the site-wide hmis.siteId.
+      // Log the sites the pending calls will really carry.
       this.log.info(
         {
           codes: this.equipmentCodes(),
-          siteId: this.cfg.siteId ?? this.hmis.defaultSiteId ?? null,
+          siteIds: this.siteIds().map((s) => s ?? null),
           intervalMs,
           lookbackDays,
           download,
@@ -466,6 +465,16 @@ export class AnalyzerRuntime {
     return [this.cfg.equipmentCode, ...this.cfg.extraEquipmentCodes];
   }
 
+  /** The HMIS sites every pending call is repeated over: the analyzer's own
+   *  `siteIds`, else its `siteId`, else the site-wide list (`hmis.siteIds`
+   *  / `hmis.siteId`), else one unfiltered call. */
+  private siteIds(): (string | undefined)[] {
+    if (this.cfg.siteIds.length) return this.cfg.siteIds;
+    if (this.cfg.siteId) return [this.cfg.siteId];
+    // A client without the list (a test double) means one unfiltered call.
+    return this.hmis.defaultSiteIds ?? [undefined];
+  }
+
   // ---------------------------------------------------------------------------
   // Proactive order download. One tick: ask HMIS for each code × each day in
   // the look-back window, fold every row into the order store, and push to the
@@ -486,75 +495,77 @@ export class AnalyzerRuntime {
       downloadPrefixes.some((p) => barcode.toUpperCase().startsWith(p.toUpperCase()));
     try {
       for (const eqCode of this.equipmentCodes()) {
-        for (let daysAgo = 0; daysAgo <= lookbackDays; daysAgo++) {
-          const body = await this.hmis.getPending({
-            sampleId: '',
-            eqCode,
-            siteId: this.cfg.siteId,
-            showCulture: this.cfg.showCulture,
-            date: formatApiDateDaysAgo(daysAgo),
-          });
-          const groups = groupPendingByBarcode(body, {
-            eqCode,
-            equipmentId: this.cfg.equipmentId ?? null,
-            ipAddress: this.ackIpAddress,
-            portNo: this.ackPortNo,
-          });
-          for (const [, pending] of groups) {
-            samples++;
-            // The poll is where a complete panel is most likely to be seen, so
-            // it is the catalogue's main source.
-            this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
-            const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll');
-            if (!download || newCodes.length === 0) continue;
-            if (!downloadable(order.sampleId)) {
-              // The gateway lists this barcode under our eqCode, but the
-              // analyzer does not run it (see orderPoll.downloadPrefixes). The
-              // rows stay cached for result-time joins; nothing is programmed.
-              notOurs++;
-              continue;
-            }
-            if (!this.transport.connected) {
-              // Leave it un-downloaded; the next tick after reconnect sends it.
-              this.log.warn({ barcode: order.sampleId, tests: newCodes }, 'order waiting — analyzer link is down');
-              continue;
-            }
-            if (this.downloadsPaused()) {
-              // The instrument is not answering. Keep the order in the store,
-              // un-downloaded, so it goes out as soon as the breaker closes.
-              held++;
-              continue;
-            }
-            try {
-              await this.link.sendOrders([
-                {
-                  sampleId: order.sampleId,
-                  testCodes: newCodes,
-                  priority: order.priority,
-                  patient: this.cfg.sendDemographics ? order.patient : null,
-                  specimenType: order.specimenType,
-                },
-              ]);
-              this.orders.markDownloaded(order.sampleId, newCodes);
-              this.downloadedCount++;
-              pushed++;
-              this.resumeDownloads('an order was accepted');
-              this.log.info({ barcode: order.sampleId, tests: newCodes, eqCode }, 'order downloaded to analyzer');
-            } catch (err) {
-              // Not marked downloaded, so it is retried once the breaker closes.
-              this.downloadFailStreak++;
-              this.log.error(
-                {
-                  barcode: order.sampleId,
-                  tests: newCodes,
-                  consecutiveFailures: this.downloadFailStreak,
-                  err: err instanceof Error ? err.message : String(err),
-                },
-                'order download failed — will retry on the next poll',
-              );
-              if (this.downloadFailStreak >= DOWNLOAD_FAIL_THRESHOLD) {
-                this.pauseDownloads();
-                break; // stop hammering the rest of this tick's orders
+        for (const siteId of this.siteIds()) {
+          for (let daysAgo = 0; daysAgo <= lookbackDays; daysAgo++) {
+            const body = await this.hmis.getPending({
+              sampleId: '',
+              eqCode,
+              siteId,
+              showCulture: this.cfg.showCulture,
+              date: formatApiDateDaysAgo(daysAgo),
+            });
+            const groups = groupPendingByBarcode(body, {
+              eqCode,
+              equipmentId: this.cfg.equipmentId ?? null,
+              ipAddress: this.ackIpAddress,
+              portNo: this.ackPortNo,
+            });
+            for (const [, pending] of groups) {
+              samples++;
+              // The poll is where a complete panel is most likely to be seen, so
+              // it is the catalogue's main source.
+              this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
+              const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll');
+              if (!download || newCodes.length === 0) continue;
+              if (!downloadable(order.sampleId)) {
+                // The gateway lists this barcode under our eqCode, but the
+                // analyzer does not run it (see orderPoll.downloadPrefixes). The
+                // rows stay cached for result-time joins; nothing is programmed.
+                notOurs++;
+                continue;
+              }
+              if (!this.transport.connected) {
+                // Leave it un-downloaded; the next tick after reconnect sends it.
+                this.log.warn({ barcode: order.sampleId, tests: newCodes }, 'order waiting — analyzer link is down');
+                continue;
+              }
+              if (this.downloadsPaused()) {
+                // The instrument is not answering. Keep the order in the store,
+                // un-downloaded, so it goes out as soon as the breaker closes.
+                held++;
+                continue;
+              }
+              try {
+                await this.link.sendOrders([
+                  {
+                    sampleId: order.sampleId,
+                    testCodes: newCodes,
+                    priority: order.priority,
+                    patient: this.cfg.sendDemographics ? order.patient : null,
+                    specimenType: order.specimenType,
+                  },
+                ]);
+                this.orders.markDownloaded(order.sampleId, newCodes);
+                this.downloadedCount++;
+                pushed++;
+                this.resumeDownloads('an order was accepted');
+                this.log.info({ barcode: order.sampleId, tests: newCodes, eqCode }, 'order downloaded to analyzer');
+              } catch (err) {
+                // Not marked downloaded, so it is retried once the breaker closes.
+                this.downloadFailStreak++;
+                this.log.error(
+                  {
+                    barcode: order.sampleId,
+                    tests: newCodes,
+                    consecutiveFailures: this.downloadFailStreak,
+                    err: err instanceof Error ? err.message : String(err),
+                  },
+                  'order download failed — will retry on the next poll',
+                );
+                if (this.downloadFailStreak >= DOWNLOAD_FAIL_THRESHOLD) {
+                  this.pauseDownloads();
+                  break; // stop hammering the rest of this tick's orders
+                }
               }
             }
           }
@@ -1009,25 +1020,27 @@ export class AnalyzerRuntime {
   private async fetchPending(lookup: string, includeTransmitted = false): Promise<PendingOrders> {
     const parts: PendingOrders[] = [];
     for (const eqCode of this.equipmentCodes()) {
-      const body = await this.hmis.getPending({
-        sampleId: lookup,
-        eqCode,
-        siteId: this.cfg.siteId,
-        showCulture: this.cfg.showCulture,
-        // Off by default: an order raised yesterday for a tube run today would
-        // otherwise not be found.
-        date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
-      });
-      parts.push(
-        normalizePending(body, {
+      for (const siteId of this.siteIds()) {
+        const body = await this.hmis.getPending({
           sampleId: lookup,
           eqCode,
-          equipmentId: this.cfg.equipmentId ?? null,
-          ipAddress: this.ackIpAddress,
-          portNo: this.ackPortNo,
-          includeTransmitted,
-        }),
-      );
+          siteId,
+          showCulture: this.cfg.showCulture,
+          // Off by default: an order raised yesterday for a tube run today would
+          // otherwise not be found.
+          date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
+        });
+        parts.push(
+          normalizePending(body, {
+            sampleId: lookup,
+            eqCode,
+            equipmentId: this.cfg.equipmentId ?? null,
+            ipAddress: this.ackIpAddress,
+            portNo: this.ackPortNo,
+            includeTransmitted,
+          }),
+        );
+      }
     }
     const merged = mergePending(parts);
     this.parameters.learn(merged.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });

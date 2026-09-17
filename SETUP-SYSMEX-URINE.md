@@ -87,14 +87,14 @@ fill one panel in either order.
 
 | Setting | Value | Status |
 |---|---|---|
-| Record layout | `sysmex` dialect: `^^^^CODE^1` test ids, sample no. right-justified in 15 chars + `^rack^tube`, H `E1394-97`, query reply O field 26 = `Q`, unsolicited download = `O` | **Assumed** — Sysmex XN/UF/UC family convention. Confirm on first capture |
-| Line protocol | ASTM E1381 (ENQ/ACK, STX…ETX, checksum) | **Assumed** — the UF/UC host settings can also be set to Sysmex's older proprietary format; make sure service selects ASTM |
-| TCP side | analyzer / U-WAM **dials** the PC (`mode: server`); port is the site's | **Assumed** — client/server is a Sysmex service setting. If they set the IPU as server, use `"mode": "client", "host": "<IPU ip>"` |
+| Record layout | `sysmex` dialect: `^^^CODE` test ids (strip items prefixed `C-`), bare barcode in O field 3, every value twice as `<v>^RAW` / `<v>^MAINFORMAT` (`astm.valueFormat` picks, profile = `main`), `IF`-typed image records dropped, H `LIS2-A2` | **Confirmed** for the result upload — U-WAM capture 2026-09-17 (`logs/wire-sysmex-uwam-2026-09-17.log`, pinned in `test/dialects-check.ts` [12]). The `^^^^CODE^1` XN layout assumed before was wrong. Query reply (O field 26 = `Q`, specimen field echoed) still the ASTM norm — **no Q captured yet** |
+| Line protocol | ASTM E1381 (ENQ/ACK, STX…ETX, checksum) | **Confirmed** — the U-WAM's frames were acknowledged and reassembled on 2026-09-17 |
+| TCP side | U-WAM **dials** the PC (`mode: server`) on 2031 | **Confirmed** on 2026-09-17 (route A, `sysmex-uwam` block, eqCode EC014) |
 | UC-3500 serial | 9600 8-N-1, DTR/RTS high | **Assumed** — read the real values off [RS-232C SETTINGS] (BO §5.4.2; service-set) |
 | Host query | on, per tube | **From manual** (UC BO §5.3.2, UF BO §3) — must also be switched on at the instrument |
 | Order push | off (`orderPoll.download: false`); rows still cached | Design — both instruments run their fixed panel regardless of the order, so a push adds nothing |
-| Allow-list | none | Deliberate — wire spelling of the mnemonics is unconfirmed (is it `X'TAL` or `XTAL`? `S.G` or `SG`?). Promote to `allowTestCodes` after the first capture |
-| Ignore list (UF) | `*Info*`, `*?`, research parameters | **From manual** (GI §8.1.1, §5.6.4); spelling to confirm |
+| Allow-list | none | Deliberate — scope is whatever HMIS registers under EC014 (8 of ~35 wire codes on 2026-09-17: WBC Clumps, SPERM, MUCUS, Lysed RBC, SRC, NL RBC, YLC, Tran.EC — spelled exactly as on the wire). Add the rest in the HMIS master, or `testCodeAliases` where HMIS names differ (`LEU`→`C-LEU`, `ERY`→`C-BLD`, `COL`→`C-COLOR`) |
+| Ignore list | `*Info*` (RBC-Info. / UTI-Info. / BACT-Info.), `*?`, `C-Error Code`, `C-ColorRANK`, unregistered research parameters | **From capture + manual** (GI §8.1.1, §5.6.4). `Lysed RBC` and `SRC` are research items but HMIS registers them, so they are NOT ignored |
 | QC ids | `QC`, `CTRL`, `UF CONTROL`, `UC CONTROL` … | **Partly assumed** — the UC's control ids are whatever the lab registered (BO §2.6); add the site's convention to `qc.sampleIdPrefixes` |
 
 ## What to ask Sysmex service for

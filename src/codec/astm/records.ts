@@ -43,6 +43,62 @@ export const DEFAULT_DELIMS: Delimiters = { field: '|', repeat: '\\', component:
 // coefficient. Only the DOSE (or an untyped) row carries the result to file.
 const NON_REPORTABLE_RESULT_TYPES = new Set(['RLU', 'COFF']);
 
+// The Sysmex U-WAM sends every parameter twice, the value tagged with its
+// format in the second component of the result field: "8.0^RAW" (the
+// instrument's native value) and "1.4^MAINFORMAT" (the U-WAM's configured
+// reporting format). One of the pair is filed; see `valueFormat`.
+const VALUE_FORMAT_TAGS: Record<string, ValueFormat> = { RAW: 'raw', MAINFORMAT: 'main' };
+export type ValueFormat = 'main' | 'raw';
+
+/** Split "<value>^<FORMAT>" when the tag is one of the U-WAM's; any other
+ *  value (including one that merely contains a component delimiter) is
+ *  returned whole. */
+function splitValueFormat(field: string, d: Delimiters): { value: string; format: ValueFormat | null } {
+  const c = field.split(d.component);
+  if (c.length === 2) {
+    const format = VALUE_FORMAT_TAGS[(c[1] ?? '').trim().toUpperCase()];
+    if (format) return { value: (c[0] ?? '').trim(), format };
+  }
+  return { value: field.trim(), format: null };
+}
+
+/**
+ * Keep ONE of each RAW/MAINFORMAT pair per parameter — the preferred format,
+ * or the other when the preferred one is blank (the U-WAM leaves C-LEU's
+ * MAINFORMAT and C-BIL's RAW empty). A parameter blank in both is not a
+ * result and is dropped. Results that carried no format tag pass through
+ * untouched, in their original order.
+ */
+function collapseValueFormats(
+  results: InstrumentResult[],
+  formats: Map<InstrumentResult, ValueFormat>,
+  prefer: ValueFormat,
+): InstrumentResult[] {
+  if (formats.size === 0) return results;
+  const out: InstrumentResult[] = [];
+  const slot = new Map<string, number>(); // parameter → index in `out`
+  for (const r of results) {
+    const format = formats.get(r);
+    if (!format) {
+      out.push(r);
+      continue;
+    }
+    const key = `${r.sampleId}\u0000${r.testCode.toUpperCase()}`;
+    const at = slot.get(key);
+    if (at === undefined) {
+      slot.set(key, out.length);
+      out.push(r);
+      continue;
+    }
+    const held = out[at]!;
+    // Replace what is held when this one is the preferred format with a
+    // value, or when the held one is blank and this one is not.
+    const takeThis = r.value !== '' && (format === prefer || held.value === '');
+    if (takeThis) out[at] = r;
+  }
+  return out.filter((r) => r.value !== '');
+}
+
 function detectDelims(lines: string[]): Delimiters {
   const h = lines.find((l) => l.startsWith('H'));
   if (!h || h.length < 6) return DEFAULT_DELIMS;
@@ -93,7 +149,12 @@ export function parseMessage(
   name?: AstmDialect,
   /** Which record carries the barcode HMIS keys on. See `sampleIdFrom` in
    *  src/config.ts — "order" (the ASTM norm) for every analyzer but the ABL9. */
-  opts?: { sampleIdFrom?: 'order' | 'patient' },
+  opts?: {
+    sampleIdFrom?: 'order' | 'patient';
+    /** Which half of a RAW/MAINFORMAT pair to file — see `valueFormat` in
+     *  src/config.ts. Only the Sysmex U-WAM tags its values this way. */
+    valueFormat?: ValueFormat;
+  },
 ): ParsedMessage {
   // Records may arrive one-per-frame OR packed several-per-frame separated by CR
   // (the CareTech/Atellica host puts H/Q/L in a single ETX-terminated frame).
@@ -105,6 +166,9 @@ export function parseMessage(
 
   let currentPatient: PatientDemographics | null = null;
   let currentSampleId = '';
+  // Results that arrived tagged RAW / MAINFORMAT, collapsed to one per
+  // parameter once the whole message is read.
+  const valueFormats = new Map<InstrumentResult, ValueFormat>();
 
   for (const line of lines) {
     const type = line[0]?.toUpperCase();
@@ -166,9 +230,15 @@ export function parseMessage(
         // HMIS receives one result per analyte (otherwise the COFF value is filed
         // as a second, conflicting result). Analyzers that omit this component
         // (empty index 7) are unaffected and still file.
-        const resultType = comps(f[2], d)[7]?.trim().toUpperCase();
+        const testIdComps = comps(f[2], d);
+        const resultType = testIdComps[7]?.trim().toUpperCase();
         if (resultType && NON_REPORTABLE_RESULT_TYPES.has(resultType)) break;
+        // The dialect may know a record is not a result at all — the Sysmex
+        // U-WAM's scattergram images travel as R records marked "IF".
+        const { tests } = dialect(name);
+        if (tests.reportable && !tests.reportable(testIdComps)) break;
 
+        const { value, format } = splitValueFormat(f[3] || '', d);
         const result: InstrumentResult = {
           // WHICH FIELD IS THE BARCODE — the two orders, and why both exist.
           //
@@ -201,7 +271,7 @@ export function parseMessage(
               ? currentPatient?.patientId || currentSampleId || ''
               : currentSampleId || currentPatient?.patientId || '',
           testCode: testCodeFromUniversalId(f[2], d, name),
-          value: (f[3] || '').trim(),
+          value,
           unit: (f[4] || '').trim() || null,
           referenceRange: (f[5] || '').trim() || null,
           abnormalFlag: (f[6] || '').trim() || null,
@@ -211,7 +281,10 @@ export function parseMessage(
           completedAt: (f[12] || '').trim() || null, // VERIFY-SPEC: date completed position
           instrument: (f[13] || '').trim() || null,
         };
-        if (result.testCode) msg.results.push(result);
+        if (result.testCode) {
+          msg.results.push(result);
+          if (format) valueFormats.set(result, format);
+        }
         break;
       }
       // C (comment) and L (terminator) carry no data we file today.
@@ -219,6 +292,7 @@ export function parseMessage(
         break;
     }
   }
+  msg.results = collapseValueFormats(msg.results, valueFormats, opts?.valueFormat ?? 'main');
   return msg;
 }
 

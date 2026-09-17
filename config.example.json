@@ -113,6 +113,11 @@
         "senderId": "HOST",
         "receiverId": "",
         "dialect": "vitros-eciq"
+        // Sysmex U-WAM only: it sends every value twice, "<v>^RAW" (native, /µl)
+        // and "<v>^MAINFORMAT" (the reporting format set on the U-WAM — /HPF,
+        // /LPF, "-" / "4+"). "main" (default) files what the lab sees on the
+        // U-WAM; "raw" files the native value. Other analyzers are unaffected.
+        // "valueFormat": "main",
       }
     },
     {

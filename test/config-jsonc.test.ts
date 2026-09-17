@@ -59,11 +59,26 @@ const lines = text.split(/\r?\n/);
 const parked: string[] = [];
 let run: string[] = [];
 
-// A run of commented lines may open with prose explaining the sample; the JSON
-// starts at the `"transport"` key.
+// A run of commented lines may open with prose explaining the sample, and a
+// whole parked analyzer block (the Sysmex alternatives) carries more than the
+// transport: take EVERY `"transport"` key in the run, from its opening brace
+// to the matching closing one, and nothing after it.
 const collect = (r: string[]) => {
-  const start = r.findIndex((l) => l.trimStart().startsWith('"transport"'));
-  if (start !== -1) parked.push(r.slice(start).join('\n'));
+  const text = r.join('\n');
+  const re = /"transport"\s*:\s*\{/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    let depth = 0;
+    let end = -1;
+    for (let i = m.index + m[0].length - 1; i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}' && --depth === 0) {
+        end = i + 1;
+        break;
+      }
+    }
+    if (end !== -1) parked.push(text.slice(m.index, end));
+  }
 };
 
 for (const line of lines) {
@@ -93,11 +108,17 @@ for (const [i, block] of parked.entries()) {
   writeFileSync(file, JSON.stringify(probe, null, 2));
   const loaded = loadConfig(file);
   const t = loaded.analyzers[0]!.transport;
-  assert.equal(t.type, 'serial', 'the parked sample is the COM-mode alternative');
-  console.log(
-    `✓ parked sample ${i + 1} valid: serial://${t.path}@${t.baudRate} ` +
-      `${t.dataBits}-${t.parity[0]!.toUpperCase()}-${t.stopBits} dtr=${t.dtr} rts=${t.rts}`,
-  );
+  // A parked sample is either the COM-mode alternative (the original case) or
+  // a TCP alternative for a machine that can be cabled either way (the Sysmex
+  // blocks: IPU as server, NPort as server). Both must load as written.
+  if (t.type === 'serial') {
+    console.log(
+      `✓ parked sample ${i + 1} valid: serial://${t.path}@${t.baudRate} ` +
+        `${t.dataBits}-${t.parity[0]!.toUpperCase()}-${t.stopBits} dtr=${t.dtr} rts=${t.rts}`,
+    );
+  } else {
+    console.log(`✓ parked sample ${i + 1} valid: tcp/${t.mode} ${t.host}:${t.port}`);
+  }
 }
 
 // The COM ports and line settings the legacy middleware ran on (ComVal in

@@ -86,7 +86,25 @@ export class TcpTransport extends EventEmitter implements Transport {
         reject(err);
       });
       server.listen(this.opts.port, this.opts.host, () => {
-        this.opts.logger.info({ endpoint: this.describe }, 'TCP server listening');
+        // Trust the OS, not the config. On 2026-09-16 a lab PC silently bound
+        // every requested port to a random ~20xxx one (a host-level network
+        // filter): "listening" was logged, the analyzer dialled 2807, nothing
+        // answered. A bound port that differs from the configured one is a
+        // failed start, not a healthy connector.
+        const addr = server.address();
+        const bound = typeof addr === 'object' && addr ? addr.port : this.opts.port;
+        if (this.opts.port !== 0 && bound !== this.opts.port) {
+          const err = new Error(
+            `TCP server asked for port ${this.opts.port} but the OS bound ${bound} — something on this PC is ` +
+              'rewriting socket binds (a security agent / network sandbox). The analyzer cannot reach the connector ' +
+              'until that is fixed at the OS level; the config is not the problem.',
+          );
+          this.opts.logger.error({ endpoint: this.describe, boundPort: bound }, err.message);
+          server.close();
+          reject(err);
+          return;
+        }
+        this.opts.logger.info({ endpoint: this.describe, boundPort: bound }, 'TCP server listening');
         resolve();
       });
       this.server = server;

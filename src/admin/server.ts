@@ -93,9 +93,24 @@ export class AdminServer {
       });
 
       server.listen(this.port, this.host, () => {
+        // Same guard as TcpTransport.listen: the OS may hand back a different
+        // port than asked for (seen 2026-09-16, a host-level bind rewrite).
+        // Report it instead of logging a URL nobody can open.
+        const addr = server.address();
+        const bound = typeof addr === 'object' && addr ? addr.port : this.port;
+        if (this.port !== 0 && bound !== this.port) {
+          server.close();
+          reject(
+            new Error(
+              `admin dashboard asked for ${this.host}:${this.port} but the OS bound port ${bound} — something on this PC ` +
+                'is rewriting socket binds (a security agent / network sandbox); fix that at the OS level.',
+            ),
+          );
+          return;
+        }
         this.sweeper = setInterval(() => this.sessions.sweep(), 15 * 60 * 1000);
         this.sweeper.unref();
-        this.logger.info({ url: `http://${this.host}:${this.port}` }, 'admin dashboard listening');
+        this.logger.info({ url: `http://${this.host}:${this.port}`, boundPort: bound }, 'admin dashboard listening');
         resolve();
       });
     });

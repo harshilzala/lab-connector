@@ -149,81 +149,117 @@ console.log('\n[10] A dialect must not leak into another dialect\'s decoding');
 const cross = parseMessage(['H|\\^&|||X', 'O|1|S1||^^^x', 'R|1|^^^1.000000+032+1|5||||||||||', 'L|1|N'], 'raw', 'atellica');
 eq('atellica keeps the whole component', cross.results.map((x) => x.testCode), ['1.000000+032+1']);
 
-console.log('\n[12] Sysmex UF-4000 host query  (padded sample no ^ rack ^ tube; code in component 5)');
-// Shape from the Sysmex XN/UF/UC host-interface convention — NOT yet a capture
-// from the site (SETUP-SYSMEX-URINE.md). The sample number is right-justified
-// in 15 characters; rack and tube position follow.
-const SYSMEX_SPECIMEN = '   SF2609160001^A1^3^^^^^^^^^^^^^^^^^^^^^^';
+console.log('\n[12] Sysmex U-WAM result upload — the Ahmedabad capture of 2026-09-17 (ZC2609170035, trimmed)');
+// logs/wire-sysmex-uwam-2026-09-17.log, second message: the strip (UC-3500)
+// and particle (UF-4000) halves of one sample in one message, every value
+// twice (RAW / MAINFORMAT), the judgement items, one of the seven image
+// records. Lines dropped here are of the same shapes.
+const UWAM_RECORDS = [
+  'H|\\^&|||U-WAM^00-22_Build003^A1494^^^^AU501736||||||||LIS2-A2|20260917161725',
+  'P|1||10032026040311||^ATULBHAI ASHOKBHAI J||19871203|M',
+  "O|1|ZC2609170035||^^^C-URO\\^^^C-BLD\\^^^C-BIL\\^^^C-GLU\\^^^C-LEU\\^^^C-S.G.(Ref)\\^^^C-COLOR\\^^^C-Error Code\\^^^RBC\\^^^X'TAL\\^^^MUCUS\\^^^RBC-Info.\\^^^SF_DSS_PxSF_FSC_P\\|R||20260917110245||||N|||20260917110245|*||||||||||F",
+  'R|1|^^^C-URO^A^1^S^  0009^01|normal^RAW|||N||||^^device||20260917105802|UC-3500',
+  'R|2|^^^C-URO^A^1^S^  0009^01|normal^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
+  'R|3|^^^C-BLD^A^1^S^  0009^01|-^RAW|||N||||^^device||20260917105802|UC-3500',
+  'R|4|^^^C-BLD^A^1^S^  0009^01|-^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
+  'R|5|^^^C-BIL^A^1^S^  0009^01|^RAW|mg/dL||N||||^^device||20260917105802|UC-3500',
+  'R|6|^^^C-BIL^A^1^S^  0009^01|-^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
+  'R|9|^^^C-GLU^A^1^S^  0009^01|4+^RAW|||H||||^^device||20260917105802|UC-3500',
+  'R|10|^^^C-GLU^A^1^S^  0009^01|4+^MAINFORMAT|||H||||^^device||20260917105802|UC-3500',
+  'R|17|^^^C-LEU^A^1^S^  0009^01|-^RAW|||N||||^^device||20260917105802|UC-3500',
+  'R|18|^^^C-LEU^A^1^S^  0009^01|^MAINFORMAT|c/µL||N||||^^device||20260917105802|UC-3500',
+  'R|19|^^^C-S.G.(Ref)^A^1^S^  0009^01|1.010^RAW|||N||||^^device||20260917105802|UC-3500',
+  'R|20|^^^C-S.G.(Ref)^A^1^S^  0009^01|1.010^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
+  'R|21|^^^C-COLOR^A^1^S^  0009^01|STRAW     02^RAW|||N||||^^device||20260917105802|UC-3500',
+  'R|22|^^^C-COLOR^A^1^S^  0009^01|STRAW     02^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
+  'R|23|^^^C-ColorRANK^A^1^S^  0009^01|^RAW|||N||||^^device||20260917105802|UC-3500',
+  'R|24|^^^C-ColorRANK^A^1^S^  0009^01|^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
+  'R|27|^^^C-Error Code^A^1^S^  0009^01|0000^RAW|||N||||^^device||20260917105802|UC-3500',
+  'R|28|^^^C-Error Code^A^1^S^  0009^01|0000^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
+  'R|29|^^^RBC^A^1^S^  0009^01|8.0^RAW|/µl||N||||^^device||20260917110354|UF-4000',
+  'R|30|^^^RBC^A^1^S^  0009^01|1.4^MAINFORMAT|/HPF||N||||^^device||20260917110354|UF-4000',
+  "R|49|^^^X'TAL^A^1^S^  0009^01|0.0^RAW|/µl||N||||^^device||20260917110354|UF-4000",
+  "R|50|^^^X'TAL^A^1^S^  0009^01|0.0^MAINFORMAT|/LPF||N||||^^device||20260917110354|UF-4000",
+  'R|55|^^^MUCUS^A^1^S^  0009^01|0.14^RAW|/µl||N||||^^device||20260917110354|UF-4000',
+  'R|56|^^^MUCUS^A^1^S^  0009^01|0.02^MAINFORMAT|/HPF||N||||^^device||20260917110354|UF-4000',
+  'R|59|^^^RBC-Info.^A^1^S^  0009^01|0^RAW|||||||^^device||20260917110354|UF-4000',
+  'R|60|^^^RBC-Info.^A^1^S^  0009^01|0^MAINFORMAT|||||||^^device||20260917110354|UF-4000',
+  'R|65|^^^SF_DSS_PxSF_FSC_P^A^1^IF^  0009^01|20260917&R&PNG&E&R&E&[UF-4000&S&11308]&E&[20260917_110354]&E&R&E&[          ZC2609170035]_[SF_DSS_PxSF_FSC_P].png^RAW|||||||^^device||20260917110354|UF-4000',
+  'L|1|N',
+];
+const uwam = parseMessage(UWAM_RECORDS, 'raw', 'sysmex');
+eq('sender', uwam.sender, 'U-WAM');
+eq('patient from the P record', [uwam.patient?.patientId, uwam.patient?.sex, uwam.patient?.birthDate], ['10032026040311', 'M', '19871203']);
+eq('no query in a result upload', uwam.queries.length, 0);
+eq(
+  'one value per parameter, MAINFORMAT preferred, RAW when MAINFORMAT is blank, images dropped',
+  uwam.results.map((x) => [x.sampleId, x.testCode, x.value, x.unit, x.abnormalFlag, x.instrument]),
+  [
+    ['ZC2609170035', 'C-URO', 'normal', null, 'N', 'UC-3500'],
+    ['ZC2609170035', 'C-BLD', '-', null, 'N', 'UC-3500'],
+    ['ZC2609170035', 'C-BIL', '-', null, 'N', 'UC-3500'],
+    ['ZC2609170035', 'C-GLU', '4+', null, 'H', 'UC-3500'],
+    ['ZC2609170035', 'C-LEU', '-', null, 'N', 'UC-3500'],
+    ['ZC2609170035', 'C-S.G.(Ref)', '1.010', null, 'N', 'UC-3500'],
+    ['ZC2609170035', 'C-COLOR', 'STRAW     02', null, 'N', 'UC-3500'],
+    ['ZC2609170035', 'C-Error Code', '0000', null, 'N', 'UC-3500'],
+    ['ZC2609170035', 'RBC', '1.4', '/HPF', 'N', 'UF-4000'],
+    ['ZC2609170035', "X'TAL", '0.0', '/LPF', 'N', 'UF-4000'],
+    ['ZC2609170035', 'MUCUS', '0.02', '/HPF', 'N', 'UF-4000'],
+    ['ZC2609170035', 'RBC-Info.', '0', null, null, 'UF-4000'],
+  ],
+);
+eq('a parameter blank in both formats (C-ColorRANK) is not a result', uwam.results.some((x) => x.testCode === 'C-ColorRANK'), false);
+eq('the image record is not a result', uwam.results.some((x) => /png/i.test(x.value) || x.testCode === 'A'), false);
+
+console.log('\n[13] Sysmex U-WAM — valueFormat "raw" files the native value, MAINFORMAT when RAW is blank');
+const uwamRaw = parseMessage(UWAM_RECORDS, 'raw', 'sysmex', { valueFormat: 'raw' });
+eq(
+  'raw values',
+  uwamRaw.results.filter((x) => ['C-BIL', 'C-LEU', 'RBC', 'MUCUS'].includes(x.testCode)).map((x) => [x.testCode, x.value, x.unit]),
+  [['C-BIL', '-', null], ['C-LEU', '-', null], ['RBC', '8.0', '/µl'], ['MUCUS', '0.14', '/µl']],
+);
+
+console.log('\n[14] An analyzer that sends one plain value is untouched by the pair handling');
+const magX6 = parseMessage(
+  ['H|\\^&||PSWD|X6 User|||||Lis||P|E1394-97|20260917', 'P|1', 'O|1|LB2609170565||^^^HIV Combi',
+   'R|1|^^^HIV Combi|<0.01|AU/mL|0.000 - 1.000|N||||||20260917155439||', 'L|1|N'],
+  'raw',
+  'maglumi',
+);
+eq('maglumi X6 value', magX6.results.map((x) => [x.sampleId, x.testCode, x.value, x.unit]), [['LB2609170565', 'HIV Combi', '<0.01', 'AU/mL']]);
+
+console.log('\n[15] Sysmex query REPLY echoes the specimen field, bare ^^^CODE test ids, report type Q');
+// The Q record is NOT yet captured from the U-WAM; this is the ASTM norm the
+// connector answers with until it is.
+const SYSMEX_SPECIMEN = 'ZC2609170035^A1^3';
 const sq = parseMessage(
-  ['H|\\^&|||UF-4000^00-01^12345678^^^^AB123456||||||||E1394-97|20260916101500', 'Q|1|' + SYSMEX_SPECIMEN + '||^^^^URI|||||||O', 'L|1|N'],
+  ['H|\\^&|||U-WAM^00-22_Build003^A1494^^^^AU501736||||||||LIS2-A2|20260917101500', 'Q|1|' + SYSMEX_SPECIMEN + '||ALL|||||||O', 'L|1|N'],
   'raw',
   'sysmex',
 );
-eq('sender', sq.sender, 'UF-4000');
-eq('query sampleId is trimmed', sq.queries.map((x) => x.sampleId), ['SF2609160001']);
+eq('query sampleId', sq.queries.map((x) => x.sampleId), ['ZC2609170035']);
 eq('query keeps the specimen field verbatim', sq.queries.map((x) => x.specimenIdField), [SYSMEX_SPECIMEN]);
-
-console.log('\n[13] Sysmex UF-4000 result upload  ("^^^^RBC^1" — the code is NOT in the ASTM component)');
-const sr = parseMessage(
-  [
-    'H|\\^&|||UF-4000^00-01^12345678^^^^AB123456||||||||E1394-97|20260916101800',
-    'P|1',
-    'O|1|' + SYSMEX_SPECIMEN + '||^^^^URI|R||20260916101500|||||||||||||||||F',
-    'R|1|^^^^RBC^1|12.3|/uL||N||F||||20260916101700',
-    'R|2|^^^^WBC^1|4.0|/uL||N||F||||20260916101700',
-    'R|3|^^^^BACT^1|250.0|/uL||H||F||||20260916101700',
-    'R|4|^^^^RBC-Info^1|Isomorphic?|||||F||||20260916101700',
-    'L|1|N',
-  ],
-  'raw',
-  'sysmex',
-);
-eq('results', sr.results.map((x) => [x.sampleId, x.testCode, x.value, x.unit, x.abnormalFlag, x.status, x.completedAt]), [
-  ['SF2609160001', 'RBC', '12.3', '/uL', 'N', 'F', '20260916101700'],
-  ['SF2609160001', 'WBC', '4.0', '/uL', 'N', 'F', '20260916101700'],
-  ['SF2609160001', 'BACT', '250.0', '/uL', 'H', 'F', '20260916101700'],
-  ['SF2609160001', 'RBC-Info', 'Isomorphic?', null, null, 'F', '20260916101700'],
-]);
-
-console.log('\n[14] Sysmex UC-3500 result upload  (qualitative strip values, conventional units)');
-const ucr = parseMessage(
-  [
-    'H|\\^&|||UC-3500^00-01^87654321||||||||E1394-97|20260916102000',
-    'P|1',
-    'O|1|   SF2609160001^A1^3||^^^^URI|R||20260916101900|||||||||||||||||F',
-    'R|1|^^^^GLU^1|NEGATIVE|mg/dL||N||F',
-    'R|2|^^^^PRO^1|30|mg/dL||A||F',
-    'R|3|^^^^S.G^1|1.020|||N||F',
-    'R|4|^^^^COLOR^1|YELLOW|||N||F',
-    'L|1|N',
-  ],
-  'raw',
-  'sysmex',
-);
-eq('results', ucr.results.map((x) => [x.testCode, x.value, x.unit]), [
-  ['GLU', 'NEGATIVE', 'mg/dL'], ['PRO', '30', 'mg/dL'], ['S.G', '1.020', null], ['COLOR', 'YELLOW', null],
-]);
-
-console.log('\n[15] Sysmex query REPLY echoes the specimen field and marks report type Q');
 const sysReply = buildOrderMessage(
-  [{ sampleId: 'SF2609160001', testCodes: ['URI'], priority: 'R', patient: null, specimenType: null,
+  [{ sampleId: 'ZC2609170035', testCodes: ['WBC Clumps', 'SPERM'], priority: 'R', patient: null, specimenType: null,
      queryReply: true, specimenIdField: SYSMEX_SPECIMEN }],
   { senderId: 'HMIS-LIS', receiverId: '', sendDemographics: false, dialect: 'sysmex' },
 );
 eq('records', sysReply.map(stamp), [
-  'H|\\^&|||HMIS-LIS||||||||E1394-97|<ts>',
+  'H|\\^&|||HMIS-LIS||||||||LIS2-A2|<ts>',
   'P|1',
-  'O|1|' + SYSMEX_SPECIMEN + '||^^^^URI^1|R||||||||||||||||||||Q',
+  'O|1|' + SYSMEX_SPECIMEN + '||^^^WBC Clumps\\^^^SPERM|R||||||||||||||||||||Q',
   'L|1|N',
 ]);
 for (const l of sysReply) console.log('      ' + l);
 
 console.log('\n[16] Sysmex unsolicited download uses the bare barcode and report type O');
 const sysPush = buildOrderMessage(
-  [{ sampleId: 'SF2609160001', testCodes: ['URI', 'BF'], priority: 'S', patient: null, specimenType: null }],
+  [{ sampleId: 'ZC2609170035', testCodes: ['WBC Clumps', 'SPERM'], priority: 'S', patient: null, specimenType: null }],
   { senderId: 'HMIS-LIS', receiverId: '', sendDemographics: false, dialect: 'sysmex' },
 );
-eq('O record', sysPush[2], 'O|1|SF2609160001||^^^^URI^1\\^^^^BF^1|S||||||||||||||||||||O');
+eq('O record', sysPush[2], 'O|1|ZC2609170035||^^^WBC Clumps\\^^^SPERM|S||||||||||||||||||||O');
+
 
 console.log('\n[17] The reply flags change nothing for the other dialects');
 const magReply = buildOrderMessage(
