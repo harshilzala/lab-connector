@@ -196,4 +196,41 @@ function writeConfig(name: string, analyzers: unknown[]): string {
   console.log('✓ snibe-maglumi: listener block with host query');
 }
 
+// ---- 9) Sysmex urinalysis pair: UF-4000 over TCP, UC-3500 over serial ----
+{
+  const path = writeConfig('sysmex.json', [
+    { id: 'site-uf4000', profile: 'sysmex-uf4000', equipmentCode: 'UF4000', transport: { port: 6070 } },
+    { id: 'site-uc3500', profile: 'sysmex-uc3500', equipmentCode: 'UC3500', transport: { path: 'COM3' } },
+    { id: 'site-uwam', profile: 'sysmex-uwam', equipmentCode: 'UWAM', transport: { port: 6071 } },
+  ]);
+  const [uf, uc, wam] = loadConfig(path).analyzers;
+  assert.equal(uf!.protocol, 'astm');
+  assert.deepEqual(uf!.transport, { type: 'tcp', mode: 'server', host: '0.0.0.0', port: 6070 });
+  assert.equal(uf!.hostQuery, true);
+  assert.equal(uf!.orderPoll.enabled, true, 'rows cached for a tube run with the query off');
+  assert.equal(uf!.orderPoll.download, false, 'nothing pushed — the instrument runs its fixed panel');
+  assert.equal(uf!.filing.mode, 'staged', 'half a panel per instrument');
+  assert.equal(uf!.astm.dialect, 'sysmex');
+  assert.deepEqual(uf!.allowTestCodes, [], 'no allow-list until the wire spelling is confirmed');
+  assert.ok(uf!.ignoreTestCodes.includes('*Info*'));
+  assert.ok(uf!.qc.sampleIdPrefixes.includes('UF CONTROL'));
+
+  assert.equal(uc!.transport.type, 'serial');
+  assert.deepEqual(uc!.transport, { type: 'serial', path: 'COM3', baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none', dtr: true, rts: true });
+  assert.equal(uc!.astm.dialect, 'sysmex');
+  assert.equal(uc!.filing.mode, 'staged');
+
+  // A UC-3500 behind an NPort: the site writes a tcp transport and the
+  // schema drops the profile's serial keys.
+  const nport = loadConfig(writeConfig('sysmex-nport.json', [
+    { id: 'site-uc3500', profile: 'sysmex-uc3500', equipmentCode: 'UC3500', transport: { type: 'tcp', mode: 'client', host: '10.0.0.9', port: 4001 } },
+  ])).analyzers[0]!;
+  assert.deepEqual(nport.transport, { type: 'tcp', mode: 'client', host: '10.0.0.9', port: 4001 });
+
+  assert.equal(wam!.astm.dialect, 'sysmex');
+  assert.equal(wam!.transport.type, 'tcp');
+  assert.equal(PROFILE_LIBRARY['sysmex-uf5000'], PROFILE_LIBRARY['sysmex-uf4000'], 'UF-5000 shares the UF-4000 profile');
+  console.log('✓ sysmex-uf4000 / sysmex-uc3500 / sysmex-uwam: staged, host-query, TCP + serial');
+}
+
 console.log('profiles: all checks passed');

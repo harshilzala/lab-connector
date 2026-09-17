@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { AnalyzerConfig } from '../config.js';
 import type { HmisClient } from '../hmis/client.js';
-import type { HmisResultUpload, MirthAcknowledgeItem, OrderDownload, ParsedMessage, PendingOrders } from '../types.js';
+import type { HmisResultUpload, HostQuery, MirthAcknowledgeItem, OrderDownload, ParsedMessage, PendingOrders } from '../types.js';
 import type { ProtocolLink, WireEvent } from '../codec/types.js';
 import { createTransport } from '../transport/index.js';
 import type { Transport } from '../transport/types.js';
@@ -897,7 +897,7 @@ export class AnalyzerRuntime {
       if (!this.cfg.hostQuery) {
         this.log.warn('received host query but hostQuery is disabled — ignoring');
       } else {
-        for (const q of msg.queries) await this.answerQuery(q.sampleId);
+        for (const q of msg.queries) await this.answerQuery(q);
       }
     }
 
@@ -952,7 +952,8 @@ export class AnalyzerRuntime {
     }
   }
 
-  private async answerQuery(barcode: string): Promise<void> {
+  private async answerQuery(query: HostQuery): Promise<void> {
+    const barcode = query.sampleId;
     // HMIS matches barcodes case-sensitively; look up with the canonical
     // uppercase form so a lowercase-entered sample still resolves its order.
     const lookup = normalizeBarcode(barcode);
@@ -986,6 +987,8 @@ export class AnalyzerRuntime {
         priority: pending.priority,
         patient: this.cfg.sendDemographics ? pending.patient : null,
         specimenType: pending.specimenType,
+        queryReply: true,
+        specimenIdField: query.specimenIdField,
       };
       await this.link.sendOrders([order]);
       // A query answer is a full download, so the poller need not repeat it.

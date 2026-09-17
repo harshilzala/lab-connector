@@ -431,6 +431,147 @@ const SNIBE_MAGLUMI: AnalyzerProfile = {
   },
 };
 
+// ---- Sysmex UF-4000 / UF-5000 + UC-3500 (+ U-WAM) — urinalysis, ASTM E1381/E1394
+//
+// Source: the site's Sysmex manuals (C:\Users\APPADMIN\Downloads\
+// fwsysmexusermanual, read 2026-09-16) — UC-3500 Basic Operation (BO) and
+// General Information (GI) 1909, UF-4000 BO / GI / TS 2302, and the two
+// operator quick guides — plus the Sysmex host-interface convention the
+// XN/UF/UC family shares. None of the manuals carries the record layout
+// ("for interface specifications ... contact your local Sysmex service
+// representative", UC-3500 BO §5.3.2, §5.4.2), so the layout is the
+// `sysmex` dialect in src/codec/astm/dialects.ts and is to be CONFIRMED on
+// the first capture — SETUP-SYSMEX-URINE.md is the checklist.
+//
+// What the manuals DO establish:
+//
+//   • Two instruments share one urine sample: the UC-3500 reads the test
+//     strip (URO BLD PRO GLU KET BIL NIT LEU pH CRE ALB P/C A/C S.G COLOR
+//     CLOUD — GI §1.2), the UF-4000 counts the particles by flow cytometry
+//     (RBC WBC EC CAST BACT X'TAL YLC SPERM MUCUS and the sub-classes;
+//     body-fluid mode adds MN#/MN% PMN#/PMN% TNC — GI §1.3). HMIS holds
+//     one urine routine panel, so each link files its half and the panel
+//     completes when both have reported: staged filing, never queue.
+//   • UC-3500 is SERIAL ONLY: "External input/output: RS-232C output x 2,
+//     USB x 2" (GI §4 specifications); no Ethernet port on the analyzer.
+//     It host-queries when [MEAS. SETTINGS] → [ORDER] = USE (BO §5.3.2),
+//     outputs results in real time by default (BO §4.2.3, "REAL-TIME
+//     OUTPUT" in [RS-232C PARAMETER], §5.4.2) and always in CONVENTIONAL
+//     units on the wire whatever the display unit (BO §5.2). S.G. is
+//     clamped to 1.000–1.050. Colour-interference marks "!" / "?" ride on
+//     the value.
+//   • UF-4000 is ETHERNET: "(5) Ethernet ports — used for the connection to
+//     the host computer" (GI §3.1). [System Settings] → [Host] enables the
+//     link (BO §6.4.6); [Query for analysis information] on the sampler /
+//     STAT dialogs asks the host per tube (BO §3); [Auto Output(Host)]
+//     picks NORMAL / REVIEW / ERROR / QC results to push (BO §6.8.4). The
+//     unit per parameter is a setting (/uL, /HPF, /LPF, rank "-,+,2+" …,
+//     BO §6.8.5): HMIS's factor must match whatever the site chooses.
+//     Research parameters (RBC-P70Fsc, RBC-Fsc-DW, Large/Small/Lysed RBC,
+//     SRC, Atyp.C, DEBRIS, Cond., Osmo. — GI §8.1.1) are "not for
+//     diagnosis" and are ignore-listed; so are the Info/flag items
+//     (RBC-Info, UTI?, …, GI §5.6.4).
+//   • The operator quick guide says "Check QC results in UWAM": the site
+//     has a Sysmex U-WAM (Urinalysis Work Area Manager) PC between the two
+//     analyzers and the LIS. Where the LIS connects to the U-WAM instead of
+//     the analyzers, ONE TCP link carries both instruments' values for a
+//     sample — that is the `sysmex-uwam` profile.
+//   • Which side of the TCP connection the IPU / U-WAM takes is a Sysmex
+//     service setting (host IP + port + client/server on their screen).
+//     The profile assumes the analyzer dials the PC — the common Sysmex
+//     setup — and the site block gives the port; flip `transport.mode`
+//     to "client" with the analyzer's IP if service configured it the other
+//     way round.
+//   • Serial parameters for the UC-3500 ([RS-232C SETTINGS], BO §5.4.2)
+//     are set by service; 9600 8-N-1 is the family default and an
+//     assumption until read off that screen.
+//
+// No allow-list on any of the three: the wire spelling of the mnemonics is
+// unconfirmed, and an allow-list written from the manual's display names
+// would silently drop every value if the wire spells one differently. The
+// scope is set by which parameters HMIS registers under the equipment code;
+// once the first capture shows the real codes, promote them to an
+// allow-list here.
+const SYSMEX_ASTM = {
+  ackTimeoutMs: 15000,
+  frameMaxData: 240,
+  senderId: 'HMIS-LIS',
+  receiverId: '',
+  dialect: 'sysmex',
+  sampleIdFrom: 'order',
+} as const;
+
+/** Sysmex QC material ids as they can appear as a sample number. The UF
+ *  runs "UF CONTROL"; the UC-3500 registers control ids by barcode (BO
+ *  §2.6) — the operator's convention for those goes in the site block. */
+const SYSMEX_QC_PREFIXES = ['QC', 'QC-', 'CTRL', 'CONTROL', 'UF CONTROL', 'UF-CONTROL', 'UFCONTROL', 'UF CTRL', 'UC CONTROL', 'UC-CONTROL'];
+
+/** UF-4000 lines that are not reportable results: research parameters (GI
+ *  §8.1.1), the RBC-Info / UTI? / BACT-Info judgement items (GI §5.6.4) and
+ *  any "?"-suffixed suspect flag. */
+const UF_IGNORE_CODES = [
+  '*Info*', '*?',
+  'RBC-P70Fsc', 'RBC-Fsc-DW', 'Large RBC', 'Small RBC', 'Lysed RBC', 'SRC', 'Atyp.C', 'DEBRIS', 'Cond.', 'Osmo.',
+];
+
+const SYSMEX_UF4000: AnalyzerProfile = {
+  description: 'Sysmex UF-4000 / UF-5000 urine particle analyzer, ASTM E1381/E1394 over TCP; analyzer dials the LIS and host-queries each tube',
+  defaults: {
+    protocol: 'astm',
+    transport: { type: 'tcp', mode: 'server', host: '0.0.0.0' },
+    sendDemographics: false,
+    hostQuery: true,
+    // Rows are cached by the poll so a value files even when the tube was
+    // run with [Query for analysis information] off; nothing is pushed —
+    // the instrument runs its fixed panel regardless of the order.
+    orderPoll: { enabled: true, download: false },
+    // Half a panel per instrument: each value files when its row exists and
+    // the rest wait, one sample never blocking another.
+    filing: { mode: 'staged' },
+    fillMissingOrderRows: true,
+    qc: { sampleIdPrefixes: SYSMEX_QC_PREFIXES, upload: false },
+    ignoreTestCodes: UF_IGNORE_CODES,
+    testCodeScale: {},
+    astm: SYSMEX_ASTM,
+  },
+};
+
+const SYSMEX_UC3500: AnalyzerProfile = {
+  description: 'Sysmex UC-3500 urine chemistry (test strip) analyzer, ASTM E1381/E1394 over RS-232C; host-queries each tube. Site block gives the COM port (or an NPort to dial)',
+  defaults: {
+    protocol: 'astm',
+    // RS-232C is the ONLY host port on this analyzer (GI §4). 9600 8-N-1 is
+    // the assumed setting — read the real one off [RS-232C SETTINGS].
+    transport: { type: 'serial', baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none', dtr: true, rts: true },
+    sendDemographics: false,
+    hostQuery: true,
+    orderPoll: { enabled: true, download: false },
+    filing: { mode: 'staged' },
+    fillMissingOrderRows: true,
+    qc: { sampleIdPrefixes: SYSMEX_QC_PREFIXES, upload: false },
+    ignoreTestCodes: [],
+    testCodeScale: {},
+    astm: SYSMEX_ASTM,
+  },
+};
+
+const SYSMEX_UWAM: AnalyzerProfile = {
+  description: "Sysmex U-WAM urinalysis work-area manager fronting a UC-3500 + UF-4000/UF-5000 pair, ASTM E1381/E1394 over TCP; one link carries both instruments' results per sample",
+  defaults: {
+    protocol: 'astm',
+    transport: { type: 'tcp', mode: 'server', host: '0.0.0.0' },
+    sendDemographics: false,
+    hostQuery: true,
+    orderPoll: { enabled: true, download: false },
+    filing: { mode: 'staged' },
+    fillMissingOrderRows: true,
+    qc: { sampleIdPrefixes: SYSMEX_QC_PREFIXES, upload: false },
+    ignoreTestCodes: UF_IGNORE_CODES,
+    testCodeScale: {},
+    astm: SYSMEX_ASTM,
+  },
+};
+
 export const PROFILE_LIBRARY = {
   'mindray-bc5150': MINDRAY_BC5150,
   /** Same protocol document and defaults as the BC-5150. */
@@ -443,6 +584,11 @@ export const PROFILE_LIBRARY = {
   'vitros-eci': VITROS_ECIQ,
   'vitros-250': VITROS_250,
   'snibe-maglumi': SNIBE_MAGLUMI,
+  'sysmex-uf4000': SYSMEX_UF4000,
+  /** Same IPU host interface as the UF-4000. */
+  'sysmex-uf5000': SYSMEX_UF4000,
+  'sysmex-uc3500': SYSMEX_UC3500,
+  'sysmex-uwam': SYSMEX_UWAM,
 } as const satisfies Record<string, AnalyzerProfile>;
 
 export type ProfileName = keyof typeof PROFILE_LIBRARY;

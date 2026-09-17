@@ -149,6 +149,90 @@ console.log('\n[10] A dialect must not leak into another dialect\'s decoding');
 const cross = parseMessage(['H|\\^&|||X', 'O|1|S1||^^^x', 'R|1|^^^1.000000+032+1|5||||||||||', 'L|1|N'], 'raw', 'atellica');
 eq('atellica keeps the whole component', cross.results.map((x) => x.testCode), ['1.000000+032+1']);
 
+console.log('\n[12] Sysmex UF-4000 host query  (padded sample no ^ rack ^ tube; code in component 5)');
+// Shape from the Sysmex XN/UF/UC host-interface convention — NOT yet a capture
+// from the site (SETUP-SYSMEX-URINE.md). The sample number is right-justified
+// in 15 characters; rack and tube position follow.
+const SYSMEX_SPECIMEN = '   SF2609160001^A1^3^^^^^^^^^^^^^^^^^^^^^^';
+const sq = parseMessage(
+  ['H|\\^&|||UF-4000^00-01^12345678^^^^AB123456||||||||E1394-97|20260916101500', 'Q|1|' + SYSMEX_SPECIMEN + '||^^^^URI|||||||O', 'L|1|N'],
+  'raw',
+  'sysmex',
+);
+eq('sender', sq.sender, 'UF-4000');
+eq('query sampleId is trimmed', sq.queries.map((x) => x.sampleId), ['SF2609160001']);
+eq('query keeps the specimen field verbatim', sq.queries.map((x) => x.specimenIdField), [SYSMEX_SPECIMEN]);
+
+console.log('\n[13] Sysmex UF-4000 result upload  ("^^^^RBC^1" — the code is NOT in the ASTM component)');
+const sr = parseMessage(
+  [
+    'H|\\^&|||UF-4000^00-01^12345678^^^^AB123456||||||||E1394-97|20260916101800',
+    'P|1',
+    'O|1|' + SYSMEX_SPECIMEN + '||^^^^URI|R||20260916101500|||||||||||||||||F',
+    'R|1|^^^^RBC^1|12.3|/uL||N||F||||20260916101700',
+    'R|2|^^^^WBC^1|4.0|/uL||N||F||||20260916101700',
+    'R|3|^^^^BACT^1|250.0|/uL||H||F||||20260916101700',
+    'R|4|^^^^RBC-Info^1|Isomorphic?|||||F||||20260916101700',
+    'L|1|N',
+  ],
+  'raw',
+  'sysmex',
+);
+eq('results', sr.results.map((x) => [x.sampleId, x.testCode, x.value, x.unit, x.abnormalFlag, x.status, x.completedAt]), [
+  ['SF2609160001', 'RBC', '12.3', '/uL', 'N', 'F', '20260916101700'],
+  ['SF2609160001', 'WBC', '4.0', '/uL', 'N', 'F', '20260916101700'],
+  ['SF2609160001', 'BACT', '250.0', '/uL', 'H', 'F', '20260916101700'],
+  ['SF2609160001', 'RBC-Info', 'Isomorphic?', null, null, 'F', '20260916101700'],
+]);
+
+console.log('\n[14] Sysmex UC-3500 result upload  (qualitative strip values, conventional units)');
+const ucr = parseMessage(
+  [
+    'H|\\^&|||UC-3500^00-01^87654321||||||||E1394-97|20260916102000',
+    'P|1',
+    'O|1|   SF2609160001^A1^3||^^^^URI|R||20260916101900|||||||||||||||||F',
+    'R|1|^^^^GLU^1|NEGATIVE|mg/dL||N||F',
+    'R|2|^^^^PRO^1|30|mg/dL||A||F',
+    'R|3|^^^^S.G^1|1.020|||N||F',
+    'R|4|^^^^COLOR^1|YELLOW|||N||F',
+    'L|1|N',
+  ],
+  'raw',
+  'sysmex',
+);
+eq('results', ucr.results.map((x) => [x.testCode, x.value, x.unit]), [
+  ['GLU', 'NEGATIVE', 'mg/dL'], ['PRO', '30', 'mg/dL'], ['S.G', '1.020', null], ['COLOR', 'YELLOW', null],
+]);
+
+console.log('\n[15] Sysmex query REPLY echoes the specimen field and marks report type Q');
+const sysReply = buildOrderMessage(
+  [{ sampleId: 'SF2609160001', testCodes: ['URI'], priority: 'R', patient: null, specimenType: null,
+     queryReply: true, specimenIdField: SYSMEX_SPECIMEN }],
+  { senderId: 'HMIS-LIS', receiverId: '', sendDemographics: false, dialect: 'sysmex' },
+);
+eq('records', sysReply.map(stamp), [
+  'H|\\^&|||HMIS-LIS||||||||E1394-97|<ts>',
+  'P|1',
+  'O|1|' + SYSMEX_SPECIMEN + '||^^^^URI^1|R||||||||||||||||||||Q',
+  'L|1|N',
+]);
+for (const l of sysReply) console.log('      ' + l);
+
+console.log('\n[16] Sysmex unsolicited download uses the bare barcode and report type O');
+const sysPush = buildOrderMessage(
+  [{ sampleId: 'SF2609160001', testCodes: ['URI', 'BF'], priority: 'S', patient: null, specimenType: null }],
+  { senderId: 'HMIS-LIS', receiverId: '', sendDemographics: false, dialect: 'sysmex' },
+);
+eq('O record', sysPush[2], 'O|1|SF2609160001||^^^^URI^1\\^^^^BF^1|S||||||||||||||||||||O');
+
+console.log('\n[17] The reply flags change nothing for the other dialects');
+const magReply = buildOrderMessage(
+  [{ sampleId: '1234567', testCodes: ['TSH'], priority: 'R', patient: null, specimenType: 'Serum',
+     queryReply: true, specimenIdField: '^1234567' }],
+  { senderId: 'Maglumi 1000', receiverId: 'Lis', sendDemographics: false, dialect: 'maglumi' },
+);
+eq('maglumi O record unchanged', magReply[2], 'O|1|1234567||^^^TSH|R');
+
 console.log('\n[11] Every dialect in the library builds a well-formed message');
 for (const name of ASTM_DIALECT_NAMES) {
   const out = buildOrderMessage(

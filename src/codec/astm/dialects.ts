@@ -39,6 +39,10 @@ export interface TestIdCodec {
   encode(codes: readonly string[], d: Delimiters): string;
   /** Read ONE assay code back out of an R record's Universal Test ID field. */
   decode(component: string): string;
+  /** 0-based component of the Universal Test ID that carries the code. ASTM
+   *  puts it in the 4th (index 3) and that is the default; Sysmex puts it in
+   *  the 5th ("^^^^RBC^1"). */
+  readonly component?: number;
 }
 
 export interface DialectProfile {
@@ -53,6 +57,15 @@ export interface DialectProfile {
   /** P record when demographics are suppressed. */
   readonly patientAnonymous: FieldMap;
   readonly order: FieldMap;
+  /** O record used when the download ANSWERS a host query, where the vendor
+   *  wants it marked differently from an unsolicited download (ASTM report
+   *  type "Q" — response to query — instead of "O"). Unset: `order` is used
+   *  for both. */
+  readonly orderQueryReply?: FieldMap;
+  /** Echo the instrument's own specimen-id field back verbatim on a query
+   *  reply — Sysmex sends "<sample no>^<rack>^<tube position>" and matches
+   *  the answer on that, not on the bare barcode. Unset: the bare barcode. */
+  readonly echoQuerySpecimenId?: boolean;
   readonly terminator: FieldMap;
   /** One O record per assay, vs one O carrying every assay for the tube. */
   readonly orderPerTest: boolean;
@@ -85,6 +98,22 @@ const plainCode: TestIdCodec = {
 const rankedCode: TestIdCodec = {
   encode: (codes, d) => codes.map((c) => ['', '', '', c, '', '', '1'].join(d.component)).join(d.repeat),
   decode: (component) => component.trim(),
+};
+
+/**
+ * "^^^^RBC^1" — the Sysmex shape (XN-series, UF-4000/UF-5000, UC-3500 and the
+ * U-WAM all share it): FOUR leading carets, the analyte in component 5 and a
+ * dilution / rank of "1" in component 6. ASTM puts the code one component
+ * earlier, which is why this codec names its component explicitly — read at
+ * index 3 a Sysmex result has an empty code and files nowhere.
+ *
+ * From the Sysmex host-interface convention, not yet from this site's wire:
+ * confirm on the first capture (SETUP-SYSMEX-URINE.md).
+ */
+const sysmexCode: TestIdCodec = {
+  encode: (codes, d) => codes.map((c) => ['', '', '', '', c, '1'].join(d.component)).join(d.repeat),
+  decode: (component) => component.trim(),
+  component: 4,
 };
 
 /**
@@ -219,6 +248,54 @@ export const ASTM_DIALECT_LIBRARY = {
     orderPerTest: false,
     timestamp: 'datetime',
     tests: vitrosDilutionCode,
+  },
+
+  /**
+   * Sysmex UF-4000 / UF-5000 urine particle analyzer, UC-3500 urine chemistry
+   * analyzer and the U-WAM work-area manager that fronts both.
+   *
+   * The site's manuals (UC-3500 BO §5.3.2/§5.4.2, UF-4000 BO §6.4.6) confirm
+   * the behaviour — host query per tube, real-time result output — but refer
+   * the record layout to "your local Sysmex service representative". This
+   * layout is the Sysmex ASTM convention shared by the XN/UF/UC family:
+   *
+   *   analyzer → host
+   *   H|^&|||UF-4000^00-01^12345678^^^^AB123456||||||||E1394-97|20230101120000
+   *   Q|1|       SF2609160001^A1^1||^^^^URI|||||||O
+   *   O|1|       SF2609160001^A1^1||^^^^URI|R||20230101120000|||||||||||||||||F
+   *   R|1|^^^^RBC^1|10.0|/uL||N||F||||20230101120100
+   *
+   *   host → analyzer (reply to the query)
+   *   H|^&|||HMIS-LIS||||||||E1394-97|20230101120005
+   *   P|1
+   *   O|1|       SF2609160001^A1^1||^^^^URI^1|R||||||||||||||||||||||Q
+   *   L|1|N
+   *
+   * Points that matter and are NOT yet confirmed on this site's wire:
+   *   • the sample number is right-justified in a 15-character field (leading
+   *     spaces) with rack and tube position in the next two components. The
+   *     parser trims; the reply echoes the field verbatim so the instrument
+   *     matches it on rack/tube as well as on the number.
+   *   • a query reply carries report type "Q" in O field 26; an unsolicited
+   *     download carries "O".
+   *   • the test codes downloaded are whatever HMIS registers as eqIdntifier
+   *     for the equipment code — the instrument runs its fixed panel either
+   *     way, so a mismatch loses nothing but the order match on screen.
+   * See SETUP-SYSMEX-URINE.md for the commissioning checklist.
+   */
+  sysmex: {
+    label: 'Sysmex UF-4000 / UF-5000 / UC-3500 / U-WAM',
+    confirmedBy: 'Sysmex host-interface convention (XN/UF/UC family) — NOT yet a capture from this site',
+    header: { 0: 'H', 1: '$delims', 4: '$sender', 12: 'E1394-97', 13: '$stamp' },
+    patient: { 0: 'P', 1: '$seq', 3: '$patientId', 5: '$name', 7: '$birth', 8: '$sex' },
+    patientAnonymous: { 0: 'P', 1: '$seq' },
+    order: { 0: 'O', 1: '$seq', 2: '$sample', 4: '$tests', 5: '$priority', 25: 'O' },
+    orderQueryReply: { 0: 'O', 1: '$seq', 2: '$sample', 4: '$tests', 5: '$priority', 25: 'Q' },
+    echoQuerySpecimenId: true,
+    terminator: { 0: 'L', 1: '1', 2: 'N' },
+    orderPerTest: false,
+    timestamp: 'datetime',
+    tests: sysmexCode,
   },
 } as const satisfies Record<string, DialectProfile>;
 

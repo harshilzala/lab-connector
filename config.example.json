@@ -66,7 +66,7 @@
       // `dialect` selects the vendor's record layout from the dialect library
       // (src/codec/astm/dialects.ts). An analyzer SILENTLY IGNORES an order it
       // cannot parse, so the wrong dialect looks exactly like a dead cable.
-      // Entries today: "atellica", "maglumi", "vitros-eciq".
+      // Entries today: "atellica", "maglumi", "vitros-eciq", "sysmex".
       // ---------------------------------------------------------------------
       "id": "example-astm",
       "equipmentCode": "EQCODE01",

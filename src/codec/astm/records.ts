@@ -72,8 +72,13 @@ const reps = (v: string | undefined, d: Delimiters) => (v ?? '').split(d.repeat)
  */
 function testCodeFromUniversalId(field: string | undefined, d: Delimiters, name?: AstmDialect): string {
   const c = comps(field, d);
-  const raw = c[3] && c[3].trim() ? c[3].trim() : (c.find((x) => x.trim())?.trim() ?? '');
-  return raw ? dialect(name).tests.decode(raw) : '';
+  const { tests } = dialect(name);
+  // Sysmex lands the code one component later ("^^^^RBC^1"); the codec says
+  // where. Falling back to the first non-empty component keeps a layout we
+  // have not seen filing SOMETHING rather than nothing.
+  const at = c[tests.component ?? 3];
+  const raw = at && at.trim() ? at.trim() : (c.find((x) => x.trim())?.trim() ?? '');
+  return raw ? tests.decode(raw) : '';
 }
 
 // -----------------------------------------------------------------------------
@@ -144,7 +149,10 @@ export function parseMessage(
         // match the O-record specimen-id logic and the barcode HMIS registers.
         const rangeComps = comps(f[2], d);
         const sampleId = rangeComps.find((x) => x.trim())?.trim() || '';
-        const query: HostQuery = { sampleId, testCodes: [] };
+        // Keep the field verbatim as well: a Sysmex matches the reply on the
+        // padded sample number + rack + tube position it sent, not on the
+        // bare barcode.
+        const query: HostQuery = { sampleId, testCodes: [], specimenIdField: f[2] ?? '' };
         currentSampleId = sampleId;
         msg.queries.push(query);
         break;
@@ -266,10 +274,15 @@ export function buildOrderMessage(
       lines.push(renderRecord(fmt.patientAnonymous, { $seq: String(seq) }, d));
     }
 
+    // A query reply may take a different O layout (Sysmex marks it report
+    // type "Q") and may echo the instrument's own specimen-id field.
+    const isReply = !!o.queryReply;
+    const orderMap = isReply && fmt.orderQueryReply ? fmt.orderQueryReply : fmt.order;
+    const sample = isReply && fmt.echoQuerySpecimenId && o.specimenIdField ? o.specimenIdField : o.sampleId;
     const orderRecord = (n: number, codes: readonly string[]) =>
-      renderRecord(fmt.order, {
+      renderRecord(orderMap, {
         $seq: String(n),
-        $sample: o.sampleId,
+        $sample: sample,
         $tests: fmt.tests.encode(codes, d),
         $priority: o.priority ?? 'R',
         $specimen: o.specimenType ?? '',
