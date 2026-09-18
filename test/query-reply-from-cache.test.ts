@@ -52,8 +52,10 @@ const UNKNOWN = 'LB2609180003';
 
 // What HMIS answers: the date POLL lists the cached barcode; a per-sample
 // lookup lists only LIVE — the cached barcode's rows have been withdrawn.
+let hmisCalls = 0;
 const hmis = {
   async getPending(q: { sampleId?: string }) {
+    hmisCalls++;
     if (!q.sampleId) return { status: 'success', data: [row(CACHED, 'WBC Clumps', 5949), row(CACHED, 'SPERM', 5959)] };
     if (q.sampleId === LIVE) return { status: 'success', data: [row(LIVE, 'YLC', 5958)] };
     return { status: 'success', data: [] };
@@ -94,6 +96,15 @@ sent.length = 0;
 await inner.answerQuery({ sampleId: UNKNOWN, testCodes: [], specimenIdField: UNKNOWN });
 assert.deepEqual(sent, [[]], 'empty download for a barcode with no order anywhere');
 console.log('✓ an unknown barcode still gets the empty download');
+
+// ---- 3b) a control id is answered too — with the empty download, no HMIS call
+// (the Maglumi X6's "$lc$" query of 2026-09-17 19:52Z got no reply at all)
+sent.length = 0;
+const hmisCallsBefore = hmisCalls;
+await inner.answerQuery({ sampleId: 'QC-LEVEL1', testCodes: [], specimenIdField: 'QC-LEVEL1' });
+assert.deepEqual(sent, [[]], 'a control id gets the empty download');
+assert.equal(hmisCalls, hmisCallsBefore, 'HMIS is not asked about a control');
+console.log('✓ a QC/control id is answered with the empty download, without asking HMIS');
 
 // ---- 4) HMIS sees the barcode — answered from HMIS as before -------------
 sent.length = 0;

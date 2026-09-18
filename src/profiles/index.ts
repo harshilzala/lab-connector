@@ -584,10 +584,16 @@ const SYSMEX_UC3500: AnalyzerProfile = {
  *  trace; "+" on nitrite is Positive; the grades "1+" … "4+" pass through.
  *  Urobilinogen arrives as the word "normal" (lower case) rather than "-"
  *  on this U-WAM (137 of 137 negatives on 2026-09-17/18), so both spellings
- *  are listed. Pads the table does not name (C-BLD, C-LEU, C-CLOUD,
+ *  are listed. Pads the table does not name (C-BLD, C-LEU,
  *  C-COLOR, C-PH, C-S.G.(Ref)) are filed as the instrument sends them.
  *  Strictly the U-WAM link: a UF-4000 or UC-3500 connected on its own has
  *  no such table yet. */
+/** What the U-WAM link does not sync: everything the UF-4000 list drops,
+ *  plus the strip's turbidity pad C-CLOUD — the lab does not interface it
+ *  (2026-09-18); its HMIS row is filled by other means. Dropped at delivery
+ *  time as `ignored`, so it is never filed, re-queued or reported unmatched. */
+const UWAM_IGNORE_CODES = [...UF_IGNORE_CODES, 'C-CLOUD'];
+
 const UWAM_VALUE_MAP: Record<string, Record<string, string>> = {
   'C-PRO': { '-': 'Absent', '+-': 'trace' },
   'C-GLU': { '-': 'Absent', '+-': 'trace' },
@@ -608,7 +614,7 @@ const SYSMEX_UWAM: AnalyzerProfile = {
     filing: { mode: 'staged' },
     fillMissingOrderRows: true,
     qc: { sampleIdPrefixes: SYSMEX_QC_PREFIXES, upload: false },
-    ignoreTestCodes: UF_IGNORE_CODES,
+    ignoreTestCodes: UWAM_IGNORE_CODES,
     testCodeScale: {},
     testValueMap: UWAM_VALUE_MAP,
     astm: SYSMEX_ASTM,

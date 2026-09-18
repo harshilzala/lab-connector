@@ -48,8 +48,10 @@ function sent(values: Record<string, string>): Record<string, string> {
   const joined = toLisResultRows(upload, orderRows, undefined, cfg.testCodeAliases, cfg.ignoreTestCodes, cfg.testCodeScale,
     cfg.allowTestCodes, cfg.excludeIdentifiers, cfg.excludeParameterIds, cfg.testValueMap);
   assert.deepEqual(joined.unmatched, [], 'every pad has a row');
+  lastIgnored = joined.ignored;
   return Object.fromEntries(joined.rows.map((r) => [r.identifier, r.resultValue]));
 }
+let lastIgnored: string[] = [];
 
 // ---- the table, row by row ------------------------------------------------
 const table: Array<[string, string, string]> = [
@@ -66,13 +68,17 @@ for (const [pad, from, to] of table) {
 console.log(`✓ ${table.length} table rows: "-" -> Absent/Negative/Normal, "+-" -> trace, "+" -> Positive, grades pass through`);
 
 // ---- pads the table does not name are filed as the instrument sends them ---
-assert.deepEqual(sent({ 'C-BLD': '-', 'C-LEU': '-', 'C-CLOUD': '-', 'C-BLD': '+-' } as Record<string, string>),
-  { 'C-BLD': '+-', 'C-LEU': '-', 'C-CLOUD': '-' });
-console.log('✓ C-BLD / C-LEU / C-CLOUD untouched');
+assert.deepEqual(sent({ 'C-LEU': '-', 'C-BLD': '+-' }), { 'C-BLD': '+-', 'C-LEU': '-' });
+console.log('✓ C-BLD / C-LEU untouched');
+
+// ---- C-CLOUD is not interfaced on the U-WAM link: dropped, never filed ------
+assert.deepEqual(sent({ 'C-CLOUD': '-', 'C-KET': '-' }), { 'C-KET': 'Absent' });
+assert.deepEqual(lastIgnored, ['C-CLOUD'], 'C-CLOUD reported as ignored, not unmatched');
+console.log('✓ C-CLOUD dropped at delivery (ignore list), its HMIS row left for other means');
 
 // ---- a whole strip at once, as one U-WAM message files ----------------------
 assert.deepEqual(
-  sent({ 'C-URO': 'normal', 'C-BLD': '+-', 'C-BIL': '-', 'C-KET': '-', 'C-GLU': '4+', 'C-PRO': '+-', 'C-NIT': '-', 'C-LEU': '2+' }),
+  sent({ 'C-URO': 'normal', 'C-BLD': '+-', 'C-BIL': '-', 'C-KET': '-', 'C-GLU': '4+', 'C-PRO': '+-', 'C-NIT': '-', 'C-LEU': '2+', 'C-CLOUD': '-' }),
   { 'C-URO': 'Normal', 'C-BLD': '+-', 'C-BIL': 'Absent', 'C-KET': 'Absent', 'C-GLU': '4+', 'C-PRO': 'trace', 'C-NIT': 'Negative', 'C-LEU': '2+' },
 );
 console.log('✓ a full strip files in the lab\'s words');

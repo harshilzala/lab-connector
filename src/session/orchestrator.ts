@@ -974,7 +974,16 @@ export class AnalyzerRuntime {
     // trip per retry (89772 produced 100 identical pending queries), so answer
     // the instrument locally with no order instead.
     if (isQcSample(lookup, this.cfg.qc)) {
-      this.log.info({ barcode: lookup }, 'QC/control barcode — not queried against HMIS');
+      // The instrument is still waiting for an answer: a query left hanging
+      // holds its sampler until the host timeout. The Maglumi X6's "$lc$"
+      // control query of 2026-09-17 19:52Z got nothing back at all. Send the
+      // empty download, exactly as for a barcode with no order.
+      this.log.info({ barcode: lookup }, 'QC/control barcode — not queried against HMIS, answered with an empty download');
+      try {
+        await this.link.sendOrders([]);
+      } catch (err) {
+        this.log.error({ barcode, err: err instanceof Error ? err.message : String(err) }, 'host-query reply failed');
+      }
       return;
     }
     try {
