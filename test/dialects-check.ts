@@ -168,6 +168,12 @@ const UWAM_RECORDS = [
   'R|10|^^^C-GLU^A^1^S^  0009^01|4+^MAINFORMAT|||H||||^^device||20260917105802|UC-3500',
   'R|17|^^^C-LEU^A^1^S^  0009^01|-^RAW|||N||||^^device||20260917105802|UC-3500',
   'R|18|^^^C-LEU^A^1^S^  0009^01|^MAINFORMAT|c/µL||N||||^^device||20260917105802|UC-3500',
+  // Grades identical in both halves, including the trace "+-" (C-BLD ×21,
+  // C-GLU ×15, C-PRO ×17 on 2026-09-17/18).
+  'R|7|^^^C-KET^A^1^S^  0009^01|1+^RAW|||H||||^^device||20260917105802|UC-3500',
+  'R|8|^^^C-KET^A^1^S^  0009^01|1+^MAINFORMAT|||H||||^^device||20260917105802|UC-3500',
+  'R|11|^^^C-PRO^A^1^S^  0009^01|+-^RAW|||N||||^^device||20260917105802|UC-3500',
+  'R|12|^^^C-PRO^A^1^S^  0009^01|+-^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
   'R|19|^^^C-S.G.(Ref)^A^1^S^  0009^01|1.010^RAW|||N||||^^device||20260917105802|UC-3500',
   'R|20|^^^C-S.G.(Ref)^A^1^S^  0009^01|1.010^MAINFORMAT|||N||||^^device||20260917105802|UC-3500',
   'R|21|^^^C-COLOR^A^1^S^  0009^01|STRAW     02^RAW|||N||||^^device||20260917105802|UC-3500',
@@ -200,6 +206,8 @@ eq(
     ['ZC2609170035', 'C-BIL', '-', null, 'N', 'UC-3500'],
     ['ZC2609170035', 'C-GLU', '4+', null, 'H', 'UC-3500'],
     ['ZC2609170035', 'C-LEU', '-', null, 'N', 'UC-3500'],
+    ['ZC2609170035', 'C-KET', '1+', null, 'H', 'UC-3500'],
+    ['ZC2609170035', 'C-PRO', '+-', null, 'N', 'UC-3500'],
     ['ZC2609170035', 'C-S.G.(Ref)', '1.010', null, 'N', 'UC-3500'],
     ['ZC2609170035', 'C-COLOR', 'STRAW     02', null, 'N', 'UC-3500'],
     ['ZC2609170035', 'C-Error Code', '0000', null, 'N', 'UC-3500'],
@@ -211,6 +219,32 @@ eq(
 );
 eq('a parameter blank in both formats (C-ColorRANK) is not a result', uwam.results.some((x) => x.testCode === 'C-ColorRANK'), false);
 eq('the image record is not a result', uwam.results.some((x) => /png/i.test(x.value) || x.testCode === 'A'), false);
+
+console.log('\n[12b] A strip GRADE wins over a concentration whichever half carries it (C-LEU ↔ C-BIL, 2026-09-18)');
+// Measured 2026-09-17/18: C-LEU RAW is the grade and MAINFORMAT is blank or
+// 25/75/500 c/µL; C-BIL is the mirror image. A pad must file on one scale.
+const MIRROR_RECORDS = [
+  'H|\\^&|||U-WAM^00-22_Build003^A1494^^^^AU501736||||||||LIS2-A2|20260918003810',
+  'P|1',
+  'O|1|LB2609180027||^^^C-BIL\\^^^C-LEU\\^^^C-BLD\\^^^RBC|R||20260918003709|||||||||||||||||F',
+  'R|5|^^^C-BIL^A^1^S^  0031^01|0.5^RAW|mg/dL||H||||^^device||20260918003700|UC-3500',
+  'R|6|^^^C-BIL^A^1^S^  0031^01|1+^MAINFORMAT|||H||||^^device||20260918003700|UC-3500',
+  'R|17|^^^C-LEU^A^1^S^  0031^01|2+^RAW|||H||||^^device||20260918003700|UC-3500',
+  'R|18|^^^C-LEU^A^1^S^  0031^01|75^MAINFORMAT|c/µL||H||||^^device||20260918003700|UC-3500',
+  'R|3|^^^C-BLD^A^1^S^  0031^01|10^RAW|c/µL||N||||^^device||20260918003700|UC-3500',
+  'R|4|^^^C-BLD^A^1^S^  0031^01|10^MAINFORMAT|c/µL||N||||^^device||20260918003700|UC-3500',
+  'R|29|^^^RBC^A^1^S^  0031^01|8.0^RAW|/µl||N||||^^device||20260918003700|UF-4000',
+  'R|30|^^^RBC^A^1^S^  0031^01|1.4^MAINFORMAT|/HPF||N||||^^device||20260918003700|UF-4000',
+  'L|1|N',
+];
+const mirror = parseMessage(MIRROR_RECORDS, 'raw', 'sysmex');
+eq('grade from either half; numeric-in-both keeps the preferred (MAINFORMAT)',
+  mirror.results.map((x) => [x.testCode, x.value, x.unit]),
+  [['C-BIL', '1+', null], ['C-LEU', '2+', null], ['C-BLD', '10', 'c/µL'], ['RBC', '1.4', '/HPF']]);
+const mirrorRaw = parseMessage(MIRROR_RECORDS, 'raw', 'sysmex', { valueFormat: 'raw' });
+eq('valueFormat "raw" changes only the numeric-in-both pairs',
+  mirrorRaw.results.map((x) => [x.testCode, x.value, x.unit]),
+  [['C-BIL', '1+', null], ['C-LEU', '2+', null], ['C-BLD', '10', 'c/µL'], ['RBC', '8.0', '/µl']]);
 
 console.log('\n[13] Sysmex U-WAM — valueFormat "raw" files the native value, MAINFORMAT when RAW is blank');
 const uwamRaw = parseMessage(UWAM_RECORDS, 'raw', 'sysmex', { valueFormat: 'raw' });

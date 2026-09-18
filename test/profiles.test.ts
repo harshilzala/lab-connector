@@ -229,6 +229,12 @@ function writeConfig(name: string, analyzers: unknown[]): string {
 
   assert.equal(wam!.astm.dialect, 'sysmex');
   assert.equal(wam!.transport.type, 'tcp');
+  // The lab's words for the strip pads ride on the U-WAM profile only.
+  assert.deepEqual(wam!.testValueMap['C-PRO'], { '-': 'Absent', '+-': 'trace' });
+  assert.deepEqual(wam!.testValueMap['C-NIT'], { '-': 'Negative', '+': 'Positive' });
+  assert.deepEqual(wam!.testValueMap['C-URO'], { '-': 'Normal', normal: 'Normal' });
+  assert.deepEqual(uf!.testValueMap, {}, 'a lone UF-4000 has no strip table');
+  assert.deepEqual(uc!.testValueMap, {}, 'a lone UC-3500 has no table yet');
   assert.equal(PROFILE_LIBRARY['sysmex-uf5000'], PROFILE_LIBRARY['sysmex-uf4000'], 'UF-5000 shares the UF-4000 profile');
   console.log('✓ sysmex-uf4000 / sysmex-uc3500 / sysmex-uwam: staged, host-query, TCP + serial');
 }

@@ -62,12 +62,29 @@ function splitValueFormat(field: string, d: Delimiters): { value: string; format
   return { value: field.trim(), format: null };
 }
 
+// A test-strip GRADE: "-", "+-", "+", "1+" … "4+", "normal". The UC-3500
+// reads every strip pad on this scale and HMIS registers strip parameters
+// against it; the U-WAM's "main format" for some pads is a concentration
+// instead, and then only for a positive pad. Measured over 193 messages on
+// 2026-09-17/18: C-LEU RAW is the grade ("-" ×124, "1+" ×13, "2+" ×11,
+// "3+" ×14) while MAINFORMAT is blank for every negative and 25 / 75 / 500
+// c/µL for the positives; C-BIL is the mirror image (RAW blank or 0.5 / 1.0
+// mg/dL, MAINFORMAT the grade). Filing the configured half would put "-"
+// and "25 c/µL" on the same parameter.
+const GRADE = /^(-|\+-|-\+|\+|\d\+|normal)$/i;
+const isGrade = (v: string) => GRADE.test(v);
+
 /**
- * Keep ONE of each RAW/MAINFORMAT pair per parameter — the preferred format,
- * or the other when the preferred one is blank (the U-WAM leaves C-LEU's
- * MAINFORMAT and C-BIL's RAW empty). A parameter blank in both is not a
- * result and is dropped. Results that carried no format tag pass through
- * untouched, in their original order.
+ * Keep ONE of each RAW/MAINFORMAT pair per parameter:
+ *   1. never a blank half — the other is taken (a parameter blank in both is
+ *      not a result and is dropped);
+ *   2. when exactly one half is a strip GRADE, that half — whichever format
+ *      it came in — so a pad is always filed on one scale (C-LEU from RAW,
+ *      C-BIL from MAINFORMAT);
+ *   3. otherwise the preferred format (`valueFormat`): the UF-4000's
+ *      particle counts are numeric in both halves and MAINFORMAT is the
+ *      /HPF the lab reports.
+ * Results that carried no format tag pass through untouched, in order.
  */
 function collapseValueFormats(
   results: InstrumentResult[],
@@ -91,9 +108,11 @@ function collapseValueFormats(
       continue;
     }
     const held = out[at]!;
-    // Replace what is held when this one is the preferred format with a
-    // value, or when the held one is blank and this one is not.
-    const takeThis = r.value !== '' && (format === prefer || held.value === '');
+    let takeThis: boolean;
+    if (r.value === '') takeThis = false;
+    else if (held.value === '') takeThis = true;
+    else if (isGrade(r.value) !== isGrade(held.value)) takeThis = isGrade(r.value); // the grade half wins
+    else takeThis = format === prefer;
     if (takeThis) out[at] = r;
   }
   return out.filter((r) => r.value !== '');

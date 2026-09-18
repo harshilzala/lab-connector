@@ -283,18 +283,26 @@ export const ASTM_DIALECT_LIBRARY = {
    *   • every parameter comes TWICE: "<value>^RAW" (the instrument's native
    *     value, /µl for particles) and "<value>^MAINFORMAT" (the U-WAM's
    *     configured reporting format — /HPF, /LPF, or the strip's "-", "4+",
-   *     "normal"). The parser keeps one of the pair per parameter; which one
-   *     is the analyzer's astm.valueFormat (see src/config.ts). Either half
-   *     can be blank (C-LEU's MAINFORMAT, C-BIL's RAW).
+   *     "normal"). The parser keeps one of the pair per parameter: a blank
+   *     half is never taken, a strip GRADE ("-", "+-", "1+" …) beats a
+   *     concentration whichever half carries it, and otherwise
+   *     astm.valueFormat decides (see src/config.ts and
+   *     collapseValueFormats in records.ts). C-LEU has its grade in RAW and
+   *     25/75/500 c/µL in MAINFORMAT; C-BIL is the mirror image.
    *   • the seven "IF"-typed records are scattergram images, not results.
    *   • demographics arrive on the P record when the U-WAM has them.
    *
-   * NOT yet on this wire: a Q record. The U-WAM had demographics for
-   * ZC2609170035 without asking this connector, so its host query — if it is
-   * enabled — was answered elsewhere or keyed by hand. The Q handling here is
-   * the ASTM norm (first non-empty component of the specimen field, the field
-   * echoed back verbatim on the reply, report type "Q"); confirm it on the
-   * first Q the U-WAM sends. See SETUP-SYSMEX-URINE.md.
+   * Host query, first seen 2026-09-17 18:32Z (five in the first night):
+   *
+   *   Q|1|LB2609180027||||20260918003709||||||F
+   *
+   * The bare barcode in field 3 — no padding, no rack or tube position — with
+   * the request time in field 7. The reply echoes field 3 verbatim (it IS the
+   * bare barcode here) with report type "Q", and the U-WAM's own order list
+   * uses the same "^^^CODE" shape, so the download is built with it. Whether
+   * the U-WAM shows the downloaded tests on its screen is not yet observed:
+   * every query so far met a barcode HMIS listed no rows for at that moment
+   * (see answerQuery in the orchestrator for what is done about that).
    */
   sysmex: {
     label: 'Sysmex U-WAM (UC-3500 + UF-4000) / UF-4000 / UF-5000 / UC-3500',

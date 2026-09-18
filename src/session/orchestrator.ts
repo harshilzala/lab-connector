@@ -837,6 +837,7 @@ export class AnalyzerRuntime {
         this.cfg.allowTestCodes,
         this.cfg.excludeIdentifiers,
         this.cfg.excludeParameterIds,
+        this.cfg.testValueMap,
       );
 
     const joined = join(orderRows);
@@ -985,7 +986,17 @@ export class AnalyzerRuntime {
       // their labResultId to be filable.
       if (pending.ackItems.length) this.orders.upsert(lookup, pending, 'query');
 
-      if (!pending.found) {
+      // HMIS drops a sample's rows from the pending list and offers them
+      // again later. LB2609180027, 2026-09-17: 21 rows on the 18:42Z poll,
+      // none on the live lookup at 19:08Z when the U-WAM asked (the reply
+      // was an empty download), 27 values filed from the CACHED rows at
+      // 19:48Z. The order store holds every row this analyzer was ever
+      // offered, so a barcode HMIS cannot see right now is still answered
+      // from there — the rule resolveOrderRows already applies when filing.
+      // Only a barcode neither side knows gets the empty download.
+      const stored = pending.found ? null : this.orders.get(lookup);
+      const source = pending.found ? pending : stored?.rows.length ? stored : null;
+      if (!source) {
         this.log.info({ barcode, lookup }, 'no pending orders — sending empty download');
         await this.link.sendOrders([]); // header + terminator = "no work"
         return;
@@ -994,17 +1005,20 @@ export class AnalyzerRuntime {
       const order: OrderDownload = {
         // Reply with the barcode the analyzer sent so it matches its own sample.
         sampleId: barcode,
-        testCodes: pending.testCodes,
-        priority: pending.priority,
-        patient: this.cfg.sendDemographics ? pending.patient : null,
-        specimenType: pending.specimenType,
+        testCodes: source.testCodes,
+        priority: source.priority,
+        patient: this.cfg.sendDemographics ? source.patient : null,
+        specimenType: source.specimenType,
         queryReply: true,
         specimenIdField: query.specimenIdField,
       };
       await this.link.sendOrders([order]);
       // A query answer is a full download, so the poller need not repeat it.
-      this.orders.markDownloaded(lookup, pending.testCodes);
-      this.log.info({ barcode, tests: pending.testCodes }, 'order download sent to analyzer');
+      this.orders.markDownloaded(lookup, source.testCodes);
+      this.log.info(
+        { barcode, tests: source.testCodes, from: pending.found ? 'hmis' : 'order store' },
+        pending.found ? 'order download sent to analyzer' : 'HMIS lists no pending rows — order download sent from the cached rows',
+      );
 
       // NOT acknowledged here. A downloaded order is not finished work — the
       // row is retired only once its result has been filed, in the spool

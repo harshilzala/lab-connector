@@ -118,6 +118,14 @@
         // /LPF, "-" / "4+"). "main" (default) files what the lab sees on the
         // U-WAM; "raw" files the native value. Other analyzers are unaffected.
         // "valueFormat": "main",
+
+      // Instrument value -> the WORD HMIS reports, per assay code, for
+      // qualitative results. The sysmex-uwam profile carries the lab's table
+      // for the strip pads ("-" -> Absent / Negative / Normal, "+-" -> trace,
+      // nitrite "+" -> Positive; grades pass through). Exact value match,
+      // case-insensitive; anything not listed is filed as sent. Override or
+      // extend per site here:
+      // "testValueMap": { "C-PRO": { "-": "Absent", "+-": "trace" } },
       }
     },
     {
