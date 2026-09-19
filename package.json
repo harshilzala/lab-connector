@@ -40,6 +40,7 @@
     "bc6000:allow": "tsx test/bc6000-allow-codes.test.ts",
     "abl9:allow": "tsx test/abl9-allow-codes.test.ts",
     "staged": "tsx test/staged-results.test.ts",
+    "uwam:pairing": "tsx test/uwam-pairing.test.ts",
     "orders": "tsx test/order-store.test.ts",
     "import:old-orders": "tsx scripts/import-old-interface-orders.ts",
     "connector-tool": "tsx test/connector-tool.test.ts",

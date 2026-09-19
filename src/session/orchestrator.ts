@@ -242,11 +242,23 @@ export class AnalyzerRuntime {
         log: this.log,
         recheckMs: cfg.filing.recheckMs,
         completeBarcode: cfg.barcodeCompletion ? compileCompletion(cfg.barcodeCompletion) : undefined,
+        // Optional-chained: the schema always fills this in, but the test
+        // harnesses build an analyzer config by hand and must not have to
+        // know about a feature only one machine uses.
+        pairing: cfg.filing.pairing?.devices.length ? cfg.filing.pairing : null,
       });
       if (cfg.barcodeCompletion) {
         this.log.info(
           { short: cfg.barcodeCompletion.short, full: cfg.barcodeCompletion.full },
           'barcode completion enabled — short instrument ids are tried under the full HMIS barcode',
+        );
+      }
+      if (cfg.filing.pairing?.devices.length) {
+        this.log.info(
+          { devices: cfg.filing.pairing.devices, maxWaitMs: cfg.filing.pairing.maxWaitMs },
+          cfg.filing.pairing.maxWaitMs === null
+            ? 'paired instruments — a sample is not sent to HMIS until every one of them has reported on it (no time limit)'
+            : 'paired instruments — a sample is not sent to HMIS until every one of them has reported on it',
         );
       }
     } else {
@@ -539,7 +551,7 @@ export class AnalyzerRuntime {
                 await this.link.sendOrders([
                   {
                     sampleId: order.sampleId,
-                    testCodes: newCodes,
+                    testCodes: this.downloadCodes(newCodes),
                     priority: order.priority,
                     patient: this.cfg.sendDemographics ? order.patient : null,
                     specimenType: order.specimenType,
@@ -838,6 +850,7 @@ export class AnalyzerRuntime {
         this.cfg.excludeIdentifiers,
         this.cfg.excludeParameterIds,
         this.cfg.testValueMap,
+        this.cfg.testCodeDecimals,
       );
 
     const joined = join(orderRows);
@@ -884,6 +897,33 @@ export class AnalyzerRuntime {
       'HMIS is not offering an order row for these parameters — rebuilt from the parameter catalogue so the values file instead of leaving the report blank',
     );
     return filled;
+  }
+
+  /** The test codes to put in an order DOWNLOAD: the HMIS codes as they are,
+   *  plus, for each one that has a downloadCodeAliases entry, the code the
+   *  instrument recognises. Both go, so results still return under the HMIS
+   *  spelling and an unrecognised extra costs nothing. Order preserved,
+   *  duplicates dropped case-insensitively. */
+  private downloadCodes(codes: string[]): string[] {
+    const aliases = Object.entries(this.cfg.downloadCodeAliases);
+    if (!aliases.length) return codes;
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const add = (c: string) => {
+      const k = c.trim().toUpperCase();
+      if (!k || seen.has(k)) return;
+      seen.add(k);
+      out.push(c);
+    };
+    for (const code of codes) {
+      add(code);
+      const k = code.trim().toUpperCase();
+      for (const [from, to] of aliases) {
+        if (from.trim().toUpperCase() !== k) continue;
+        for (const t of Array.isArray(to) ? to : [to]) add(t);
+      }
+    }
+    return out;
   }
 
   /** The configured alias for an analyzer assay code, matched the way the
@@ -1014,7 +1054,7 @@ export class AnalyzerRuntime {
       const order: OrderDownload = {
         // Reply with the barcode the analyzer sent so it matches its own sample.
         sampleId: barcode,
-        testCodes: source.testCodes,
+        testCodes: this.downloadCodes(source.testCodes),
         priority: source.priority,
         patient: this.cfg.sendDemographics ? source.patient : null,
         specimenType: source.specimenType,
@@ -1025,7 +1065,7 @@ export class AnalyzerRuntime {
       // A query answer is a full download, so the poller need not repeat it.
       this.orders.markDownloaded(lookup, source.testCodes);
       this.log.info(
-        { barcode, tests: source.testCodes, from: pending.found ? 'hmis' : 'order store' },
+        { barcode, tests: this.downloadCodes(source.testCodes), from: pending.found ? 'hmis' : 'order store' },
         pending.found ? 'order download sent to analyzer' : 'HMIS lists no pending rows — order download sent from the cached rows',
       );
 

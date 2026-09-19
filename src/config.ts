@@ -273,6 +273,18 @@ const AnalyzerSchema = z.object({
    *  this is the escape hatch when the parameter is named after the report
    *  line rather than the instrument. */
   testCodeAliases: z.record(z.string()).default({}),
+  /** HMIS `eqIdntifier` → the code the INSTRUMENT wants to see in an order
+   *  download, for analyzers whose order vocabulary differs from their result
+   *  vocabulary. The aliased code is sent IN ADDITION to the HMIS one, so a
+   *  wrong guess costs nothing (an unknown code is ignored) and results still
+   *  come back under the HMIS spelling. The Sysmex U-WAM is the case: it
+   *  reports strip items as "C-GLU" but recognises only "GLU" in an order,
+   *  and with an order it recognises it sends ONLY the recognised items —
+   *  so an order of "C-GLU" silently drops the whole strip half (every tube
+   *  from 2026-09-18 15:27 to 2026-09-19, U-WAM host log). Case-insensitive
+   *  on the HMIS side. A list sends every spelling in it — for an item whose
+   *  order code is not yet known, so the candidates can be tried on one tube. */
+  downloadCodeAliases: z.record(z.union([z.string(), z.array(z.string())])).default({}),
   /** HMIS `eqIdntifier` values this analyzer must NEVER file into, even when
    *  the instrument's own code is spelled exactly the same. For an HMIS
    *  service that carries both "WBC COUNT" and a smear-review row named "WBC"
@@ -361,6 +373,15 @@ const AnalyzerSchema = z.object({
    *  time, like testCodeAliases, so a corrected map also repairs results
    *  already waiting in the spool. */
   testValueMap: z.record(z.record(z.string())).default({}),
+  /** Decimal places a numeric value is ROUNDED to before filing, per assay
+   *  code, for the parameters the lab reports as whole numbers. The Sysmex
+   *  UF-4000 sends the epithelial cell counts in /HPF with one decimal
+   *  ("0.9", "1.0") and the urine report shows them without one — asked for
+   *  on 2026-09-19 for EC, Squa.EC, Non SEC and RTEC only. Half rounds up
+   *  (0.5 → 1). Only a strictly numeric value is touched; a flag or a "<0.1"
+   *  files unchanged. Applied after unit scaling and before the word map, at
+   *  delivery time like the others. Exact, case-insensitive code match. */
+  testCodeDecimals: z.record(z.number().int().min(0).max(6)).default({}),
   /** Rebuild the order rows HMIS has stopped offering, so a result can still be
    *  filed against the parameter it belongs to.
    *
@@ -421,6 +442,49 @@ const AnalyzerSchema = z.object({
       /** Staged: a fully filed sample stays visible on the console for this
        *  many days, then its file is dropped. */
       keepFiledDays: z.number().int().min(0).max(30).default(2),
+      /** Staged, PAIRED ANALYZERS ONLY — in this deployment that means the
+       *  Sysmex U-WAM and nothing else.
+       *
+       *  The U-WAM is a work-area manager with TWO analyzers behind it, a
+       *  UC-3500 reading the strip and a UF-4000 counting the particles, and
+       *  one urine tube is run on both. HMIS holds the two halves as one
+       *  panel. The U-WAM frequently sends them as SEPARATE ASTM messages —
+       *  60 of 239 samples on 2026-09-17/18/19 — so filing the first half on
+       *  arrival flips the sample to "result interfaced" and the report
+       *  prints with the other instrument's rows blank. That is the partial
+       *  transfer the lab sees.
+       *
+       *  `devices` lists the instrument names, exactly as the machine writes
+       *  them in ASTM R field 14 ("UC-3500", "UF-4000"); matching is
+       *  case-insensitive. While any of them has not reported a value for a
+       *  sample, that sample is HELD: no HMIS lookup, no post, nothing
+       *  acknowledged. It files in one pass the moment the last one arrives.
+       *
+       *  `maxWaitMs` is the backstop — a tube may be run on one instrument
+       *  only, and one of the pair can be out of service for a day
+       *  (2026-09-19: 69 of 81 samples had no strip half). After this long
+       *  the sample files with whatever it has and the log names the
+       *  instrument that never reported. `null` switches the backstop off:
+       *  the sample is held until every instrument has reported, however
+       *  long that takes, and only the console's "file now" releases it.
+       *  A site chooses null when HMIS must never show the panel as
+       *  interfaced with one instrument's rows blank.
+       *
+       *  Empty `devices` (the default) = no hold, which is every other
+       *  analyzer here. The console's "file now" always overrides the hold.
+       *  See src/results/pairing.ts. */
+      pairing: z
+        .object({
+          devices: z.array(z.string().min(1)).default([]),
+          maxWaitMs: z
+            .number()
+            .int()
+            .min(30_000)
+            .max(6 * 60 * 60_000)
+            .nullable()
+            .default(10 * 60_000),
+        })
+        .default({}),
     })
     .default({}),
   astm: AstmOptions.default({}),
