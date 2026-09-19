@@ -203,10 +203,18 @@ export class ResultStore {
 
     const changed: string[] = [];
     const unchanged: string[] = [];
+    let touched = false;
     for (const r of upload.results) {
       const have = sample.values[r.testCode];
       const unit = r.unit ?? null;
-      if (have && have.value === r.value && have.unit === unit) {
+      if (have && have.value === r.value && (have.unit === unit || have.unit === null)) {
+        // The same value again. A held value with no unit (restored from the
+        // HMIS transaction log, which does not carry one) learns the unit
+        // from the analyzer's own transmission without becoming unfiled.
+        if (have.unit === null && unit !== null) {
+          have.unit = unit;
+          touched = true;
+        }
         unchanged.push(r.testCode);
         continue;
       }
@@ -228,7 +236,7 @@ export class ResultStore {
       changed.push(r.testCode);
     }
 
-    if (changed.length || pruned || !existing) {
+    if (changed.length || pruned || touched || !existing) {
       sample.updatedAt = receivedAt;
       sample.raw = upload.raw ?? sample.raw;
       // A new value re-opens the sample: the last error described a state

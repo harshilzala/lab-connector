@@ -17,6 +17,21 @@ import { unwrapRows } from './pending.js';
 //   POST {resultsPath}      analyzer results, idempotent on messageId
 // =============================================================================
 
+/**
+ * The gateway could not be reached or could not answer: timeout, HTTP 5xx,
+ * DNS/connect/reset. Nothing about the request itself is wrong, so the spool
+ * holds every queued item until the next pass (`holdQueue`) instead of trying
+ * them one after another against a gateway that is down. Any other error is a
+ * verdict on one item and stops only that item.
+ */
+export class HmisUnavailableError extends Error {
+  readonly holdQueue = true as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'HmisUnavailableError';
+  }
+}
+
 export interface HmisClientOptions {
   baseUrl: string;
   pendingPath: string;
@@ -340,12 +355,20 @@ export class HmisClient {
       // a gateway gives on a 4xx/5xx, and it belongs in the audit entry too.
       const text = await res.text();
       if (!res.ok) {
-        throw new Error(`HMIS ${method} ${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
+        const message = `HMIS ${method} ${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`;
+        // 5xx is the gateway itself (502 Bad Gateway from its proxy, 18–19 Sep
+        // 2026); 4xx is a verdict on this one request.
+        throw res.status >= 500 ? new HmisUnavailableError(message) : new Error(message);
       }
       return { status: res.status, text };
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new Error(`HMIS ${method} ${path} -> timed out after ${this.opts.timeoutMs}ms`);
+        throw new HmisUnavailableError(`HMIS ${method} ${path} -> timed out after ${this.opts.timeoutMs}ms`);
+      }
+      // fetch reports DNS / connect / reset failures as a TypeError — nothing
+      // reached the gateway, so every item in the queue would fail the same way.
+      if (err instanceof TypeError) {
+        throw new HmisUnavailableError(`HMIS ${method} ${path} -> ${(err.cause as Error | undefined)?.message ?? err.message}`);
       }
       throw err;
     } finally {

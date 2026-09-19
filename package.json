@@ -42,6 +42,7 @@
     "staged": "tsx test/staged-results.test.ts",
     "orders": "tsx test/order-store.test.ts",
     "import:old-orders": "tsx scripts/import-old-interface-orders.ts",
+    "import:filed": "tsx scripts/import-filed-results.ts",
     "connector-tool": "tsx test/connector-tool.test.ts",
     "pm2:logrotate": "node scripts/setup-logrotate.mjs",
     "bc6000": "tsx test/bc6000-ignore-codes.test.ts",

@@ -11,6 +11,9 @@ from the PM2 home beside the connector (`..\.pm2`).
 | `magic-force-stop.bat` | Stops **everything** the operator owns, however it was started: the PM2 app, the watchdog task, any watchdog worker mid-tick, and any stray `npm run dev` or `node dist\index.js`. Use it when `magic-stop.bat` reports "nothing to stop" but the dashboard still answers. |
 | `magic-add-to-startup.bat` | Registers the logon entry and the 5-minute watchdog for this operator. `magic-start.bat` runs it for you; run it by hand only to re-register without starting. |
 | `magic-remove-from-startup.bat` | Undoes the above. |
+| `magic-agent-start.bat` | Starts the **Lab-Watch-Agent**: a 48-hour AI watch (Claude Code, headless) over the VITROS ECiQ and VITROS 250. Every 15 min it snapshots link/orders/results/spool/HMIS, corrects what it is allowed to (re-queue a parked patient result whose HMIS rows exist; restart the connector when a link stays down — at most once per 30 min, never during maintenance), and reports to `logs\agent-watch-<date>.log`; things a person must do go to `logs\agent-alerts.log`. Its brief and limits: `scripts\agent\PROMPT.md`. Needs the `claude` CLI signed in as the operator. `/hours N` and `/every M` change the length and cadence. |
+| `magic-agent-stop.bat` | Stops the agent now (the connector keeps running). It also stops itself after its 48 hours. |
+| `magic-agent-status.bat` | Is it running, last alerts, last report. |
 
 `magic-startup.cmd` is the worker the logon entry and the watchdog run. It is
 not meant to be double-clicked — it never pauses and never builds. It is

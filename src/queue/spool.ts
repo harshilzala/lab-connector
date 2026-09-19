@@ -11,7 +11,22 @@ import type { Logger } from '../logger.js';
 // result. A worker drains pending in timestamp order; on repeated failure an
 // item is parked in spool/failed for manual attention (surfaced in the admin
 // UI). No native deps — just the filesystem.
+//
+// ONE ITEM'S FAILURE IS NOT THE QUEUE'S. A delivery that fails because of the
+// item — no order row in HMIS for that barcode, a control run under a made-up
+// id — moves on to the next item in the same pass. Only a failure that says
+// the gateway itself is unreachable (an error carrying `holdQueue: true`, see
+// HmisUnavailableError) ends the pass, because then every item would fail the
+// same way. Before this distinction every failure ended the pass, and one
+// unfilable item at the head held every result behind it for the 12½ minutes
+// (50 attempts × 15 s) it took to park: on 2026-09-19 a G2905 control held
+// four patient results on the VITROS 250 for 8 minutes, and one thyroid
+// result with no order held six others on the ECiQ.
 // =============================================================================
+
+/** An error whose `holdQueue` is true stops the drain pass; anything else fails only its item. */
+const holdsQueue = (err: unknown): boolean =>
+  typeof err === 'object' && err !== null && (err as { holdQueue?: unknown }).holdQueue === true;
 
 export interface SpoolEnvelope<T> {
   id: string;
@@ -160,8 +175,9 @@ export class SpoolQueue<T> {
           } else {
             this.writeAtomic(this.pendingDir, id, env);
             this.logger.warn({ id, attempts: env.attempts, err: env.lastError }, 'spool delivery failed, will retry');
-            // Back off the whole drain — the server/network is likely down.
-            break;
+            // The gateway is down: back off the whole pass. Anything else is
+            // this item's problem — carry on with the next one.
+            if (holdsQueue(err)) break;
           }
         }
       }
