@@ -26,6 +26,26 @@ rem somewhere else here would mean talking to a daemon that has never heard of
 rem this app, and reporting "nothing to stop" while it kept running.
 set "PM2_HOME=%ROOT%\.pm2"
 
+rem Full paths to find/findstr: a PATH that puts a Unix "find" first (Git for
+rem Windows) would otherwise break every check below.
+set "FIND=%SystemRoot%\System32\find.exe"
+set "FINDSTR=%SystemRoot%\System32\findstr.exe"
+
+rem ---------------------------------------------------------------------------
+rem  Service mode. Where the connector is installed as the LAB-Interface Windows
+rem  service, PM2 knows nothing about it - so stop the service itself, through
+rem  the Service Control Manager (a clean stop, not a crash, so the SCM does not
+rem  start it again). `sc stop` / `sc config` need no elevation once
+rem  service\grant-user-control.ps1 has been run on the machine.
+rem ---------------------------------------------------------------------------
+rem ---------------------------------------------------------------------------
+rem  PM2 only, as the operator. If an administrator has the LAB-Interface
+rem  Windows service RUNNING, this account cannot stop it - say so instead of
+rem  pretending. An installed-but-stopped service is of no concern here.
+rem ---------------------------------------------------------------------------
+sc query LAB-Interface 2>nul | "%FIND%" "RUNNING" >nul 2>&1
+if not errorlevel 1 goto service_running
+
 where pm2 >nul 2>&1
 if errorlevel 1 goto no_pm2
 
@@ -60,6 +80,22 @@ pause
 exit /b 0
 
 rem ---------------------------------------------------------------------------
+:service_running
+echo Stopped by magic-stop.bat on %DATE% %TIME%> ".lab-maintenance"
+echo.
+echo  The LAB-Interface Windows service is RUNNING. The operator account
+echo  cannot stop a Windows service; only an administrator can:
+echo      sc stop LAB-Interface
+echo      sc config LAB-Interface start= demand
+echo.
+echo  The maintenance flag was raised so the PM2 watchdog stays out of the
+echo  way. This PC is meant to run the connector under PM2 (magic-start.bat),
+echo  not as the service - once an administrator has stopped it, the magic
+echo  scripts need no administrator ever again.
+echo.
+pause
+exit /b 1
+
 :not_registered
 echo.
 echo  Lab-Interface is not registered with PM2 - nothing to stop here.
@@ -67,8 +103,8 @@ echo  The maintenance flag was still raised, so the watchdog will leave it be.
 echo.
 echo  NOTE: "not registered with PM2" is not the same as "not running". If
 echo        someone started it by hand with  node dist\index.js  then it is
-echo        still up and PM2 cannot see it. Use Lab-Interface-force-stop.bat
-echo        in the folder above - that stops it however it was started.
+echo        still up and PM2 cannot see it. Use magic-force-stop.bat -
+echo        that stops it however it was started.
 echo.
 pause
 exit /b 0

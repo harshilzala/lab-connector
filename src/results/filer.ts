@@ -38,6 +38,10 @@ export interface FilerDeps {
   log: Logger;
   /** Minimum gap between two live HMIS lookups for the same waiting barcode. */
   recheckMs: number;
+  /** The analyzer's barcodeCompletion rule, if it has one: the full HMIS
+   *  barcode a short instrument id stands for, or null when the id is not of
+   *  that shape. See src/results/complete.ts. */
+  completeBarcode?: (barcode: string, receivedAt: Date) => string | null;
 }
 
 export interface FilerReport {
@@ -123,6 +127,31 @@ export class StagedFiler {
     if (upload.results.length === 0) return 'nothing';
 
     try {
+      // A short id keyed on the instrument ("SF0054") is tried under the full
+      // barcode it stands for ("SF2608290054") BEFORE anything else — but only
+      // moved there if HMIS actually has an order under that barcode. A sample
+      // an operator already re-keyed is never completed again.
+      let liveLookupUsed = false;
+      if (this.deps.completeBarcode && sample.rekeyedFrom === null) {
+        const full = this.deps.completeBarcode(barcode, new Date(sample.firstReceivedAt));
+        if (full && full !== barcode) {
+          let fullRows = await this.deps.orderRows(full, { refresh: false });
+          if (fullRows.length === 0 && this.mayRecheck(sample, forced)) {
+            fullRows = await this.deps.orderRows(full, { refresh: true });
+            liveLookupUsed = true;
+          }
+          if (fullRows.length > 0) {
+            const moved = store.rekey(barcode, full, new Date().toISOString(), 'completion');
+            if (moved) return this.fileOne(moved, reason, forced);
+          } else if (liveLookupUsed) {
+            // Spend this pass's live lookup on the full barcode, not the short
+            // one — HMIS never has an order under "SF0054".
+            store.recordAttempt(barcode, { error: `no order under ${full} yet (from short id ${barcode})`, checkedHmis: true });
+            return 'waiting';
+          }
+        }
+      }
+
       let rows = await this.deps.orderRows(barcode, { refresh: false });
       let joined = this.deps.join(upload, rows);
       let checked = false;

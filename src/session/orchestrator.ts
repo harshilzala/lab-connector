@@ -10,6 +10,7 @@ import { createProtocolLink } from '../codec/index.js';
 import { SpoolQueue } from '../queue/spool.js';
 import { ResultStore, type StagedSummary } from '../results/store.js';
 import { StagedFiler } from '../results/filer.js';
+import { compileCompletion } from '../results/complete.js';
 import {
   interfacedCodeFilter,
   isQcSample,
@@ -244,7 +245,14 @@ export class AnalyzerRuntime {
         acknowledge: (rows) => this.hmis.acknowledge(rows),
         log: this.log,
         recheckMs: cfg.filing.recheckMs,
+        completeBarcode: cfg.barcodeCompletion ? compileCompletion(cfg.barcodeCompletion) : undefined,
       });
+      if (cfg.barcodeCompletion) {
+        this.log.info(
+          { short: cfg.barcodeCompletion.short, full: cfg.barcodeCompletion.full },
+          'barcode completion enabled — short instrument ids are tried under the full HMIS barcode',
+        );
+      }
     } else {
       this.staged = null;
       this.filer = null;
@@ -393,8 +401,16 @@ export class AnalyzerRuntime {
         void this.pollOrders();
         this.pollTimer = setInterval(() => void this.pollOrders(), intervalMs);
       }, FIRST_POLL_DELAY_MS);
+      // Log the site the pending call will really carry: the analyzer's own
+      // siteId if set, else the site-wide hmis.siteId.
       this.log.info(
-        { codes: this.equipmentCodes(), siteId: this.cfg.siteId ?? null, intervalMs, lookbackDays, download },
+        {
+          codes: this.equipmentCodes(),
+          siteId: this.cfg.siteId ?? this.hmis.defaultSiteId ?? null,
+          intervalMs,
+          lookbackDays,
+          download,
+        },
         'order polling enabled',
       );
     }

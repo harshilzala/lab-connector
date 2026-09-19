@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import { DEFAULT_DIALECT, ASTM_DIALECT_NAMES, type AstmDialect } from './codec/astm/records.js';
 import { PROFILE_NAMES, applyProfiles } from './profiles/index.js';
+import { compileCompletion } from './results/complete.js';
 
 // Minimal .env loader (no dependency). Reads KEY=VALUE lines and populates
 // process.env without overwriting variables already set in the real environment.
@@ -264,6 +265,33 @@ const AnalyzerSchema = z.object({
    *  2123 AND the smear row 2166 after the 2026-09-12 edit). A parameterId
    *  does not change when its name does. Prefer this over names. */
   excludeParameterIds: z.array(z.number().int().positive()).default([]),
+  /** Complete a short sample id keyed on the instrument into the full HMIS
+   *  barcode, as the retired middleware did for the Shela H360: the operators
+   *  type "SF" + the last four digits ("sf0054") and HMIS calls the sample
+   *  SF2608290054. `short` is a case-insensitive regex the instrument's id
+   *  must match whole, with ONE capture group — the sequence. `full` is the
+   *  HMIS barcode built from it: {yyyy} {yy} {mm} {dd} from the day the result
+   *  was received, {seq:N} the sequence zero-padded to N digits. The built
+   *  barcode is used ONLY when HMIS has an order under exactly that barcode
+   *  (cache first, then one live lookup at the recheck cadence); otherwise the
+   *  sample waits under the short id for the operator to re-key it on the
+   *  console. There is deliberately no suffix search across cached orders:
+   *  "0002" exists on every day's list, and a wrong completion is a result on
+   *  the wrong patient. Staged filing only. See src/results/complete.ts. */
+  barcodeCompletion: z
+    .object({
+      short: z.string().min(1),
+      full: z.string().min(1),
+    })
+    .optional()
+    .superRefine((rule, ctx) => {
+      if (!rule) return;
+      try {
+        compileCompletion(rule);
+      } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: err instanceof Error ? err.message : String(err) });
+      }
+    }),
   /** Assay codes this analyzer emits that are not reportable results and will
    *  never have a pending row — research-only channels and flag scores. They
    *  are dropped at delivery time instead of being re-queued as an unfilable

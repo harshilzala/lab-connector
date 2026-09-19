@@ -355,7 +355,7 @@ export class ResultStore {
    * the old barcode had somehow filed), and merged over whatever the target
    * already holds. Returns null when `from` does not exist.
    */
-  rekey(from: string, to: string, at = new Date().toISOString()): StagedSample | null {
+  rekey(from: string, to: string, at = new Date().toISOString(), by: 'operator' | 'completion' = 'operator'): StagedSample | null {
     const src = this.get(from);
     const target = normalizeBarcode(to);
     if (!src || !target) return null;
@@ -377,7 +377,12 @@ export class ResultStore {
     dst.raw = src.raw ?? dst.raw;
     this.write(dst);
     this.remove(src.barcode);
-    this.log.warn({ from: src.barcode, to: target, values: Object.keys(src.values).length }, 'staged sample re-keyed by an operator');
+    this.log.warn(
+      { from: src.barcode, to: target, values: Object.keys(src.values).length, by },
+      by === 'operator'
+        ? 'staged sample re-keyed by an operator'
+        : 'short instrument id completed to the HMIS barcode — an order exists under it',
+    );
     return dst;
   }
 

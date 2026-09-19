@@ -14,6 +14,10 @@ rem
 rem  It is also idempotent: if the connector is already online it does nothing,
 rem  which is what makes it safe to run from a 5-minute watchdog as well.
 rem
+rem  It runs the connector under PM2, as the operator, from the PM2 home beside
+rem  the connector - nothing here needs administrator rights. It never starts a
+rem  second copy beside one that is already up, however that one was started.
+rem
 rem  Install it with magic-add-to-startup.bat
 rem ===========================================================================
 setlocal
@@ -26,6 +30,26 @@ if not exist "%PM2_HOME%" mkdir "%PM2_HOME%" >nul 2>&1
 rem Somebody stopped this on purpose. Leave it alone.
 if exist ".lab-maintenance" exit /b 0
 
+rem ---------------------------------------------------------------------------
+rem  Is a connector already up, however it was started? PM2's view below only
+rem  covers what PM2 started; the Windows service, or an "npm run dev" from a
+rem  terminal, is invisible to it - and a second copy would fight the first for
+rem  the analyzer ports and post to HMIS twice. The admin dashboard port is the
+rem  one thing every copy binds. Keep this in step with admin.port in config.json.
+rem ---------------------------------------------------------------------------
+rem  Full paths: a PATH that puts a Unix "find" first (Git for Windows) would
+rem  otherwise break this check and let a second copy start.
+"%SystemRoot%\System32\netstat.exe" -ano -p tcp | "%SystemRoot%\System32\find.exe" "LISTENING" | "%SystemRoot%\System32\find.exe" ":7071" >nul 2>&1
+if not errorlevel 1 exit /b 0
+
+rem ---------------------------------------------------------------------------
+rem  PM2 only, as the operator. The LAB-Interface Windows service may still be
+rem  installed on this PC (stopped, start type Manual) but it is NOT used from
+rem  here: starting it needs administrator rights the operator account does
+rem  not have, so a worker that tried would fail at every tick and never bring
+rem  the connector back. If an administrator does start the service, the port
+rem  check above sees it and this worker does nothing - one copy only.
+rem ---------------------------------------------------------------------------
 where pm2 >nul 2>&1
 if errorlevel 1 exit /b 1
 if not exist "ecosystem.config.cjs" exit /b 1

@@ -180,9 +180,51 @@ const MINDRAY_BC6000: AnalyzerProfile = {
 // ---- Erba H360 — 3-part haematology, HL7 v2.3.1 over MLLP -----------------
 //
 // Source: the production wire log of the legacy middleware
-// (E:\API_Integration\Devices\H360\H360.txt), pinned in test/hl7-h360.test.ts.
-// The instrument dials the LIS. The 22 numeric analytes are exactly what the
-// legacy middleware filed (InsertData_Param.txt / arrOBX.log).
+// (E:\API_Integration\Devices\H360\H360.txt), pinned in test/hl7-h360.test.ts,
+// and the Shela installation (ZHFC03), 2026-08-29 → 2026-09-16:
+//
+//   • the instrument DIALS the LIS — the connector listens; the site block
+//     gives the PC address and the port the H360 is configured to dial
+//     (3010 at Shela, from the legacy Lab Integration.exe.config).
+//   • results are ORU^R01 (CBC+3DIFF), acknowledged with ACK^R01. Only
+//     OBX-2 = NM carries a value; IS lines are run modes, ref group, remark
+//     and the alarm flags (Leucopenia, Granulopenia …).
+//   • the 22 numeric analytes below are exactly what the legacy middleware
+//     filed (InsertData_Param.txt / arrOBX.log); Age and the histogram
+//     metadata are NM-typed but not results.
+//   • a blank run is sent as an ordinary ORU with OBR-3 = "background"
+//     (H360.txt, 2026-09-06 21:16). Recognised by that id and kept out of
+//     HMIS like a control. Operators have also keyed "BACKGROND" by hand.
+//   • no barcode reader is in use at Shela: operators key "SF" + the last
+//     four digits of the HMIS barcode ("sf0054" for SF2608290054), or just
+//     the digits. The legacy middleware completed those before posting (its
+//     Results log, 2026-08-29). That completion is a SITE setting, because
+//     the barcode prefix is the site's — see below.
+//   • the group HMIS CBC service (labServiceId 3141) is a PARAMETER service:
+//     one labResultId covers the panel, so a row HMIS stops offering
+//     mid-sample can be rebuilt from a sibling (fillMissingOrderRows), and
+//     the same service carries peripheral-smear rows named "WBC" / "RBC" /
+//     "PLATELET" (parameterIds 2166 / 2152 / 2162) that a count must never
+//     file into — the BC-5150 fault of 2026-09-12. Both settings belong to
+//     the HMIS the whole group shares, not to one site, so they sit here;
+//     on a site where those ids are not registered they are a no-op.
+//
+// What a SITE block still has to say (see the Shela config.json):
+//
+//   {
+//     "id": "erba-h360",
+//     "profile": "erba-h360",
+//     "equipmentCode": "ZHFC03",
+//     "transport": { "host": "10.20.1.7", "port": 3010 },
+//     // HMIS's report-line spellings of the analytes it registers under a
+//     // name other than the instrument mnemonic — the group HMIS spells
+//     // these three this way; a 3-part GRAN%/MID% is only an approximation
+//     // of the 5-part Neutrophils/Monocytes rows and is a lab decision:
+//     "testCodeAliases": { "HGB": "HAEMOGLOBIN", "HCT": "HEMATOCRIT", "LYM%": "Lymphocytes" },
+//     // Short ids keyed on the instrument → the site's barcode. The prefix
+//     // and shape are the site's (SF at Shela, ZC at the Cancer Centre …):
+//     "barcodeCompletion": { "short": "(?:SF)?0*(\\d{1,4})", "full": "SF{yy}{mm}{dd}{seq:4}" }
+//   }
 const ERBA_H360: AnalyzerProfile = {
   description: 'Erba H360 3-part haematology analyzer, HL7 v2.3.1 over MLLP; analyzer dials the LIS',
   defaults: {
@@ -191,14 +233,19 @@ const ERBA_H360: AnalyzerProfile = {
     sendDemographics: false,
     hostQuery: false,
     orderPoll: { enabled: true, download: false },
+    // Staged filing: results wait per sample for their order, one sample never
+    // blocks another, and the console can re-key a mistyped id.
     filing: { mode: 'staged' },
-    qc: { sampleIdPrefixes: ['QC', 'QC-', 'CTRL', 'CONTROL'] },
+    fillMissingOrderRows: true,
+    excludeParameterIds: [2166, 2152, 2162],
+    qc: { sampleIdPrefixes: ['QC', 'QC-', 'CTRL', 'CONTROL', 'Background', 'Backgrond'] },
     allowTestCodes: [
       'WBC', 'LYM%', 'GRAN%', 'MID%', 'LYM#', 'GRAN#', 'MID#',
       'RBC', 'HGB', 'HCT', 'MCV', 'MCH', 'MCHC', 'RDW-CV', 'RDW-SD',
       'PLT', 'MPV', 'PDW-SD', 'PDW-CV', 'PCT', 'P-LCR', 'P-LCC',
     ],
     ignoreTestCodes: ['Age', '*Histogram*'],
+    testCodeScale: {},
     hl7: {
       sendingApp: 'LIS',
       sendingFacility: '',

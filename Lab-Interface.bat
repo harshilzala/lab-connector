@@ -66,6 +66,15 @@ if errorlevel 1 goto no_pm2
 
 if not exist "config.json" goto no_config
 
+rem ---- a Windows-service install of the connector wins ---------------------
+rem  Some sites (Shela since 2026-09-08) run the connector as the "LAB-Interface"
+rem  Windows service under service\ so it is up at the login screen. A PM2 copy
+rem  beside it would fight for the analyzer and dashboard ports and crash-loop
+rem  on EADDRINUSE, so refuse here. Redeploy in service mode: npm run build,
+rem  then service\restart-service.ps1 as administrator.
+sc query LAB-Interface >nul 2>&1
+if not errorlevel 1 goto service_mode
+
 rem ---- shared access + a warning about the machine-wide PM2 service ---------
 call :grant_shared_access
 call :warn_foreign_pm2
@@ -315,6 +324,37 @@ echo        PM2 still restarts crashes; only the backstop is missing.
 exit /b 0
 
 rem ---- error paths ----------------------------------------------------------
+rem ---------------------------------------------------------------------------
+rem  Service mode. Not starting under PM2 - a PM2 copy beside the service would
+rem  fight it for the analyzer and dashboard ports.
+rem
+rem  "Start it again with Lab-Interface.bat" is what both force-stop scripts
+rem  tell the operator, so this branch has to actually undo a force stop, not
+rem  just print status: the flag, the disabled watchdog tasks and the Manual
+rem  start type all have to go back. service\resume-service.ps1 does all three
+rem  and elevates itself once for the service part.
+rem ---------------------------------------------------------------------------
+:service_mode
+echo  Lab-Interface is installed as a Windows service here - not starting under PM2.
+echo.
+echo   Status   : sc query LAB-Interface
+echo   Logs     : logs\LAB-Interface-service.out.log
+echo   Redeploy : npm run build, then run (as administrator)
+echo              service\restart-service.ps1
+echo   Dashboard: http://127.0.0.1:7071
+echo.
+if not exist "%~dp0service\resume-service.ps1" goto service_status_only
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0service\resume-service.ps1"
+goto stop
+
+:service_status_only
+echo  NOTE: service\resume-service.ps1 is missing, so this script can only
+echo        report the service state. Start it by hand (as administrator):
+echo        sc.exe start LAB-Interface
+echo.
+sc query LAB-Interface | findstr STATE
+goto stop
+
 :no_node
 echo  ERROR: Node.js was not found on PATH.
 echo         Install Node 20 or newer from https://nodejs.org and re-run this.
