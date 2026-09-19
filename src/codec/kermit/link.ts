@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import type { Transport } from '../../transport/types.js';
 import type { Logger } from '../../logger.js';
 import type { OrderDownload } from '../../types.js';
-import type { ProtocolLink } from '../types.js';
+import type { ProtocolLink, WireEvent } from '../types.js';
 import {
   DEFAULT_PARAMS,
   KermitDecoder,
@@ -28,6 +28,13 @@ import { renderBytes } from '../../probe/identify.js';
 //
 // `sending` gates whether inbound packets are routed to the sender's
 // acknowledgement waiter or to the receive state machine.
+//
+// WHAT THE ANALYZER DOES WHEN NOTHING IS HAPPENING. Every ~60 s of quiet the
+// VITROS 250 sends a bare NAK for packet 0 — a Kermit receiver saying "I am
+// here, send me a file if you have one". The legacy capture holds 51,501 of
+// them and the host it ran under never answered a single one; it sent its own
+// send-init whenever it had work, at any point in that 60 s cycle, and was
+// never refused. See handleInbound for what happened when this link did answer.
 // =============================================================================
 
 export interface KermitLinkOptions {
@@ -53,17 +60,34 @@ export interface KermitLinkOptions {
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/**
- * Our own capabilities, announced when we acknowledge the analyzer's send-init:
- * MAXL 94, TIME 10, no padding, EOL CR, control quote '#', no 8-bit prefixing,
- * single-character checksum. These mirror what the VITROS itself announces.
- */
-const OUR_PARAMS_DATA = '~* @-#N1';
 /** How much non-packet input to keep, per transfer, for the failure report. */
 const UNPARSED_KEEP = 200;
+/** Packet data shown in a trace token — enough to read an E or S, never a whole D. */
+const TRACE_DATA_CHARS = 48;
+
+/**
+ * One packet as a trace token: "→S0", "←Y0(~* @-#N1\)", "←E0(0005 INVALID PACKET
+ * USAGE)". D packets show only their length — the payload is already on the
+ * wire line the trace belongs to.
+ */
+function traceToken(direction: 'IN' | 'OUT', p: KermitPacket): string {
+  const arrow = direction === 'OUT' ? '→' : '←';
+  if (p.type === 'D') return `${arrow}D${p.seq}[${p.data.length}]`;
+  if (!p.data) return `${arrow}${p.type}${p.seq}`;
+  const shown = p.data.length > TRACE_DATA_CHARS ? `${p.data.slice(0, TRACE_DATA_CHARS)}…` : p.data;
+  return `${arrow}${p.type}${p.seq}(${shown.replace(/[\x00-\x1f]/g, (c) => `<${c.charCodeAt(0).toString(16).padStart(2, '0')}>`).trimEnd()})`;
+}
 
 export class KermitLink extends EventEmitter implements ProtocolLink {
   readonly name = 'kermit' as const;
+  /**
+   * A sample program sent to the VITROS 250 REPLACES the one it holds for that
+   * sample id — it does not add to it. Legacy capture, 2026-06-19:
+   * SF2606190004 was downloaded with 15 tests at 08:11 and again with 12 at
+   * 11:24; the analyzer ran exactly the 12. So every download must carry the
+   * whole panel, never just the tests added since the last one.
+   */
+  readonly downloadReplacesProgram = true;
 
   private readonly decoder = new KermitDecoder();
   /** Parameters in force. Replaced by whatever the peer negotiates. */
@@ -73,11 +97,16 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
   private ackWaiter: ((p: KermitPacket) => void) | null = null;
   /** Non-packet bytes heard while waiting for an ACK — see onData. */
   private unparsedWhileSending: Buffer = Buffer.alloc(0);
+  /** Packet-by-packet record of the transfer in progress, for the wire log. */
+  private txTrace: string[] = [];
 
   // Receive-session accumulators.
   private rxFileName = '';
   private rxData = '';
+  private rxTrace: string[] = [];
   private lastAckedSeq = -1;
+  /** Idle NAK/Y packets heard from the analyzer and left unanswered. */
+  private heartbeats = 0;
 
   private txQueue: Promise<unknown> = Promise.resolve();
   private orderSequence = 0;
@@ -119,60 +148,96 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
     for (const { packet, valid } of decoded) {
       if (this.sending) {
         // Mid-transmit: every packet is an answer to what we just sent.
+        this.txTrace.push(traceToken('IN', packet));
         this.ackWaiter?.(packet);
         continue;
       }
       if (!valid) {
         this.opts.logger.warn({ seq: packet.seq, type: packet.type }, 'Kermit checksum mismatch → NAK');
-        this.write({ seq: packet.seq, type: 'N', data: '' });
+        this.rxTrace.push(`${traceToken('IN', packet)}✗`);
+        this.reply({ seq: packet.seq, type: 'N', data: '' });
         continue;
       }
       this.handleInbound(packet);
     }
   }
 
-  private write(p: KermitPacket): void {
+  /** Answer a packet of the analyzer's own transfer, and note it in the trace. */
+  private reply(p: KermitPacket): void {
+    this.rxTrace.push(traceToken('OUT', p));
     this.transport.write(encodePacket(p, this.params)).catch((e) => this.emit('error', e));
   }
 
   private handleInbound(p: KermitPacket): void {
+    if (p.type === 'N' || p.type === 'Y') {
+      // The idle heartbeat (see the header), or a stray acknowledgement. Not
+      // the start of anything, and NOT to be answered: this link used to treat
+      // the second heartbeat as "a repeat of the packet we last acknowledged"
+      // and send a Y for it, after which the analyzer refused our next
+      // send-init with "0005 INVALID PACKET USAGE" — 28 of 28 downloads that
+      // followed two or more minutes of quiet on 16–17 Sep 2026, against 4 of
+      // 4 first-time successes inside that window. The legacy host answered
+      // none of the 51,501 heartbeats it was sent.
+      this.heartbeats += 1;
+      this.opts.logger.debug({ type: p.type, seq: p.seq, heartbeats: this.heartbeats }, 'Kermit idle packet from the analyzer — ignored');
+      return;
+    }
+
+    this.rxTrace.push(traceToken('IN', p));
+
     // A repeat of the packet we last acknowledged means our Y was lost. Answer
     // again, but do not fold the payload in a second time.
     if (p.seq === this.lastAckedSeq && p.type !== 'S') {
-      this.write({ seq: p.seq, type: 'Y', data: '' });
+      this.reply({ seq: p.seq, type: 'Y', data: '' });
       return;
     }
 
     switch (p.type) {
       case 'S':
-        // The analyzer opens a transfer and states its parameters; we answer
-        // with ours, which is what a Kermit ACK-to-send-init must carry.
+        // The analyzer opens a transfer and states its parameters. Our answer
+        // is an EMPTY Y — "# Y>" on the wire — which is what the legacy host
+        // sent on every one of its 1,598 captured receives; it never named
+        // parameters of its own, so the analyzer fell back to Kermit's
+        // defaults (80-character packets, the 'p' LEN seen throughout the
+        // capture). This link used to put our parameters in the Y, and 11 of
+        // the 32 result transfers on 16–17 Sep 2026 opened with "0009 INVALID
+        // CONSTRUCTION" / "0008 INVALID SEQUENCE USE" and only landed on the
+        // analyzer's retry ~13 s later. Match the exchange that is proven.
         this.params = parseSendInit(p.data);
         this.rxFileName = '';
         this.rxData = '';
-        this.write({ seq: p.seq, type: 'Y', data: OUR_PARAMS_DATA });
+        this.rxTrace = [this.rxTrace[this.rxTrace.length - 1]!];
+        this.reply({ seq: p.seq, type: 'Y', data: '' });
         break;
       case 'F':
         this.rxFileName = unquote(p.data, this.params.qctl);
         this.rxData = '';
-        this.write({ seq: p.seq, type: 'Y', data: '' });
+        this.reply({ seq: p.seq, type: 'Y', data: '' });
         break;
       case 'D':
         this.rxData += unquote(p.data, this.params.qctl);
-        this.write({ seq: p.seq, type: 'Y', data: '' });
+        this.reply({ seq: p.seq, type: 'Y', data: '' });
         break;
       case 'Z':
-        this.write({ seq: p.seq, type: 'Y', data: '' });
+        this.reply({ seq: p.seq, type: 'Y', data: '' });
         break;
       case 'B':
-        this.write({ seq: p.seq, type: 'Y', data: '' });
+        this.reply({ seq: p.seq, type: 'Y', data: '' });
         this.finalizeReceive();
         break;
-      case 'E':
-        this.emit('error', new Error(`VITROS sent a Kermit error packet: ${unquote(p.data, this.params.qctl)}`));
-        break;
+      case 'E': {
+        // The analyzer has abandoned whatever was in progress. Keep the
+        // exchange that led here — it is the only evidence of why.
+        const text = unquote(p.data, this.params.qctl).trimEnd();
+        this.emit('wire', { direction: 'IN', text: `(error packet) ${text}`, trace: this.rxTrace.join(' ') } satisfies WireEvent);
+        this.rxFileName = '';
+        this.rxData = '';
+        this.rxTrace = [];
+        this.lastAckedSeq = -1;
+        this.emit('error', new Error(`VITROS sent a Kermit error packet: ${text}`));
+        return;
+      }
       default:
-        // Y/N arriving while we are not transmitting is a stray retransmit.
         break;
     }
     this.lastAckedSeq = p.seq;
@@ -181,12 +246,14 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
   private finalizeReceive(): void {
     const payload = this.rxData;
     const fileName = this.rxFileName;
+    const trace = this.rxTrace.join(' ');
     this.rxData = '';
     this.rxFileName = '';
+    this.rxTrace = [];
     this.lastAckedSeq = -1;
     if (!payload) return;
 
-    this.emit('wire', { direction: 'IN', text: `${fileName}: ${payload}` });
+    this.emit('wire', { direction: 'IN', text: `${fileName}: ${payload}`, trace } satisfies WireEvent);
     try {
       const msg = parseResultFile(payload);
       this.opts.logger.info({ file: fileName, results: msg.results.length }, 'VITROS 250 result file received');
@@ -229,7 +296,8 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
     await this.awaitTransferGap();
     this.sending = true;
     this.unparsedWhileSending = Buffer.alloc(0);
-    this.emit('wire', { direction: 'OUT', text: `${fileName}: ${payload}` });
+    this.txTrace = [];
+    let failure: string | null = null;
     try {
       let seq = 0;
       // Send-init carries no data, matching the host the analyzer has accepted
@@ -248,10 +316,18 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
       await this.sendPacket({ seq: seq++, type: 'Z', data: '' });
       await this.pace();
       await this.sendPacket({ seq: seq++, type: 'B', data: '' });
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+      throw err;
     } finally {
       this.sending = false;
       this.decoder.reset();
       this.lastTransferEndedAt = Date.now();
+      // One wire line per transfer, written once its outcome is known, with
+      // the packet exchange beside the payload — so "did the analyzer take
+      // it?" is answered by the log rather than by the next result.
+      const trace = failure ? `${this.txTrace.join(' ')} ✗ ${failure}` : this.txTrace.join(' ');
+      this.emit('wire', { direction: 'OUT', text: `${fileName}: ${payload}`, trace } satisfies WireEvent);
     }
   }
 
@@ -272,16 +348,18 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
   /** Transmit one packet and wait for its Y, retransmitting on NAK or silence. */
   private async sendPacket(p: KermitPacket): Promise<KermitPacket> {
     for (let attempt = 1; attempt <= this.opts.maxRetries; attempt++) {
+      this.txTrace.push(traceToken('OUT', p));
       this.transport.write(encodePacket(p, this.params)).catch((e) => this.emit('error', e));
       const reply = await this.waitAck(this.opts.ackTimeoutMs);
 
       if (!reply) {
+        this.txTrace.push('(no reply)');
         this.opts.logger.warn({ seq: p.seq, type: p.type, attempt }, 'Kermit ACK timeout — retransmitting');
         continue;
       }
       if (reply.type === 'Y' && reply.seq === p.seq % 64) return reply;
       if (reply.type === 'E') {
-        throw new Error(`VITROS rejected the transfer: ${unquote(reply.data, this.params.qctl)}`);
+        throw new Error(`VITROS rejected the transfer: ${unquote(reply.data, this.params.qctl).trimEnd()}`);
       }
       this.opts.logger.warn(
         { sent: p.type, seq: p.seq, gotType: reply.type, gotSeq: reply.seq, attempt },

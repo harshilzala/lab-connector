@@ -29,7 +29,7 @@ import { safeSpoolId } from '../queue/spool.js';
 // =============================================================================
 
 /** How the rows for a barcode reached the store. Informational. */
-export type OrderSource = 'poll' | 'query' | 'result' | 'import';
+export type OrderSource = 'poll' | 'query' | 'result' | 'import' | 'resend';
 
 export interface StoredOrder {
   /** Canonical (trimmed, upper-cased) barcode — the file is named after it. */
@@ -63,7 +63,8 @@ export function canonicalBarcode(barcode: string): string {
   return (barcode ?? '').trim().toUpperCase();
 }
 
-const codeKey = (identifier: string): string => (identifier ?? '').trim().toUpperCase();
+/** How assay identifiers are compared everywhere the store looks at them. */
+export const codeKey = (identifier: string): string => (identifier ?? '').trim().toUpperCase();
 
 export class OrderStore {
   /** Lazily filled by count(); null means "re-read the directory". */
@@ -102,9 +103,16 @@ export class OrderStore {
    * again. A row identical to what is stored changes nothing.
    *
    * Returns the codes the analyzer has not been given yet, in the order HMIS
-   * listed them.
+   * listed them — minus `neverDownload` (orderPoll.excludeTestCodes): those
+   * are stored like any other row, so a result can still be joined, but are
+   * never reported as waiting to be programmed.
    */
-  upsert(barcode: string, pending: PendingOrders, source: OrderSource): UpsertResult {
+  upsert(
+    barcode: string,
+    pending: PendingOrders,
+    source: OrderSource,
+    opts: { neverDownload?: ReadonlySet<string> } = {},
+  ): UpsertResult {
     const key = canonicalBarcode(barcode);
     const now = new Date().toISOString();
     const existing = this.read(key);
@@ -158,7 +166,8 @@ export class OrderStore {
     order.rows = [...byCode.values()];
     order.testCodes = order.rows.map((r) => r.identifier);
     order.downloaded = order.downloaded.filter((c) => downloaded.has(codeKey(c)));
-    const newCodes = order.testCodes.filter((c) => !downloaded.has(codeKey(c)));
+    const skip = opts.neverDownload ?? new Set<string>();
+    const newCodes = order.testCodes.filter((c) => !downloaded.has(codeKey(c)) && !skip.has(codeKey(c)));
 
     if (changed) {
       order.updatedAt = now;
