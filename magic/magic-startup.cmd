@@ -32,6 +32,26 @@ if not exist "ecosystem.config.cjs" exit /b 1
 if not exist "dist\index.js" exit /b 1
 
 rem ---------------------------------------------------------------------------
+rem  Is a connector already up, whoever started it? Exactly one connector can
+rem  hold the admin dashboard port, so if something listens there this tick is
+rem  done - without touching pm2 at all. Keep in step with admin.port in
+rem  config.json (and with Lab-Interface-startup.cmd).
+rem ---------------------------------------------------------------------------
+netstat -ano -p tcp | find "LISTENING" | find ":7071" >nul 2>&1
+if not errorlevel 1 exit /b 0
+
+rem ---------------------------------------------------------------------------
+rem  Does ANOTHER PM2 own the daemon pipe? On Windows every PM2 uses the fixed
+rem  \\.\pipe\rpc.sock whatever PM2_HOME says. When a PM2 under another account
+rem  (e.g. the LocalSystem service) holds it, every pm2 call from here fails to
+rem  connect, spawns a fresh Daemon.js that cannot bind the pipe, and that
+rem  daemon never exits - one leaked node.exe per tick, hundreds per day.
+rem  Pipe present but our own pm2.pid is not a live process = not ours: stop.
+rem ---------------------------------------------------------------------------
+powershell -NoProfile -NonInteractive -Command "if (-not ([IO.Directory]::GetFiles('\\.\pipe\') -contains '\\.\pipe\rpc.sock')) { exit 1 }; $id = 0; try { $id = [int](Get-Content -Raw '%PM2_HOME%\pm2.pid') } catch {}; if ($id -and (Get-Process -Id $id -ErrorAction SilentlyContinue)) { exit 1 }; exit 0" >nul 2>&1
+if not errorlevel 1 exit /b 0
+
+rem ---------------------------------------------------------------------------
 rem  Is it already up? `pm2 pid <name>` prints the process id, or 0 when the
 rem  app is registered but stopped, and fails when PM2 has never heard of it.
 rem  Checking the pid rather than blindly restarting is what keeps a watchdog
