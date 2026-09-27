@@ -592,7 +592,12 @@ const SYSMEX_UC3500: AnalyzerProfile = {
  *  plus the strip's turbidity pad C-CLOUD — the lab does not interface it
  *  (2026-09-18); its HMIS row is filled by other means. Dropped at delivery
  *  time as `ignored`, so it is never filed, re-queued or reported unmatched. */
-const UWAM_IGNORE_CODES = [...UF_IGNORE_CODES, 'C-CLOUD'];
+/** On the U-WAM link the RBC-Info. and BACT-Info. judgements DO file (HMIS
+ *  registers them as "RBC Morphology" / "Type of Bacteria", identifiers
+ *  RBC-Info / BACT-Info, lab request 2026-09-19) — only UTI-Info. stays
+ *  out, HMIS has no row for it. Their numeric codes become the manual's
+ *  words through UWAM_VALUE_MAP below. */
+const UWAM_IGNORE_CODES = [...UF_IGNORE_CODES.filter((c) => c !== '*Info*'), 'UTI-Info.', 'C-CLOUD'];
 
 const UWAM_VALUE_MAP: Record<string, Record<string, string>> = {
   'C-PRO': { '-': 'Absent', '+-': 'trace' },
@@ -601,6 +606,70 @@ const UWAM_VALUE_MAP: Record<string, Record<string, string>> = {
   'C-URO': { '-': 'Normal', normal: 'Normal' },
   'C-BIL': { '-': 'Absent' },
   'C-NIT': { '-': 'Negative', '+': 'Positive' },
+  // The UF-4000's judgement items arrive as a NUMBER (the UF-4000 sends the
+  // same number to the U-WAM, log 20260919_UF-4000.txt, so no text exists
+  // on the wire). The words are the manual's, in the manual's order
+  // (UF-4000 BO §5.3.4, GI §5.6.4), and the order is borne out by the
+  // instrument's own scatter data over 201 tubes (2026-09-18/19):
+  //   RBC-Info. 1 = high forward scatter, narrow spread   → undamaged cells
+  //             2 = low forward scatter                   → damaged / small
+  //             3 = wide spread                           → both present
+  //   BACT-Info. 4 sits on the lowest bacteria counts (16–141/µL), where the
+  //             distribution cannot be classified; 2 is by far the commonest.
+  //   BACT-Info. 1/2/3 follow the ORDER ON THE INSTRUMENT'S SETTINGS SCREEN
+  //             (BO §settings: "BACT-Info.(Gram Negative?, Gram Positive?,
+  //             Gram Pos/Neg?, Unclassified)"), NOT the order of the
+  //             glossary — CONFIRMED on LB2609190776 (2026-09-19): wire code 2,
+  //             U-WAM screen "Gram Positive?". RBC-Info. 1/2/3 still follow
+  //             the glossary order; check one tube of each on the screen.
+  // HMIS holds RBC Morphology and Type of Bacteria as CODED lists, so it is
+  // sent the code, not a word (lab, 2026-09-21 — a word typed into the field
+  // showed as literal text on the report):
+  //   RBC Morphology   Isomorphic type 1   Dismorphic type 2   Mixed type 3   Unclassified 0
+  //   Type of Bacteria Gram Negative 1    Gram positive 2     Gram mixed 3   Unclassified 0
+  // The UF-4000's own codes are the same numbers for 1/2/3 (manual order,
+  // confirmed on LB2609190776: wire 2 = "Gram Positive?" on the U-WAM screen).
+  // Two differences, both mapped to the lab's 0:
+  //   * wire 0 = "judgement not performed" (GI §5.6.4; 82% of tubes) → 0;
+  //   * wire 4 on BACT-Info. = Sysmex's "Unclassified" (42 tubes, all with
+  //     10–258 bacteria/µl — too few to Gram-type; LB2609210717 was one) → 0.
+  'RBC-Info.': { '0': '0', '1': '1', '2': '2', '3': '3' },
+  'BACT-Info.': { '0': '0', '1': '1', '2': '2', '3': '3', '4': '0' },
+};
+
+/** What the U-WAM wants to see in an ORDER for a strip item, keyed by the
+ *  HMIS identifier (= the U-WAM's own RESULT spelling). Measured on the
+ *  U-WAM's host log (C:/Users/APPADMIN/Desktop/Log/20260918_UWAM.txt):
+ *  when the U-WAM holds a host order it outputs only the items it recognises
+ *  in it, and the "C-" prefix is a result-side decoration it does not accept
+ *  in an order. An order of the 21 HMIS codes (C-PH, C-GLU …) therefore
+ *  produced 11 particle values and NO strip values on every tube from
+ *  2026-09-18 15:27 onward, while an order carrying the bare names at 19:48
+ *  that day brought back C-BIL C-KET C-GLU C-PRO C-NIT C-LEU. Those six are
+ *  CONFIRMED, and URO and PH were confirmed on LB2609190759 the next day.
+ *  BLD and COLOR are the UC-3500's own names (GI §1.2) and a best guess —
+ *  "UBG", "pH", "SG", "S.G", "ERY" and "COL" were tried and were NOT
+ *  recognised. The HMIS code is still sent alongside, so a wrong guess only
+ *  leaves that item missing. Verify on the wire log and correct here. */
+const UWAM_DOWNLOAD_ALIASES: Record<string, string | string[]> = {
+  'C-BIL': 'BIL',
+  'C-KET': 'KET',
+  'C-GLU': 'GLU',
+  'C-PRO': 'PRO',
+  'C-NIT': 'NIT',
+  'C-LEU': 'LEU',
+  'C-URO': 'URO',
+  'C-PH': 'PH',
+  // Confirmed on LB2609190759 (2026-09-19 18:49): URO, PH, BIL, KET, GLU,
+  // PRO, NIT all came back. "S.G" did NOT. Every plausible spelling of the
+  // refractometer S.G. goes until one is seen to work; then keep that one.
+  'C-S.G.(Ref)': ['S.G.', 'S.G.(Ref)', 'S.G(Ref)', 'SG(Ref)', 'S.G.(REF)', 'SG.', 'S.G.REF'],
+  'C-BLD': 'BLD',
+  'C-COLOR': 'COLOR',
+  // HMIS's own names for the three ZCCEC002 rows (result-side aliases in the
+  // site block: C-LEU→LEU, C-COLOR→COL, C-BLD→ERY). LEU already matches.
+  'ERY': 'BLD',
+  'COL': 'COLOR',
 };
 
 const SYSMEX_UWAM: AnalyzerProfile = {
@@ -611,12 +680,21 @@ const SYSMEX_UWAM: AnalyzerProfile = {
     sendDemographics: false,
     hostQuery: true,
     orderPoll: { enabled: true, download: false },
-    filing: { mode: 'staged' },
+    // The ONE place the paired-instrument hold is switched on. Both analyzers
+    // behind the U-WAM run the same tube and HMIS holds their parameters as
+    // one urine panel, so a sample is not filed until both have reported —
+    // otherwise the first half to arrive marks the panel interfaced and the
+    // report prints half blank. Ten minutes is the backstop for a tube run on
+    // only one of them, or for an instrument that is down; see
+    // src/results/pairing.ts for the wire measurements behind that number.
+    // The names are the U-WAM's own spelling in ASTM R field 14.
+    filing: { mode: 'staged', pairing: { devices: ['UC-3500', 'UF-4000'], maxWaitMs: 10 * 60_000 } },
     fillMissingOrderRows: true,
     qc: { sampleIdPrefixes: SYSMEX_QC_PREFIXES, upload: false },
     ignoreTestCodes: UWAM_IGNORE_CODES,
     testCodeScale: {},
     testValueMap: UWAM_VALUE_MAP,
+    downloadCodeAliases: UWAM_DOWNLOAD_ALIASES,
     astm: SYSMEX_ASTM,
   },
 };

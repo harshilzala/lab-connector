@@ -162,6 +162,32 @@
       // case-insensitive; anything not listed is filed as sent. Override or
       // extend per site here:
       // "testValueMap": { "C-PRO": { "-": "Absent", "+-": "trace" } },
+
+      // Decimal places a numeric value is rounded to before filing, per
+      // assay code, for the parameters the report shows as whole numbers.
+      // Half rounds up; a flag or "<0.1" is never touched. The Ahmedabad
+      // urine report shows the four epithelial cell counts without a
+      // decimal (2026-09-19):
+      // "testCodeDecimals": { "EC": 0, "Squa.EC": 0, "Non SEC": 0, "RTEC": 0 },
+
+      // HMIS identifier -> the code the INSTRUMENT recognises in an ORDER,
+      // sent alongside the HMIS one. U-WAM ONLY: it reports strip items as
+      // "C-GLU" but recognises only "GLU" in an order, and with an order it
+      // recognises it outputs ONLY the recognised items - so an order of
+      // "C-GLU" silently drops the strip half. The profile carries the
+      // table; a value may be a list to try several spellings at once:
+      // "downloadCodeAliases": { "C-GLU": "GLU", "C-S.G.(Ref)": ["S.G.", "S.G.(Ref)"] },
+
+      // U-WAM ONLY: two analyzers share each tube and the U-WAM often sends
+      // their halves as separate messages. The profile holds a sample until
+      // BOTH have reported (names as written in ASTM R field 14) and files
+      // it in one post; after maxWaitMs it files whatever it has, so a tube
+      // run on one instrument, or a day with one instrument down, is delayed
+      // at most this long. "maxWaitMs": null removes the limit — the sample
+      // waits until both have reported and only the console's "file now"
+      // releases a lone half. Tune the wait here; never set this on a
+      // machine that is not a U-WAM.
+      // "filing": { "mode": "staged", "pairing": { "devices": ["UC-3500", "UF-4000"], "maxWaitMs": 600000 } },
       }
     },
     {

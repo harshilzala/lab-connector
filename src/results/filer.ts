@@ -2,6 +2,7 @@ import type { Logger } from '../logger.js';
 import type { HmisResultUpload, LisInboundResultRow, MirthAcknowledgeItem } from '../types.js';
 import type { toLisResultRows } from '../mapping/mapper.js';
 import { ResultStore, summarize, type StagedSample } from './store.js';
+import { pairingVerdict, wasHeld, type PairingRule } from './pairing.js';
 
 // =============================================================================
 // StagedFiler — the filing pass for `filing.mode: "staged"`.
@@ -42,6 +43,11 @@ export interface FilerDeps {
    *  barcode a short instrument id stands for, or null when the id is not of
    *  that shape. See src/results/complete.ts. */
   completeBarcode?: (barcode: string, receivedAt: Date) => string | null;
+  /** Instruments that must all have reported before a sample is filed — the
+   *  Sysmex U-WAM's UC-3500 + UF-4000 pair, and nothing else in this
+   *  deployment. Null or an empty device list means no hold, which is what
+   *  every other analyzer gets. See src/results/pairing.ts. */
+  pairing?: PairingRule | null;
 }
 
 export interface FilerReport {
@@ -50,11 +56,14 @@ export interface FilerReport {
   filed: number;
   partial: number;
   waiting: number;
+  /** Samples deliberately not filed this pass because the other instrument on
+   *  a paired analyzer has not reported yet. U-WAM only. */
+  held: number;
   errors: number;
   skipped: boolean;
 }
 
-export type SampleOutcome = 'filed' | 'partial' | 'waiting' | 'error' | 'nothing';
+export type SampleOutcome = 'filed' | 'partial' | 'waiting' | 'held' | 'error' | 'nothing';
 
 /** Gateway failures in a row before the pass gives up until the next tick. */
 const MAX_CONSECUTIVE_ERRORS = 3;
@@ -74,7 +83,7 @@ export class StagedFiler {
    * HMIS lookup regardless of the recheck cadence.
    */
   async run(reason: string, only?: string): Promise<FilerReport> {
-    const report: FilerReport = { reason, samples: 0, filed: 0, partial: 0, waiting: 0, errors: 0, skipped: false };
+    const report: FilerReport = { reason, samples: 0, filed: 0, partial: 0, waiting: 0, held: 0, errors: 0, skipped: false };
     if (this.running) {
       if (only) this.followUp.add(only);
       report.skipped = true;
@@ -108,6 +117,7 @@ export class StagedFiler {
         if (outcome === 'filed') report.filed++;
         else if (outcome === 'partial') report.partial++;
         else if (outcome === 'waiting') report.waiting++;
+        else if (outcome === 'held') report.held++;
       }
       if (report.filed || report.partial || report.errors) {
         this.deps.log.info(report, 'filing pass complete');
@@ -125,6 +135,44 @@ export class StagedFiler {
     const barcode = sample.barcode;
     const upload = store.pendingUpload(sample, `${barcode}-${Date.now()}`);
     if (upload.results.length === 0) return 'nothing';
+
+    // ---- paired instruments (Sysmex U-WAM) ---------------------------------
+    // One urine tube, two analyzers behind one link. Filing the half that
+    // arrived first flips the sample to "result interfaced" in HMIS and the
+    // report prints with the other instrument's rows blank, so the sample is
+    // held until both have reported or the wait expires. No HMIS call is made
+    // while a sample is held, and the operator's "file now" overrides it.
+    // Every analyzer that is not the U-WAM has no pairing rule and skips this
+    // whole block. See src/results/pairing.ts.
+    const pairing = pairingVerdict(sample, this.deps.pairing ?? null);
+    if (pairing.hold && reason !== 'operator') {
+      if (!wasHeld(sample.lastError)) {
+        log.info(
+          {
+            barcode,
+            missing: pairing.missing,
+            values: upload.results.length,
+            since: sample.firstReceivedAt,
+            filesInMs: pairing.remainingMs,
+          },
+          'holding this sample — the other instrument on this tube has not reported yet',
+        );
+      }
+      store.recordAttempt(barcode, { error: pairing.reason });
+      return 'held';
+    }
+    if (pairing.expired && wasHeld(sample.lastError)) {
+      log.warn(
+        { barcode, missing: pairing.missing, values: upload.results.length, since: sample.firstReceivedAt },
+        'filing without the other instrument — it never reported on this tube within the pairing window',
+      );
+    }
+    if (pairing.hold && reason === 'operator') {
+      log.warn(
+        { barcode, missing: pairing.missing },
+        'operator filed this sample now — going to HMIS without the other instrument on this tube',
+      );
+    }
 
     try {
       // A short id keyed on the instrument ("SF0054") is tried under the full
@@ -173,6 +221,9 @@ export class StagedFiler {
       if (joined.voided.length) {
         store.markDropped(barcode, joined.voided, 'void');
         log.warn({ barcode, voided: joined.voided }, 'analyzer reported no value for these assays — not filed; the rerun will file');
+      }
+      if (joined.rounded.length) {
+        log.info({ barcode, rounded: joined.rounded }, 'values rounded to whole numbers or fixed decimals before filing');
       }
       if (joined.translated.length) {
         log.info({ barcode, translated: joined.translated }, 'qualitative values reported in the lab\'s words before filing');

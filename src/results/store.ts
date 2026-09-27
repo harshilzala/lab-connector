@@ -37,6 +37,11 @@ export interface StagedValue {
   receivedAt: string;
   /** When HMIS accepted it; null while it is still waiting for an order row. */
   filedAt: string | null;
+  /** The instrument that produced this value, when the message named one
+   *  (ASTM R field 14). Only the Sysmex U-WAM link populates it here: it
+   *  fronts a UC-3500 and a UF-4000 that share one tube, so the filing pass
+   *  needs to know which of the two a value came from. Null everywhere else. */
+  instrument: string | null;
   /** The pending row it was filed against, for tracing. */
   identifier: string | null;
   labResultId: number | null;
@@ -125,6 +130,24 @@ function isWaiting(v: StagedValue): boolean {
   return v.filedAt === null && v.dropped === null;
 }
 
+/**
+ * The instruments this sample has heard from, upper-cased for comparison.
+ *
+ * Read only by the U-WAM pairing gate (src/results/pairing.ts). Every value is
+ * counted, filed or not: once the UC-3500 half of a tube has been filed, a
+ * later rerun of a UF-4000 parameter must not re-open the wait for a strip
+ * result that has already been and gone.
+ */
+export function devicesOf(s: StagedSample): Set<string> {
+  const out = new Set<string>();
+  for (const v of Object.values(s.values)) {
+    if (v.dropped === 'ignored') continue;
+    const d = (v.instrument ?? '').trim();
+    if (d) out.add(d.toUpperCase());
+  }
+  return out;
+}
+
 export function summarize(s: StagedSample): StagedSummary {
   // Channels the interface is not scoped to are not part of the sample: they
   // are filtered before intake now, and a sample stored before that filter
@@ -203,17 +226,18 @@ export class ResultStore {
 
     const changed: string[] = [];
     const unchanged: string[] = [];
-    let touched = false;
+    /** A re-transmit that carries no new value can still carry something the
+     *  store did not have: the name of the instrument that produced it. Worth
+     *  a write, because that name is what the U-WAM pairing gate reads. */
+    let namedInstrument = false;
     for (const r of upload.results) {
       const have = sample.values[r.testCode];
       const unit = r.unit ?? null;
-      if (have && have.value === r.value && (have.unit === unit || have.unit === null)) {
-        // The same value again. A held value with no unit (restored from the
-        // HMIS transaction log, which does not carry one) learns the unit
-        // from the analyzer's own transmission without becoming unfiled.
-        if (have.unit === null && unit !== null) {
-          have.unit = unit;
-          touched = true;
+      const instrument = (r.instrument ?? '').trim() || null;
+      if (have && have.value === r.value && have.unit === unit) {
+        if (instrument && have.instrument !== instrument) {
+          have.instrument = instrument;
+          namedInstrument = true;
         }
         unchanged.push(r.testCode);
         continue;
@@ -229,6 +253,7 @@ export class ResultStore {
         completedAt: r.completedAt ?? null,
         receivedAt,
         filedAt: null,
+        instrument: instrument ?? have?.instrument ?? null,
         identifier: null,
         labResultId: null,
         dropped: null,
@@ -236,7 +261,7 @@ export class ResultStore {
       changed.push(r.testCode);
     }
 
-    if (changed.length || pruned || touched || !existing) {
+    if (changed.length || pruned || namedInstrument || !existing) {
       sample.updatedAt = receivedAt;
       sample.raw = upload.raw ?? sample.raw;
       // A new value re-opens the sample: the last error described a state

@@ -184,6 +184,13 @@ export interface HmisResultUpload {
     abnormalFlag?: string | null;
     status?: string | null; // F | P | C | X
     completedAt?: string | null;
+    /** Which physical instrument produced this value, when the message names
+     *  one (ASTM R record, field 14). A work-area manager standing in front of
+     *  several analyzers reports its members here — the Sysmex U-WAM sends
+     *  "UC-3500" or "UF-4000" on every R record — and that is what lets the
+     *  filing pass hold a shared panel until both halves have arrived. Null on
+     *  instruments that do not name themselves. */
+    instrument?: string | null;
   }>;
   /** Raw wire text for the server-side interface message log. */
   raw?: string;

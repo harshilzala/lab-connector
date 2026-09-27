@@ -34,7 +34,7 @@ writeFileSync(
 const cfg = loadConfig(join(dir, 'config.json')).analyzers[0]!;
 rmSync(dir, { recursive: true, force: true });
 
-const PADS = ['C-PRO', 'C-GLU', 'C-KET', 'C-URO', 'C-BIL', 'C-NIT', 'C-BLD', 'C-LEU', 'C-CLOUD'];
+const PADS = ['C-PRO', 'C-GLU', 'C-KET', 'C-URO', 'C-BIL', 'C-NIT', 'C-BLD', 'C-LEU', 'C-CLOUD', 'C-S.G.(Ref)', 'C-PH'];
 const orderRows: MirthAcknowledgeItem[] = PADS.map((identifier, i) => ({
   sampleID: 'LB2609180500', identifier, labServiceId: 414, parameterId: 90 + i, labResultId: 93390000,
   equipmentId: 19232485, ipAddress: '10.11.103.21', portNo: '2031', resultType: 'PARAMETER', isTransmitted: true,
@@ -46,7 +46,7 @@ function sent(values: Record<string, string>): Record<string, string> {
     results: Object.entries(values).map(([testCode, value]) => ({ testCode, value, unit: null, abnormalFlag: 'N', status: 'F', completedAt: null })),
   } as unknown as HmisResultUpload;
   const joined = toLisResultRows(upload, orderRows, undefined, cfg.testCodeAliases, cfg.ignoreTestCodes, cfg.testCodeScale,
-    cfg.allowTestCodes, cfg.excludeIdentifiers, cfg.excludeParameterIds, cfg.testValueMap);
+    cfg.allowTestCodes, cfg.excludeIdentifiers, cfg.excludeParameterIds, cfg.testValueMap, cfg.testCodeDecimals);
   assert.deepEqual(joined.unmatched, [], 'every pad has a row');
   lastIgnored = joined.ignored;
   return Object.fromEntries(joined.rows.map((r) => [r.identifier, r.resultValue]));
@@ -66,6 +66,16 @@ for (const [pad, from, to] of table) {
   assert.equal(sent({ [pad]: from })[pad], to, `${pad} "${from}" -> "${to}"`);
 }
 console.log(`✓ ${table.length} table rows: "-" -> Absent/Negative/Normal, "+-" -> trace, "+" -> Positive, grades pass through`);
+
+// ---- Specific Gravity and pH go through EXACTLY as the machine gives them ----
+// (lab, 2026-09-22: ZC2609220074 — machine 1.008, HMIS must get 1.008). No
+// word map, no rounding, no unit scale may ever touch these two.
+for (const sg of ['1.008', '1.002', '1.050', '1.019']) {
+  assert.equal(sent({ 'C-S.G.(Ref)': sg })['C-S.G.(Ref)'], sg, `S.G. ${sg} unchanged`);
+}
+assert.equal(sent({ 'C-PH': '6.5' })['C-PH'], '6.5');
+assert.ok(!('C-S.G.(Ref)' in cfg.testCodeDecimals) && !('C-PH' in cfg.testCodeDecimals), 'S.G. and pH are not on the rounding list');
+console.log('✓ C-S.G.(Ref) and C-PH pass through untouched');
 
 // ---- pads the table does not name are filed as the instrument sends them ---
 assert.deepEqual(sent({ 'C-LEU': '-', 'C-BLD': '+-' }), { 'C-BLD': '+-', 'C-LEU': '-' });
