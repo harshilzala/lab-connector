@@ -1,0 +1,251 @@
+// =============================================================================
+// seal.mjs — bind this deployment to THIS machine.
+//
+//   node seal.mjs
+//
+// Ships INSIDE the deployment folder (npm run dist puts it there) and runs from
+// there, because sealing must happen on the machine that will run the connector.
+// It needs no node_modules and no source: it encrypts the bundle that is already
+// built beside it.
+//
+// WHAT IT DOES
+//   dist\index.cjs  ->  dist\app.enc    AES-256-GCM, and the plaintext is gone
+//   .env            ->  .env.enc        the same, for the secrets
+//   dist\app.key                        the AES key, wrapped by Windows DPAPI
+//   dist\index.js   ->  the loader that undoes all of the above at startup
+//
+// WHAT THAT IS AND IS NOT WORTH
+// The AES key is not in the folder in any usable form: DPAPI holds it against
+// this machine (LocalMachine scope), so copying the folder to another PC yields
+// files that cannot be decrypted there. That is the protection, and it is real.
+//
+// It is NOT secrecy from someone who already has administrator rights on THIS
+// machine. They can ask DPAPI to unwrap the key exactly as the loader does. No
+// scheme can prevent that while the connector still has to start by itself at
+// 3am with nobody logged in — the key must be reachable without a human, and
+// what the program can reach, a person on that machine can reach. Say that
+// plainly to whoever asks; do not let it be sold as more than it is.
+//
+// LocalMachine scope, not CurrentUser, deliberately. PM2 may run the connector
+// as the operator today and the LAB-Interface service account tomorrow — this
+// codebase has a whole section in magic\magic-start.bat about that confusion.
+// CurrentUser would make the deployment silently undecryptable after such a
+// change; LocalMachine keeps it working for any account on the same PC.
+// =============================================================================
+import { execFileSync } from 'node:child_process';
+import { createCipheriv, randomBytes } from 'node:crypto';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const HERE = import.meta.dirname;
+const DIST = join(HERE, 'dist');
+const BUNDLE = join(DIST, 'index.cjs');
+
+if (process.platform !== 'win32') {
+  console.error('seal.mjs uses Windows DPAPI and only runs on Windows.');
+  process.exit(1);
+}
+if (!existsSync(BUNDLE)) {
+  console.error(`nothing to seal: ${BUNDLE} is not here.`);
+  console.error('Either this deployment is already sealed, or it was never built.');
+  console.error('Rebuild from the source checkout with:  npm run dist -- <this folder>');
+  process.exit(1);
+}
+
+/**
+ * Hand a secret to Windows DPAPI and get back a blob only this machine can open.
+ *
+ * Through PowerShell rather than a native module, so the deployment stays
+ * dependency-free — `npm install` is never needed here. -Command (not a script
+ * file) is used because the execution policy that blocks scripts does not apply
+ * to it, which matters on a locked-down hospital PC.
+ *
+ * Only the 32-byte AES key goes through this. Pushing the whole 460 KB bundle
+ * through a PowerShell pipe as base64 would be slow and one more thing to break.
+ */
+function dpapiProtect(secret) {
+  const ps = [
+    // Without this, a DPAPI failure is a NON-TERMINATING error: PowerShell
+    // prints a .NET stack and still exits 0, so the caller sees success and an
+    // empty result. Make it terminating so the exit code means something.
+    "$ErrorActionPreference='Stop';",
+    'Add-Type -AssemblyName System.Security;',
+    `$b=[Convert]::FromBase64String('${secret.toString('base64')}');`,
+    "[Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($b,$null,'LocalMachine'))",
+  ].join(' ');
+  const out = execFileSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+    { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const wrapped = Buffer.from(out.trim(), 'base64');
+  if (wrapped.length === 0) throw new Error('DPAPI returned nothing — the key was not wrapped');
+  return wrapped;
+}
+
+const key = randomBytes(32);
+
+/** iv | tag | ciphertext — GCM, so a tampered file fails to open rather than
+ *  running as something else. */
+function encrypt(plain) {
+  const iv = randomBytes(12);
+  const c = createCipheriv('aes-256-gcm', key, iv);
+  const body = Buffer.concat([c.update(plain), c.final()]);
+  return Buffer.concat([iv, c.getAuthTag(), body]);
+}
+
+console.log('\n  sealing this deployment to this machine\n');
+
+// ---- 1. the application ------------------------------------------------------
+const source = readFileSync(BUNDLE);
+writeFileSync(join(DIST, 'app.enc'), encrypt(source));
+// The plaintext must not survive the sealing. Overwritten rather than deleted:
+// the file is regenerated by every build, so there is nothing here to lose, and
+// a note in its place explains where the code went to anyone who looks.
+writeFileSync(
+  BUNDLE,
+  '// Sealed. The application is dist\\app.enc, decrypted at startup by dist\\index.js.\n' +
+    '// Rebuild the readable bundle from the source checkout: npm run dist\n',
+  'utf8',
+);
+console.log(`  [1/4] dist\\app.enc      ${(statSync(join(DIST, 'app.enc')).size / 1024).toFixed(0)} KB encrypted, plaintext bundle overwritten`);
+
+// ---- 2. the secrets ----------------------------------------------------------
+let envSealed = false;
+if (existsSync(join(HERE, '.env'))) {
+  writeFileSync(join(HERE, '.env.enc'), encrypt(readFileSync(join(HERE, '.env'))));
+  envSealed = true;
+  console.log('  [2/4] .env.enc          written');
+} else {
+  console.log('  [2/4] no .env here — nothing to seal');
+}
+
+// ---- 3. the key, wrapped by the machine --------------------------------------
+writeFileSync(join(DIST, 'app.key'), dpapiProtect(key).toString('base64'), 'utf8');
+console.log('  [3/4] dist\\app.key      AES key wrapped by DPAPI (LocalMachine)');
+
+// ---- 4. the loader -----------------------------------------------------------
+writeFileSync(join(DIST, 'index.js'), loader(), 'utf8');
+console.log('  [4/4] dist\\index.js     replaced by the decrypting loader');
+
+console.log('\n  Sealed. Start it exactly as before: magic\\magic-start.bat');
+if (envSealed) {
+  console.log('\n  ONE STEP LEFT, and it is not optional:');
+  console.log('  delete .env from this folder. Its values are now in .env.enc, and');
+  console.log('  leaving the plaintext beside the encrypted copy defeats the point.');
+}
+console.log('  This folder will NOT start on any other machine. Seal each one there.\n');
+
+function loader() {
+  return `// =============================================================================
+// Startup loader for a SEALED deployment. Plaintext on purpose — it has to be,
+// something must run first. It carries no secret: the AES key lives in
+// dist\\\\app.key, wrapped by Windows DPAPI, and only this machine can unwrap it.
+//
+// Order matters. The secrets go into process.env BEFORE the application is
+// evaluated, because the app reads its configuration as it loads and its own
+// .env reader will not overwrite a variable that is already set.
+//
+// Regenerate with: node seal.mjs   (from the source checkout: npm run dist)
+// =============================================================================
+import { execFileSync } from 'node:child_process';
+import { createDecipheriv } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+
+const HERE = import.meta.dirname;
+const ROOT = dirname(HERE);
+
+function fail(what, err) {
+  // Loud and specific: a sealed deployment that will not open is nearly always
+  // one that was copied from another PC, and the operator needs to be told that
+  // rather than left reading a crypto error.
+  console.error('[sealed] cannot open ' + what + ': ' + (err && err.message ? err.message : err));
+  console.error('[sealed] This deployment is bound to the machine that sealed it.');
+  console.error('[sealed] If this folder was copied here, run:  node seal.mjs');
+  process.exit(1);
+}
+
+function unwrapKey() {
+  const blob = readFileSync(join(HERE, 'app.key'), 'utf8').trim();
+  const ps = [
+    // Terminating, so a key from another machine is an exit code and not a
+    // .NET stack trace printed over the connector's own startup output.
+    "$ErrorActionPreference='Stop';",
+    'Add-Type -AssemblyName System.Security;',
+    "$b=[Convert]::FromBase64String('" + blob + "');",
+    "[Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($b,$null,'LocalMachine'))",
+  ].join(' ');
+  let out;
+  try {
+    out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+      encoding: 'utf8',
+      windowsHide: true,
+      // stderr captured, not inherited: on failure we say something useful
+      // ourselves rather than letting PowerShell's exception be the message.
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    // execFileSync puts the whole command line and PowerShell's .NET stack in
+    // its message. Neither helps an operator, and the command line carries the
+    // wrapped key — so it is replaced with the one fact that matters.
+    throw new Error('Windows DPAPI refused the wrapped key');
+  }
+  const key = Buffer.from(out.trim(), 'base64');
+  // The length IS the check. Belt and braces with $ErrorActionPreference above:
+  // between them, a foreign blob can neither pass silently nor look like a key.
+  if (key.length !== 32) throw new Error('DPAPI did not return this machine\\'s key (got ' + key.length + ' bytes)');
+  return key;
+}
+
+function decrypt(key, file) {
+  const buf = readFileSync(file);
+  const d = createDecipheriv('aes-256-gcm', key, buf.subarray(0, 12));
+  d.setAuthTag(buf.subarray(12, 28));
+  return Buffer.concat([d.update(buf.subarray(28)), d.final()]);
+}
+
+let key;
+try {
+  key = unwrapKey();
+} catch (err) {
+  fail('the key (DPAPI)', err);
+}
+
+// ---- secrets first ----------------------------------------------------------
+const envFile = join(ROOT, '.env.enc');
+if (existsSync(envFile)) {
+  try {
+    for (const line of decrypt(key, envFile).toString('utf8').split(/\\r?\\n/)) {
+      const t = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const eq = t.indexOf('=');
+      if (eq === -1) continue;
+      const k = t.slice(0, eq).trim();
+      let v = t.slice(eq + 1).trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      if (!(k in process.env)) process.env[k] = v;
+    }
+  } catch (err) {
+    fail('.env.enc', err);
+  }
+}
+
+// ---- then the application ---------------------------------------------------
+let source;
+try {
+  source = decrypt(key, join(HERE, 'app.enc')).toString('utf8');
+} catch (err) {
+  fail('app.enc', err);
+}
+
+// Run it as the CommonJS module it was bundled as. __filename is the real path
+// inside dist\\\\, so require('serialport') resolves against this folder exactly
+// as it would for a file on disk.
+const filename = join(HERE, 'index.cjs');
+const module_ = { exports: {} };
+const fn = new Function('exports', 'require', 'module', '__filename', '__dirname', source);
+fn(module_.exports, createRequire(import.meta.url), module_, filename, HERE);
+`;
+}

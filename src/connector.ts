@@ -2,7 +2,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { AppConfig } from './config.js';
 import type { Logger } from './logger.js';
-import { HmisClient } from './hmis/client.js';
+import { HmisClient, type HmisGateway } from './hmis/client.js';
+import { GenxHmisClient } from './hmis/genx.js';
 import { HmisAudit } from './hmis/audit.js';
 import { RetentionSweeper } from './maintenance/retention.js';
 import { AnalyzerRuntime } from './session/orchestrator.js';
@@ -15,12 +16,17 @@ import { AutoCertifyService } from './autocertify/service.js';
 // live state.
 export class Connector implements AdminBackend {
   private readonly runtimes = new Map<string, AnalyzerRuntime>();
-  private readonly hmis: HmisClient;
+  private readonly hmis: HmisGateway;
   private readonly admin: AdminServer;
   private readonly auth: AuthStore;
   /** Absent when retention.days is 0 — the sweep is then switched off. */
   private readonly retention?: RetentionSweeper;
   private readonly autoCertifyService: AutoCertifyService;
+
+  /** The gateway actually in use — mirth's baseUrl or genx's. */
+  private get hmisUrl(): string {
+    return this.cfg.hmis.api === 'genx' ? this.cfg.hmis.genx.baseUrl : this.cfg.hmis.baseUrl;
+  }
 
   constructor(private readonly cfg: AppConfig, private readonly logger: Logger) {
     // Separate from the application log on purpose: this one is the evidence
@@ -31,18 +37,46 @@ export class Connector implements AdminBackend {
       ? new HmisAudit(resolve(cfg.hmis.auditLog), logger.child({ mod: 'hmis-audit' }), cfg.hmis.auditMaxBytes)
       : undefined;
 
-    this.hmis = new HmisClient({
-      baseUrl: cfg.hmis.baseUrl,
-      siteId: cfg.hmis.siteId,
-      siteIds: cfg.hmis.siteIds,
-      pendingPath: cfg.hmis.pendingPath,
-      acknowledgePath: cfg.hmis.acknowledgePath,
-      resultsPath: cfg.hmis.resultsPath,
-      timeoutMs: cfg.hmis.timeoutMs,
-      tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
-      logger: logger.child({ mod: 'hmis' }),
-      audit,
-    });
+    // hmis.api picks the gateway; everything downstream sees the same shape.
+    const g = cfg.hmis.genx;
+    this.hmis = cfg.hmis.api === 'genx'
+      ? new GenxHmisClient({
+          baseUrl: g.baseUrl,
+          tokenPath: g.tokenPath,
+          revokePath: g.revokePath,
+          worklistPath: g.worklistPath,
+          acknowledgePath: g.acknowledgePath,
+          resultsPath: g.resultsPath,
+          clientId: g.clientId,
+          clientSecret: g.clientSecret,
+          scope: g.scope,
+          clientAuth: g.clientAuth,
+          apiKey: g.apiKey || undefined,
+          apiKeyHeader: g.apiKeyHeader,
+          barcodeField: g.barcodeField,
+          serviceTests: g.serviceTests,
+          equipmentServices: g.equipmentServices,
+          pendingLineStatuses: g.pendingLineStatuses,
+          batchDays: g.batchDays,
+          batchPageSize: g.batchPageSize,
+          accessionCacheFile: g.accessionCacheFile ? resolve(g.accessionCacheFile) : undefined,
+          timeoutMs: cfg.hmis.timeoutMs,
+          tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
+          logger: logger.child({ mod: 'hmis-genx' }),
+          audit,
+        })
+      : new HmisClient({
+          baseUrl: cfg.hmis.baseUrl,
+          siteId: cfg.hmis.siteId,
+          siteIds: cfg.hmis.siteIds,
+          pendingPath: cfg.hmis.pendingPath,
+          acknowledgePath: cfg.hmis.acknowledgePath,
+          resultsPath: cfg.hmis.resultsPath,
+          timeoutMs: cfg.hmis.timeoutMs,
+          tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
+          logger: logger.child({ mod: 'hmis' }),
+          audit,
+        });
 
     const spoolRoot = resolve(cfg.spoolDir);
     for (const a of cfg.analyzers) {
@@ -88,9 +122,9 @@ export class Connector implements AdminBackend {
     // A loopback/placeholder HMIS URL starts cleanly but files nothing —
     // results just accumulate in the spool. Say so loudly rather than let a
     // placeholder reach go-live unnoticed.
-    if (this.runtimes.size && /^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:|\/|$)/i.test(this.cfg.hmis.baseUrl)) {
+    if (this.runtimes.size && /^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:|\/|$)/i.test(this.hmisUrl)) {
       this.logger.warn(
-        { baseUrl: this.cfg.hmis.baseUrl },
+        { baseUrl: this.hmisUrl },
         'HMIS base URL points at this machine — results will queue in the spool until it is set to the real gateway',
       );
     }
@@ -116,7 +150,8 @@ export class Connector implements AdminBackend {
       {
         analyzers: [...this.runtimes.keys()],
         autoCertify: this.autoCertifyService.enabled ? 'enabled' : 'disabled',
-        hmis: this.cfg.hmis.baseUrl,
+        hmisApi: this.cfg.hmis.api,
+        hmis: this.hmisUrl,
         hmisLog: this.cfg.hmis.auditLog ? this.cfg.hmis.auditLog.replace(/(\.[^./\\]+)?$/, '-YYYY-MM-DD$1') : 'disabled',
         wireLogs: `${this.cfg.retention.logDir}/wire-<analyzer>-YYYY-MM-DD.log`,
         retentionDays: this.cfg.retention.days || 'disabled',

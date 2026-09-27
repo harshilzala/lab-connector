@@ -62,7 +62,21 @@ export interface PendingQuery {
   date?: string;
 }
 
-export class HmisClient {
+/**
+ * What the rest of the connector needs from an HMIS gateway. Two
+ * implementations, picked by `hmis.api` in config.json: `HmisClient` (the
+ * /mirth/* gateway, below) and `GenxHmisClient` (GenX LIMS, src/hmis/genx.ts).
+ * Both speak the mirth row shape to the connector.
+ */
+export interface HmisGateway {
+  readonly siteId: string | null;
+  readonly defaultSiteIds: (string | undefined)[];
+  getPending(q: PendingQuery): Promise<unknown>;
+  acknowledge(items: MirthAcknowledgeItem[], eqCode?: string): Promise<void>;
+  postResults(rows: LisInboundResultRow[], eqCode?: string): Promise<HmisResultUploadResponse>;
+}
+
+export class HmisClient implements HmisGateway {
   /** The site-wide siteId every pending call carries unless the analyzer
    *  block names its own. Read by the status page so the console can show
    *  what each machine's orders are keyed on. */
@@ -166,7 +180,7 @@ export class HmisClient {
    * empty or shapeless body is still accepted — only a status it declares, or
    * a successData it returns, is judged.
    */
-  async acknowledge(items: MirthAcknowledgeItem[]): Promise<void> {
+  async acknowledge(items: MirthAcknowledgeItem[], _eqCode?: string): Promise<void> {
     if (items.length === 0) return;
     const path = this.opts.acknowledgePath;
     const startedAt = Date.now();

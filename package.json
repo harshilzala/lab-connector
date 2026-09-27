@@ -53,7 +53,10 @@
     "prefixes": "tsx test/download-prefixes.test.ts",
     "params": "tsx test/parameter-catalogue.test.ts",
     "replay:0028": "tsx test/ch2609080028-replay.ts",
-    "autocertify": "tsx test/auto-certify.test.ts"
+    "autocertify": "tsx test/auto-certify.test.ts",
+    "genx": "tsx test/genx-client.test.ts",
+    "dist": "node scripts/make-dist.mjs",
+    "dist:seal": "node scripts/make-dist.mjs --seal"
   },
   "dependencies": {
     "pino": "^9.5.0",

@@ -40,3 +40,7 @@ captures/
 
 # Lab-Watch-Agent memory and run state — per machine, never committed
 scripts/agent/state/
+
+# Run-only deployment folders produced by `npm run dist`. Carry a copy of
+# config.json and .env, so never commit them.
+deploy/

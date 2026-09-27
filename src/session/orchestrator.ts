@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { AnalyzerConfig } from '../config.js';
-import type { HmisClient } from '../hmis/client.js';
+import type { HmisGateway } from '../hmis/client.js';
 import type { HmisResultUpload, HostQuery, MirthAcknowledgeItem, OrderDownload, ParsedMessage, PendingOrders } from '../types.js';
 import type { ProtocolLink, WireEvent } from '../codec/types.js';
 import { createTransport } from '../transport/index.js';
@@ -260,7 +260,7 @@ export class AnalyzerRuntime {
 
   constructor(
     private readonly cfg: AnalyzerConfig,
-    private readonly hmis: HmisClient,
+    private readonly hmis: HmisGateway,
     spoolRoot: string,
     logger: Logger,
     /** Where to persist the wire log. Omitted (tests, ad-hoc runs) = memory only. */
@@ -285,7 +285,7 @@ export class AnalyzerRuntime {
         orderRows: (barcode, opts) => this.resolveOrderRows(barcode, opts),
         join: (upload, rows) => this.joinRows(upload, rows),
         postResults: (rows) => this.hmis.postResults(rows, this.cfg.equipmentCode),
-        acknowledge: (rows) => this.hmis.acknowledge(rows),
+        acknowledge: (rows) => this.hmis.acknowledge(rows, this.cfg.equipmentCode),
         log: this.log,
         recheckMs: cfg.filing.recheckMs,
         completeBarcode: cfg.barcodeCompletion ? compileCompletion(cfg.barcodeCompletion) : undefined,
@@ -415,7 +415,7 @@ export class AnalyzerRuntime {
       // that the rows stay pending and may be downloaded again — the same cost
       // the acknowledge has always had, and much cheaper than a double file.
       try {
-        await this.hmis.acknowledge(matched);
+        await this.hmis.acknowledge(matched, this.cfg.equipmentCode);
         this.log.info({ barcode: payload.barcode, rows: matched.length }, 'pending rows acknowledged after filing');
       } catch (err) {
         this.log.error(
@@ -969,7 +969,7 @@ export class AnalyzerRuntime {
     report.message = res.message;
     this.staged.markFiled(s.barcode, joined.filedCodes);
     try {
-      await this.hmis.acknowledge(joined.matched);
+      await this.hmis.acknowledge(joined.matched, this.cfg.equipmentCode);
     } catch (err) {
       this.log.error(
         { barcode: s.barcode, err: err instanceof Error ? err.message : String(err) },

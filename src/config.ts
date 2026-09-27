@@ -615,6 +615,44 @@ const ConfigSchema = z.object({
     /** A day's file that grows past this continues in a numbered part
      *  (hmis-YYYY-MM-DD.1.log). Nothing is discarded by size. */
     auditMaxBytes: z.number().int().positive().default(10 * 1024 * 1024),
+    /** Which HMIS API the analyzers file into. "mirth" = the /mirth/* gateway
+     *  above (baseUrl + the three paths); "genx" = GenX LIMS Lab Equipment API
+     *  (the `genx` block). Flip this one word to move between them — both
+     *  blocks can stay configured side by side. */
+    api: z.enum(['mirth', 'genx']).default('mirth'),
+    /** GenX LIMS Lab Equipment External API — used only when api = "genx".
+     *  See src/hmis/genx.ts. */
+    genx: z
+      .object({
+        /** Gateway host, e.g. https://uat.genx.example — no trailing path. */
+        baseUrl: z.union([z.string().url(), z.literal('')]).default(''),
+        tokenPath: z.string().default('/auth-service/api/oauth/token'),
+        revokePath: z.string().default('/auth-service/api/oauth/revoke'),
+        worklistPath: z.string().default('/integration-service/external/v1/lab/equipment/worklist'),
+        acknowledgePath: z.string().default('/integration-service/external/v1/lab/equipment/acknowledge'),
+        resultsPath: z.string().default('/integration-service/external/v1/lab/equipment/results'),
+        /** OAuth2 client credentials. Env GENX_CLIENT_ID / GENX_CLIENT_SECRET win. */
+        clientId: z.string().default(''),
+        clientSecret: z.string().default(''),
+        scope: z.string().default('lab.equipment.worklist.read lab.equipment.acknowledge lab.equipment.result.publish'),
+        clientAuth: z.enum(['basic', 'body']).default('basic'),
+        /** PROD only. Env GENX_API_KEY wins. */
+        apiKey: z.string().default(''),
+        apiKeyHeader: z.string().default('X-API-Key'),
+        /** The worklist field printed on the tube as its barcode. */
+        barcodeField: z.enum(['sampleNumber', 'accessionNumber']).default('sampleNumber'),
+        /** GenX serviceCode → the analyzer assay codes reported under it. */
+        serviceTests: z.record(z.array(z.string())).default({}),
+        /** equipmentCode → the serviceCodes that machine runs (unlisted = all). */
+        equipmentServices: z.record(z.array(z.string())).default({}),
+        pendingLineStatuses: z.array(z.string()).default(['PENDING']),
+        batchDays: z.number().int().nonnegative().default(1),
+        batchPageSize: z.number().int().positive().max(500).default(200),
+        /** barcode → accessionNumber memory, so results after a restart still
+         *  find their tube. Relative to the working directory. */
+        accessionCacheFile: z.string().default('./spool/genx-accessions.json'),
+      })
+      .default({}),
   }).default({}),
   /** Housekeeping: how long logs and unfiled spool items are kept on disk. */
   retention: z
@@ -671,7 +709,11 @@ const ConfigSchema = z.object({
       message: 'configure at least one analyzer, or enable autoCertify to run in Auto-Certify-only mode',
     });
   }
-  if (c.analyzers.length && !c.hmis.baseUrl) {
+  if (c.analyzers.length && c.hmis.api === 'genx') {
+    if (!c.hmis.genx.baseUrl) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'genx', 'baseUrl'], message: 'required when hmis.api is "genx"' });
+    }
+  } else if (c.analyzers.length && !c.hmis.baseUrl) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'baseUrl'], message: 'required when analyzers are configured' });
   }
 });
@@ -794,6 +836,14 @@ function applyEnvOverrides(raw: any): any {
   const cfg = structuredClone(raw);
   if (process.env.LOG_LEVEL) cfg.logLevel = process.env.LOG_LEVEL;
   if (process.env.HMIS_BASE_URL) cfg.hmis = { ...cfg.hmis, baseUrl: process.env.HMIS_BASE_URL };
+  if (process.env.GENX_CLIENT_ID || process.env.GENX_CLIENT_SECRET || process.env.GENX_API_KEY) {
+    const h = cfg.hmis ?? {};
+    const g = { ...(h.genx ?? {}) };
+    if (process.env.GENX_CLIENT_ID) g.clientId = process.env.GENX_CLIENT_ID;
+    if (process.env.GENX_CLIENT_SECRET) g.clientSecret = process.env.GENX_CLIENT_SECRET;
+    if (process.env.GENX_API_KEY) g.apiKey = process.env.GENX_API_KEY;
+    cfg.hmis = { ...h, genx: g };
+  }
   if (process.env.ADMIN_AUTH_FILE) cfg.admin = { ...cfg.admin, authFile: process.env.ADMIN_AUTH_FILE };
   if (process.env.AUTOCERTIFY_ORACLE_PASSWORD) {
     const ac = cfg.autoCertify ?? {};
