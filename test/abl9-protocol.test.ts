@@ -18,7 +18,7 @@
 // Run: npx tsx test/abl9-protocol.test.ts
 // =============================================================================
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Abl9Link } from '../src/codec/abl9/link.js';
 import { AstmLink } from '../src/codec/astm/link.js';
@@ -63,6 +63,13 @@ async function run(feed: (t: FakeTransport) => void): Promise<{ msgs: ParsedMess
 }
 
 // ---- pull the real envelopes out of the capture ------------------------------
+// The capture is a month of real ABL9 traffic that lives on the Cancer-site PC,
+// not in the repo (it carries patient barcodes). Skip rather than fail anywhere
+// else, so a real regression cannot hide behind a missing-file error.
+if (!existsSync(resolve(CAPTURE))) {
+  console.log(`SKIP: ${CAPTURE} is not on this machine — site replay test`);
+  process.exit(0);
+}
 const cap = readFileSync(resolve(CAPTURE));
 const envelopes: Buffer[] = [];
 for (let i = 0; ; ) {

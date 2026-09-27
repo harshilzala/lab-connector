@@ -9,8 +9,10 @@ rem
 rem      magic-remove-from-startup.bat      (stop it coming back)
 rem      magic-stop.bat                     (put it down now)
 rem
-rem  Leaves the Lab-Interface.bat entries alone. If this machine was set up with
-rem  those as well, use Lab-Interface-remove-startup.bat in the folder above.
+rem  Only touches the entries THIS folder registered. A machine set up by the
+rem  retired Lab-Interface.bat scripts may still carry a "Lab-Interface" logon
+rem  shortcut and watchdog task; those scripts are gone, so remove any leftovers
+rem  by hand from the Startup folder and Task Scheduler.
 rem ===========================================================================
 setlocal
 title magic - remove from startup

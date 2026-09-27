@@ -1,13 +1,13 @@
 <#
   Lab-Interface - force stop (engine).
 
-  Run Lab-Interface-force-stop.bat (or magic\magic-force-stop.bat) instead of
-  this file unless you want the switches below; the .bat files are the
-  double-clickable wrappers.
+  Run magic\magic-force-stop.bat instead of this file unless you want the
+  switches below; that .bat is the double-clickable wrapper, and this script
+  is the engine it calls.
 
-  Why this exists next to Lab-Interface-stop.bat
-  ------------------------------------------------
-  Lab-Interface-stop.bat only knows how to stop the connector when PM2 is
+  Why this exists next to magic\magic-stop.bat
+  --------------------------------------------
+  magic-stop.bat only knows how to stop the connector when PM2 is
   managing it. On this machine the connector is a Windows SERVICE
   (service\LAB-Interface-service.xml, run by WinSW as LocalSystem), and PM2 has
   nothing to do with it. Killing the service's node process is not a stop
@@ -21,16 +21,16 @@
   ----------------------
     1. Raises the .lab-maintenance flag, so a watchdog tick landing in the
        middle of the stop does not start it again. Same flag, same meaning as
-       Lab-Interface-stop.bat: it stays down until Lab-Interface.bat runs.
+       magic-stop.bat: it stays down until magic-start.bat runs.
     2. Watchdog: kills any watchdog worker that is running right now
-       (magic-startup.cmd / Lab-Interface-startup.cmd) and DISABLES the
+       (magic-startup.cmd) and DISABLES the
        5-minute scheduled tasks ("Lab-Interface Watchdog - <user>" and
        "magic Lab Connector Watchdog - <user>"). Disabled, not deleted:
-       Lab-Interface.bat / magic-start.bat enable them again.
+       magic-start.bat enables them again.
     3. Windows service: stops the LAB-Interface service through the SCM (a
        clean stop, so it is NOT restarted as a crash) and sets its start type
        to Manual so a reboot does not bring it back while it is meant to be
-       down. Lab-Interface.bat restores Automatic (delayed) start.
+       down. magic-start.bat restores Automatic (delayed) start.
        Windows lets only administrators stop a service by default.
        service\grant-user-control.ps1 (run once, elevated) gives BUILTIN\Users
        start/stop/config rights on this one service; after that this script
@@ -77,11 +77,11 @@ $root = $PSScriptRoot
 $flag = Join-Path $root '.lab-maintenance'
 $serviceName = 'LAB-Interface'
 
-# Same PM2 home as Lab-Interface.bat - beside the connector, writable by every
+# Same PM2 home as magic\magic-start.bat - beside the connector, writable by every
 # operator - so this script stops the connector without "Run as administrator".
 # The machine-wide C:\ProgramData\pm2\home is owned by the LocalSystem PM2
 # service and grants Users read only, which made every unelevated pm2 call fail
-# with EPERM on pm2.pid. See the long note in Lab-Interface.bat.
+# with EPERM on pm2.pid. See the long note in magic\magic-start.bat.
 $env:PM2_HOME = Join-Path $root '.pm2'
 
 function Write-Step { param([string] $Text) Write-Host "  $Text" }
@@ -226,7 +226,7 @@ function Stop-ConnectorProcess {
 
 # ---- watchdog ---------------------------------------------------------------
 # Both generations of the 5-minute watchdog task, for every operator account:
-#   "Lab-Interface Watchdog - <user>"          registered by Lab-Interface.bat
+#   "Lab-Interface Watchdog - <user>"          left by the retired Lab-Interface.bat
 #   "magic Lab Connector Watchdog - <user>"    registered by magic\magic-add-to-startup.bat
 #   "Lab-Interface Watchdog"                   the retired shared one
 # plus anything else whose action points into this project folder.
@@ -327,7 +327,7 @@ function Stop-ConnectorService {
 
   $rc = Invoke-Quiet sc.exe config $serviceName start= demand
   if ($rc -eq 0) {
-    Write-Step '[3/6] service: start type set to Manual - a reboot will not bring it back. Lab-Interface.bat restores Automatic.'
+    Write-Step '[3/6] service: start type set to Manual - a reboot will not bring it back. magic\magic-start.bat restores Automatic.'
   } elseif ($rc -eq 5 -and -not (Test-Elevated)) {
     Write-Step '[3/6] service: no rights to change the start type, so it stays Automatic - a reboot WILL start it again.'
     Write-Step '       An administrator can set it to Manual once: sc config LAB-Interface start= demand'
@@ -451,7 +451,7 @@ if ($left.Count -eq 0 -and -not $serviceStillUp -and $watchdogFailed.Count -eq 0
   } else {
     Write-Host '  Lab-Interface is stopped and will STAY stopped'
     Write-Host '  (service stopped + Manual, watchdog disabled, flag raised).'
-    Write-Host '  Start it again with magic\magic-start.bat (PM2) or Lab-Interface.bat (service).'
+    Write-Host '  Start it again with magic\magic-start.bat.'
   }
   Write-Host ' =========================================================='
   Write-Host ''
@@ -461,7 +461,7 @@ if ($left.Count -eq 0 -and -not $serviceStillUp -and $watchdogFailed.Count -eq 0
 
 if ($serviceStillUp) {
   Write-Step ("[6/6] STILL RUNNING: the {0} service is {1}." -f $serviceName, $svcNow.Status)
-  if (-not (Test-Elevated)) { Write-Step 'Run Lab-Interface-force-stop.bat as administrator (or accept its prompt) to stop the service.' }
+  if (-not (Test-Elevated)) { Write-Step 'Run magic\magic-force-stop.bat as administrator (or accept its prompt) to stop the service.' }
 }
 if ($left.Count -gt 0) {
   Write-Step ("[6/6] STILL RUNNING: PID(s) {0}." -f (($left | ForEach-Object { $_.ProcessId }) -join ', '))

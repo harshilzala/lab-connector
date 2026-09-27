@@ -42,6 +42,8 @@ export interface HmisClientOptions {
   /** Site-wide `siteId` for the pending call (config `hmis.siteId`), used
    *  whenever the query itself does not name one. */
   siteId?: string;
+  /** Site-wide list of sites (config `hmis.siteIds`); wins over `siteId`. */
+  siteIds?: string[];
   logger: Logger;
   /** Records every call to the gateway — request, response and verdict. */
   audit?: HmisAudit;
@@ -68,6 +70,14 @@ export class HmisClient {
     return this.opts.siteId ?? null;
   }
 
+  /** The sites a pending call is repeated over when the analyzer names none
+   *  of its own: `hmis.siteIds`, else `hmis.siteId` alone, else one call
+   *  with no site filter (`[undefined]`). */
+  get defaultSiteIds(): (string | undefined)[] {
+    if (this.opts.siteIds?.length) return this.opts.siteIds;
+    return [this.opts.siteId];
+  }
+
   constructor(private readonly opts: HmisClientOptions) {
     if (!opts.tlsRejectUnauthorized) {
       // Blunt but effective for a self-signed cert on a hospital LAN. Scope it
@@ -87,6 +97,10 @@ export class HmisClient {
     const params = new URLSearchParams();
     if (q.sampleId) params.set('sampleId', q.sampleId);
     if (q.eqCode) params.set('eqCode', q.eqCode);
+    // Fall back to the site-wide id when the caller did not name one. An
+    // explicit q.siteId still wins, so the orchestrator's per-analyzer site is
+    // unaffected — this only stops a caller that omits it from polling HMIS
+    // UNSCOPED, which is how CANCER "ZC" tubes once reached the VITROS 250.
     const siteId = q.siteId ?? this.opts.siteId;
     if (siteId) params.set('siteId', siteId);
     if (q.showCulture !== undefined) params.set('showCulture', String(q.showCulture));

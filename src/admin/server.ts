@@ -6,6 +6,8 @@ import type { SpoolEnvelope } from '../queue/spool.js';
 import type { HmisResultUpload } from '../types.js';
 import { renderDashboard } from './dashboard.js';
 import { renderConnectorTool } from './connector-tool.js';
+import { renderAutoCertify } from './auto-certify.js';
+import type { AutoCertifyService } from '../autocertify/service.js';
 import { ProbeSession, type ProbeTransportConfig } from '../probe/session.js';
 import { FAMILY_LABELS, identify, knownProtocols, parsePayload } from '../probe/identify.js';
 import { listSerialPorts, scanTcp, sweepBaudRates } from '../probe/discover.js';
@@ -44,6 +46,8 @@ export interface AdminBackend {
   forceEnabled(): boolean;
   forcePasswordOk(given: string): boolean;
   force(id: string, barcode: string): Promise<ForceReport | null>;
+  /** The Auto Certify job behind the /auto-certify page. */
+  autoCertify(): AutoCertifyService;
 }
 import type { StagedSummary } from '../results/store.js';
 import type { OrderView, ResendReport } from '../session/orchestrator.js';
@@ -97,9 +101,24 @@ export class AdminServer {
       });
 
       server.listen(this.port, this.host, () => {
+        // Same guard as TcpTransport.listen: the OS may hand back a different
+        // port than asked for (seen 2026-09-16, a host-level bind rewrite).
+        // Report it instead of logging a URL nobody can open.
+        const addr = server.address();
+        const bound = typeof addr === 'object' && addr ? addr.port : this.port;
+        if (this.port !== 0 && bound !== this.port) {
+          server.close();
+          reject(
+            new Error(
+              `admin dashboard asked for ${this.host}:${this.port} but the OS bound port ${bound} — something on this PC ` +
+                'is rewriting socket binds (a security agent / network sandbox); fix that at the OS level.',
+            ),
+          );
+          return;
+        }
         this.sweeper = setInterval(() => this.sessions.sweep(), 15 * 60 * 1000);
         this.sweeper.unref();
-        this.logger.info({ url: `http://${this.host}:${this.port}` }, 'admin dashboard listening');
+        this.logger.info({ url: `http://${this.host}:${this.port}`, boundPort: bound }, 'admin dashboard listening');
         resolve();
       });
     });
@@ -298,6 +317,17 @@ export class AdminServer {
         return this.json(res, ok ? { ok } : { error: 'unknown sample' }, ok ? 200 : 404);
       }
 
+      // ---- Auto Certify ----
+      if (method === 'GET' && p === '/auto-certify') {
+        return this.html(res, renderAutoCertify({ username: session.username }));
+      }
+      if (p.startsWith('/api/auto-certify')) {
+        if (method !== 'GET' && !this.sameOrigin(req)) {
+          return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        }
+        return await this.autoCertify(req, res, p, method);
+      }
+
       // ---- Connector Tool: the universal device monitor ----
       if (method === 'GET' && p === '/connector') {
         return this.html(res, renderConnectorTool({ username: session.username }));
@@ -475,6 +505,50 @@ export class AdminServer {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.warn({ err: message, path: p }, 'connector-tool request failed');
       return this.json(res, { error: message }, 400);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto Certify
+  //
+  // "Run now" certifies patient results in HIS, so it is logged with the rest
+  // of the console's write actions. Preview only reads Oracle.
+  // ---------------------------------------------------------------------------
+  private async autoCertify(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    p: string,
+    method: string,
+  ): Promise<void> {
+    const svc = this.backend.autoCertify();
+    try {
+      if (method === 'GET' && p === '/api/auto-certify') {
+        return this.json(res, { status: svc.snapshot(), history: svc.history() });
+      }
+      if (method === 'POST' && p === '/api/auto-certify/run') {
+        this.logger.warn('auto certify run requested from the admin console');
+        return this.json(res, await svc.runNow());
+      }
+      if (method === 'POST' && p === '/api/auto-certify/pause') {
+        if (!svc.enabled) return this.json(res, { error: 'Auto Certify is disabled in config.json' }, 409);
+        let paused = true;
+        try {
+          const body = JSON.parse((await readBody(req)) || '{}') as { paused?: unknown };
+          paused = body.paused !== false;
+        } catch {
+          /* not JSON — treated as pause */
+        }
+        svc.setPaused(paused);
+        return this.json(res, { ok: true, paused });
+      }
+      if (method === 'POST' && p === '/api/auto-certify/preview') {
+        return this.json(res, await svc.preview());
+      }
+      return this.json(res, { error: 'not found' }, 404);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ err: message, path: p }, 'auto certify request failed');
+      return this.json(res, { error: message }, 409);
     }
   }
 

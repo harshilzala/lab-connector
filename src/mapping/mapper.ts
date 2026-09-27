@@ -145,7 +145,12 @@ export function toResultUploads(analyzer: AnalyzerConfig, msg: ParsedMessage): H
       barcode,
       // Either the protocol said so (HL7 MSH-11 = Q) or the barcode shape does.
       isQc: msg.isQc === true || isQcSample(sampleId, analyzer.qc),
-      results: payload,
+      // Which instrument produced each value rides along with it. Only the
+      // U-WAM link reads it (it fronts two analyzers), but carrying it costs
+      // nothing and it is deliberately NOT part of the message id below: the
+      // id must stay identical to the one a previous build computed, or a
+      // queued item re-sent after an upgrade would file twice.
+      results: payload.map((p, i) => ({ ...p, instrument: results[i]?.instrument ?? null })),
       raw: msg.raw,
       messageId: deterministicMessageId(analyzer.equipmentCode, barcode, payload),
     });
@@ -299,6 +304,23 @@ export function scaleResultValue(value: string, factor: number): string {
   return Number.isFinite(scaled) ? String(scaled) : value;
 }
 
+/**
+ * Round a reported value to a fixed number of decimal places — "0.9" → "1",
+ * "1.0" → "1", "0.5" → "1" (half up). Like scaleResultValue, anything that is
+ * not a plain number is returned UNCHANGED; a flag or a censored "<0.1" must
+ * not be turned into a number.
+ */
+export function roundResultValue(value: string, decimals: number): string {
+  const raw = (value ?? '').trim();
+  if (!raw || !/^[+-]?(\d+\.?\d*|\.\d+)$/.test(raw)) return value;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(decimals) || decimals < 0) return value;
+  // toFixed rounds half away from zero on the decimal string, which is what
+  // a lab expects (0.5 → 1), where Math.round on binary floats is not.
+  const out = Number(n.toFixed(decimals)).toFixed(decimals);
+  return out === '-0' ? '0' : out;
+}
+
 export function toLisResultRows(
   upload: HmisResultUpload,
   orderRows: MirthAcknowledgeItem[],
@@ -383,6 +405,20 @@ export function toLisResultRows(
    * not change. Rows listed here are simply never offered to the join.
    */
   excludeParameterIds: number[] = [],
+  /**
+   * Instrument value → the value HMIS is sent, per assay code — the words a
+   * lab reports a qualitative result as. The Sysmex U-WAM's strip pads say
+   * "-" where the report says "Absent" / "Negative" / "Normal" and "+-"
+   * where it says "trace". Code and value both match case-insensitively;
+   * the value match is exact. Applied after unit scaling, at delivery time.
+   */
+  valueMap: Record<string, Record<string, string>> = {},
+  /**
+   * Decimal places to round a numeric value to, per assay code — the
+   * parameters the report shows as whole numbers (UF-4000 epithelial cell
+   * counts). Applied after unit scaling, before the word map.
+   */
+  decimals: Record<string, number> = {},
 ): {
   rows: LisInboundResultRow[];
   unmatched: string[];
@@ -395,6 +431,10 @@ export function toLisResultRows(
   ignored: string[];
   /** Analyte codes whose value was unit-converted, as "WBC 8.89->8890". */
   scaled: string[];
+  /** Values rewritten by `valueMap`, as "CODE from->to", for the log. */
+  translated: string[];
+  /** Values rounded by `decimals`, as "CODE from->to", for the log. */
+  rounded: string[];
   /** The analyzer's OWN code for every row in `rows`, with the HMIS
    *  identifier and labResultId it was joined to — so a caller that tracks
    *  filing per analyte (the staged result store) can mark exactly the values
@@ -418,8 +458,24 @@ export function toLisResultRows(
     if (k && Number.isFinite(factor) && factor > 0 && factor !== 1) scaleOf.set(k, factor);
   }
 
+  const decimalsOf = new Map<string, number>();
+  for (const [code, places] of Object.entries(decimals)) {
+    const k = key(code);
+    if (k && Number.isInteger(places) && places >= 0) decimalsOf.set(k, places);
+  }
+
   const excluded = new Set(excludeIdentifiers.map(key).filter(Boolean));
   const excludedIds = new Set(excludeParameterIds);
+
+  // Per code, the instrument's value (lower-cased) → the word HMIS reports.
+  const valueMapOf = new Map<string, Map<string, string>>();
+  for (const [code, words] of Object.entries(valueMap)) {
+    const k = key(code);
+    if (!k || !words) continue;
+    const m = new Map<string, string>();
+    for (const [from, to] of Object.entries(words)) m.set(from.trim().toLowerCase(), to);
+    if (m.size) valueMapOf.set(k, m);
+  }
   const byCode = new Map<string, MirthAcknowledgeItem>();
   // One identifier → several parameterIds is an HMIS master in flux, not a
   // choice the connector may make: such a key is withheld from byCode.
@@ -454,6 +510,8 @@ export function toLisResultRows(
   // Unit conversions actually applied, so the delivery log can show the lab the
   // number that was filed next to the number the analyzer sent.
   const scaled: string[] = [];
+  const translated: string[] = [];
+  const rounded: string[] = [];
   const filedCodes: Array<{ testCode: string; identifier: string; labResultId: number | null }> = [];
 
   for (const r of upload.results) {
@@ -482,6 +540,32 @@ export function toLisResultRows(
       value = scaleResultValue(r.value, factor);
       if (value !== r.value) scaled.push(`${r.testCode} ${r.value}->${value}`);
     }
+    // Whole-number reporting for the codes the lab asked for. Keyed on the
+    // analyzer's OWN code, like the scale; a non-numeric value passes through.
+    const places = decimalsOf.get(own);
+    if (places !== undefined) {
+      const r2 = roundResultValue(value, places);
+      if (r2 !== value) {
+        rounded.push(`${r.testCode} ${value}->${r2}`);
+        value = r2;
+      }
+    }
+    // The lab's word for a qualitative value ("-" → "Absent"). Keyed on the
+    // analyzer's OWN code, like the scale, and only for a value listed
+    // exactly — anything else is filed as the instrument sent it.
+    const word = valueMapOf.get(own)?.get(value.trim().toLowerCase());
+    // An EMPTY word in the map means "the instrument made no judgement":
+    // nothing goes to HMIS and the row is left as it is (the UF-4000's
+    // RBC-Info. / BACT-Info. code 0). Dropped as void, so it is neither
+    // filed, retried, nor reported unmatched.
+    if (word === '') {
+      voided.push(r.testCode);
+      continue;
+    }
+    if (word !== undefined && word !== value) {
+      translated.push(`${r.testCode} ${value}->${word}`);
+      value = word;
+    }
     if (!seen.has(ctx)) {
       seen.add(ctx);
       matched.push(ctx);
@@ -508,5 +592,5 @@ export function toLisResultRows(
     });
   }
 
-  return { rows, unmatched, ambiguous, matched, voided, ignored, scaled, filedCodes };
+  return { rows, unmatched, ambiguous, matched, voided, ignored, scaled, translated, rounded, filedCodes };
 }

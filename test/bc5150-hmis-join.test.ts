@@ -20,7 +20,13 @@ import type { HmisResultUpload, MirthAcknowledgeItem } from '../src/types.js';
 const root = resolve(import.meta.dirname, '..');
 const cfg = loadConfig(resolve(root, 'config.json'));
 const analyzer = cfg.analyzers.find((a) => a.id === 'zhp-bc5150');
-if (!analyzer) throw new Error('zhp-bc5150 is not configured');
+// Site replay: it needs zhp-bc5150 in the local config.json. That is a lab-floor
+// artefact, so skip rather than fail when running anywhere else — otherwise a
+// real regression hides behind an environment failure.
+if (!analyzer) {
+  console.log('SKIP: zhp-bc5150 is not in this config.json — site replay test');
+  process.exit(0);
+}
 
 // parameterId → eqIdntifier, verbatim from the ZHPN001 pending rows.
 const HMIS: Array<[number, string]> = [

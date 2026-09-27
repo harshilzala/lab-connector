@@ -252,7 +252,7 @@ console.log('\n[13] Every wire line carries the packet exchange behind it');
   await link2.sendOrders([silentOrder]);
   eq('one OUT line for the download', wire2.map((w) => w.direction), ['OUT']);
   const dLen = buildOrderRecord(silentOrder as never).length;
-  eq('its trace shows each packet and its acknowledgement', wire2[0]!.trace, `→S0 ←Y0(~* @-#N1\\) →F1(SFILE1.D) ←Y1 →D2[${dLen}] ←Y2 →Z3 ←Y3 →B4 ←Y4`);
+  eq('its trace shows each packet and its acknowledgement', wire2[0]!.trace, `→S0(~* @-#N1) ←Y0(~* @-#N1\\) →F1(SFILE1.D) ←Y1 →D2[${dLen}] ←Y2 →Z3 ←Y3 →B4 ←Y4`);
 
   // A download the analyzer refuses: the refusal is on the same line.
   const t3 = new FakeTransport();
@@ -268,7 +268,7 @@ console.log('\n[13] Every wire line carries the packet exchange behind it');
   let refused = '';
   try { await link3.sendOrders([silentOrder]); } catch (e) { refused = (e as Error).message; }
   eq('the error names the analyzer\'s reason', refused, 'VITROS rejected the transfer: 0005 INVALID PACKET USAGE');
-  eq('and the wire line records S → E', wire3[0]!.trace, '→S0 ←E0(0005 INVALID PACKET USAGE) ✗ VITROS rejected the transfer: 0005 INVALID PACKET USAGE');
+  eq('and the wire line records S → E', wire3[0]!.trace, '→S0(~* @-#N1) ←E0(0005 INVALID PACKET USAGE) ✗ VITROS rejected the transfer: 0005 INVALID PACKET USAGE');
 }
 
 console.log(failures ? `\n${B} ${failures} assertion(s) failed\n` : `\n${G} all assertions passed\n`);

@@ -51,20 +51,27 @@ how to express "run these assays on this tube", and an analyzer quietly ignores
 or rejects an order it cannot parse. Pick one per analyzer with
 `astm.dialect` (default `atellica`):
 
-| | `atellica` | `maglumi` |
-|---|---|---|
-| O records | one, all assays repeat-delimited | **one per assay** |
-| Universal Test ID | `^^^CODE^^^1` (rank/dilution required) | `^^^CODE` |
-| O fields 12 + 16 | report type `O` + specimen descriptor | **omitted** |
-| P record (no demographics) | `P\|1\|\|\|\|\|\|\|` | `P\|1` |
-| H version / password | `LIS2-A2` / *(empty)* | `E1394-97` / `PSWD` |
-| H timestamp | `YYYYMMDDHHMMSS` | **`YYYYMMDD`** (date only) |
+| | `atellica` | `maglumi` | `sysmex` |
+|---|---|---|---|
+| O records | one, all assays repeat-delimited | **one per assay** | one |
+| Universal Test ID | `^^^CODE^^^1` (rank/dilution required) | `^^^CODE` | **`^^^^CODE^1`** (code in component 5) |
+| O fields 12 + 16 | report type `O` + specimen descriptor | **omitted** | report type in field **26**: `Q` on a query reply, `O` on a push |
+| Specimen id on a query reply | bare barcode | bare barcode | **echoed verbatim** (padded sample no. `^rack^tube`) |
+| P record (no demographics) | `P\|1\|\|\|\|\|\|\|` | `P\|1` | `P\|1` |
+| H version / password | `LIS2-A2` / *(empty)* | `E1394-97` / `PSWD` | `E1394-97` / *(empty)* |
+| H timestamp | `YYYYMMDDHHMMSS` | **`YYYYMMDD`** (date only) | `YYYYMMDDHHMMSS` |
 
 ```
 atellica   O|1|1234567||^^^CA125^^^1\^^^CA153^^^1|R|||||||O|||Serum
 maglumi    O|1|1234567||^^^CA125|R
            O|2|1234567||^^^CA153|R
+sysmex     O|1|   SF2609160001^A1^3||^^^^URI^1|R||||||||||||||||||||Q
 ```
+
+`vitros-eciq` is the fourth entry (see the dialect library). The `sysmex`
+layout (UF-4000 / UF-5000, UC-3500, U-WAM) is the Sysmex XN/UF/UC family
+convention and is **not yet confirmed on a wire capture** — see
+[SETUP-SYSMEX-URINE.md](SETUP-SYSMEX-URINE.md) for the commissioning checklist.
 
 Add a machine by adding an entry to `ORDER_FORMATS` in
 [`src/codec/astm/records.ts`](src/codec/astm/records.ts) — the config enum
@@ -72,6 +79,37 @@ derives from that table, so nothing else changes.
 
 `npm run dialects` replays the captured Snibe Maglumi wire logs through the
 codec and diffs the generated download against the vendor spec.
+
+### VITROS 250 (Kermit)
+
+The VITROS 250 does not speak ASTM on its host port: sample programs and
+results move as small named files over the **Kermit** file-transfer protocol
+(`protocol: "kermit"`). The link in `src/codec/kermit/` follows Ortho's
+*Specifications for Laboratory Computer Interface* (Part No. 355283, ch. 5),
+and three of its rules are easy to get wrong:
+
+- **NAK ZERO.** The analyzer at the Cancer Centre has download solicitation
+  on: whenever it is idle and can accept sample programs it sends an `N`
+  packet with sequence 0 once a minute (the legacy capture holds 372 of them).
+  It is a poll, not a NAK of anything we sent, and must never be answered. An
+  unsolicited `Y` in reply is a "valid packet, wrong place", after which the
+  analyzer rejects the next send-init with `0005 INVALID PACKET USAGE`. Before
+  this was understood, every first download after ~2 minutes of quiet failed
+  that way (29 of 57 on 2026-09-11) and succeeded only on the retry. The
+  solicitation is now surfaced as `lastSolicitAt` in the analyzer status and
+  closes the download breaker, since it is proof the instrument is receptive.
+- **One session at a time.** An upload is "in progress" from the analyzer's
+  `S` to its `B`, not from its first data packet; a download must not start
+  inside that window, and if the two send-inits genuinely cross, the analyzer
+  yields to the host (§5.6.7) — the host just waits for its `Y`.
+- **Busy is not broken.** `E 0000 RECEIVER BUSY` means "try again after a
+  minute"; `E 0002 RECEIVER DISABLED` means an operator has turned RECEIVE
+  TESTS off at the console. Neither counts toward the download breaker.
+
+Set `logLevel: "debug"` to get one log line per Kermit packet in each
+direction — the only way to see *why* the analyzer sent an `E` packet.
+`npm run vitros:link` pins the behaviours above; `npm run vitros:pacing`
+the per-packet timing; `npm run kermit:corpus` replays the site's capture.
 
 ## Prerequisites
 
@@ -97,7 +135,8 @@ Edit `config.json`:
 - One entry per analyzer under `analyzers[]`:
   - `profile` — the instrument **model**, from the machine profile library in
     `src/profiles/index.ts` (`mindray-bc5150`, `mindray-bc6000`, `erba-h360`,
-    `lifotronic-gh900plus`, `vitros-eciq`, `vitros-250`, `snibe-maglumi`
+    `lifotronic-gh900plus`, `vitros-eciq`, `vitros-250`, `snibe-maglumi`,
+    `sysmex-uf4000`, `sysmex-uc3500`, `sysmex-uwam`
     …). The profile supplies every model-level default — protocol, transport
     type/mode/port, ACK conventions, the analytes the instrument reports, the
     channels that are not results — so the same model at a second site is just
@@ -154,6 +193,13 @@ Edit `config.json`:
     analyzer (recommended for privacy). Turn on only if the analyzer needs it.
   - `qc.sampleIdPrefixes` — barcodes starting with these are treated as QC, not
     patient results.
+  - `allowTestCodes` — the ONLY analyzer codes this interface files (empty =
+    no allow-list). It scopes both directions: result values outside it are
+    dropped at delivery, and **pending rows HMIS offers for parameters outside
+    it are ignored** — not stored, not counted as waiting, not acknowledged.
+    Codes mapped through `testCodeAliases` count under either spelling. This
+    is how the BC-6000 is held to its 22 interfaced CBC analytes while HMIS
+    raises rows for 38.
 
 ## Run
 

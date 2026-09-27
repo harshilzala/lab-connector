@@ -67,6 +67,7 @@ const baseCfg = {
   id: 'vitros-250-prefix-test',
   equipmentCode: 'ZCCEQ003',
   extraEquipmentCodes: [],
+  siteIds: [],
   equipmentId: 29688657,
   protocol: 'kermit',
   transport: { type: 'tcp', mode: 'client', host: '127.0.0.1', port: 15254 },
@@ -75,6 +76,7 @@ const baseCfg = {
   sendDate: false,
   qc: { sampleIdPrefixes: [], sampleIdRegex: null },
   testCodeAliases: {},
+  downloadCodeAliases: {},
   astm: { ackTimeoutMs: 15000, frameMaxData: 240, senderId: 'HOST', receiverId: '', dialect: 'vitros-eciq' },
   kermit: { ackTimeoutMs: 10000, maxRetries: 5, interPacketDelayMs: 0, interTransferDelayMs: 0 },
   // The schema defaults, spelled out. This fixture is cast straight to

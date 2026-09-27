@@ -35,7 +35,7 @@ captures/
 # runtime state: daemon pid, log, and the dump pm2 resurrect reads at logon.
 .pm2/
 
-# Set by Lab-Interface-stop.bat; tells the watchdog the stop was deliberate.
+# Set by magic\magic-stop.bat; tells the watchdog the stop was deliberate.
 .lab-maintenance
 
 # Lab-Watch-Agent memory and run state — per machine, never committed

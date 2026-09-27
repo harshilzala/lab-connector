@@ -53,7 +53,7 @@ set "ROOT=%CD%"
 rem ---------------------------------------------------------------------------
 rem  One engine, two front doors. The real work lives in
 rem  Lab-Interface-force-stop.ps1 in the folder above, which is also what
-rem  Lab-Interface-force-stop.bat runs. Duplicating that logic here would mean
+rem  this wrapper calls. Duplicating that logic here would mean
 rem  two force-stops that drift apart, and a machine where one of them misses
 rem  the thing that is actually holding the port.
 rem ---------------------------------------------------------------------------

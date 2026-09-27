@@ -23,15 +23,15 @@ cd /d "%~dp0.." || goto no_root
 set "ROOT=%CD%"
 
 rem ---------------------------------------------------------------------------
-rem  PM2 home - the SAME one Lab-Interface.bat uses, beside the connector rather
+rem  PM2 home - beside the connector rather
 rem  than the machine-wide C:\ProgramData\pm2\home.
 rem
 rem  This is not a detail. The machine-wide home belongs to the LocalSystem PM2
 rem  service and grants Users read only, so an unelevated pm2 cannot write
 rem  pm2.pid there - every call dies with EPERM and leaks a half-started daemon.
 rem  Pointing at a different home from the other scripts would be worse still:
-rem  PM2 would look in one place while Lab-Interface.bat looked in another, and
-rem  the two would each think the connector was not running.
+rem  PM2 would look in one place while another script looked in another, and the
+rem  two would each think the connector was not running.
 rem ---------------------------------------------------------------------------
 set "PM2_HOME=%ROOT%\.pm2"
 if not exist "%PM2_HOME%" mkdir "%PM2_HOME%" >nul 2>&1
@@ -63,8 +63,8 @@ sc query LAB-Interface 2>nul | "%SystemRoot%\System32\find.exe" "RUNNING" >nul 2
 if not errorlevel 1 goto service_running
 
 rem ---------------------------------------------------------------------------
-rem  Clear the maintenance flag. magic-stop.bat and Lab-Interface-stop.bat both
-rem  raise it to tell the 5-minute watchdog "this is down on purpose". Starting
+rem  Clear the maintenance flag. magic-stop.bat raises it to tell the 5-minute
+rem  watchdog "this is down on purpose". Starting
 rem  by hand means the opposite, so the flag has to go or the watchdog would
 rem  keep standing aside the next time the app fell over.
 rem ---------------------------------------------------------------------------

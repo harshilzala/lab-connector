@@ -312,9 +312,18 @@ export function mergePending(parts: PendingOrders[]): PendingOrders {
     specimenType: null,
     ackItems: [],
   };
+  // The same row can come back twice when the parts were fetched per site
+  // and the gateway did not narrow (no siteId, or a code mapped at both):
+  // keep one copy per (sample, labResultId, parameterId, identifier).
+  const seen = new Set<string>();
   for (const p of parts) {
     for (const code of p.testCodes) if (!merged.testCodes.includes(code)) merged.testCodes.push(code);
-    merged.ackItems.push(...p.ackItems);
+    for (const item of p.ackItems) {
+      const key = [item.sampleID, item.labResultId ?? '', item.parameterId ?? '', item.identifier].join('|');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.ackItems.push(item);
+    }
     if (!merged.patient && p.patient) merged.patient = p.patient;
     if (merged.specimenType === null && p.specimenType !== null) merged.specimenType = p.specimenType;
     if (p.priority === 'S') merged.priority = 'S';

@@ -59,6 +59,10 @@ const baseCfg = {
   id: 'vitros-250-test',
   equipmentCode: 'ZHFC02',
   extraEquipmentCodes: [],
+  // Schema fields with defaults still have to be present in a hand-built
+  // fixture: nothing runs it through the zod schema, so an omission surfaces
+  // as a TypeError inside the poll rather than a config error.
+  siteIds: [],
   equipmentId: 177336856,
   protocol: 'kermit',
   transport: { type: 'tcp', mode: 'server', host: '127.0.0.1', port: 15254 },
@@ -68,6 +72,7 @@ const baseCfg = {
   orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: true, downloadPrefixes: ['SF'], excludeTestCodes: [] },
   qc: { sampleIdPrefixes: [], sampleIdRegex: null },
   testCodeAliases: {},
+  downloadCodeAliases: {},
   astm: { ackTimeoutMs: 15000, frameMaxData: 240, senderId: 'HOST', receiverId: '', dialect: 'vitros-eciq' },
   kermit: { ackTimeoutMs: 10000, maxRetries: 5, interPacketDelayMs: 0, interTransferDelayMs: 0 },
   filing: { mode: 'queue', passIntervalMs: 15000, recheckMs: 300000, keepFiledDays: 2 },

@@ -5,9 +5,9 @@
   UAC prompt). After it, none of the day-to-day scripts need "Run as
   administrator" any more:
 
-    magic\magic-start.bat / Lab-Interface.bat   -> service\resume-service.ps1
+    magic\magic-start.bat                       -> service\resume-service.ps1
     magic\magic-stop.bat                         -> sc stop
-    magic\magic-force-stop.bat / Lab-Interface-force-stop.bat
+    magic\magic-force-stop.bat                  -> stops service + watchdog
     magic\magic-startup.cmd (logon entry + 5-minute watchdog) -> sc start
 
   Why this is needed

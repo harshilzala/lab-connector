@@ -41,7 +41,7 @@ been switched from Real COM to TCP server mode for Lab-Interface.
 ## Starting it by hand
 
 Only when you actually want to fall back to it, and only after stopping
-Lab-Interface first with `Lab-Interface-stop.bat`:
+Lab-Interface first with `magic\magic-stop.bat`:
 
 - `START-Old-Interface.bat` — starts the three services (prompts for admin) and
   the three device programs.
