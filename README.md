@@ -73,6 +73,37 @@ derives from that table, so nothing else changes.
 `npm run dialects` replays the captured Snibe Maglumi wire logs through the
 codec and diffs the generated download against the vendor spec.
 
+### VITROS 250 (Kermit)
+
+The VITROS 250 does not speak ASTM on its host port: sample programs and
+results move as small named files over the **Kermit** file-transfer protocol
+(`protocol: "kermit"`). The link in `src/codec/kermit/` follows Ortho's
+*Specifications for Laboratory Computer Interface* (Part No. 355283, ch. 5),
+and three of its rules are easy to get wrong:
+
+- **NAK ZERO.** The analyzer at the Cancer Centre has download solicitation
+  on: whenever it is idle and can accept sample programs it sends an `N`
+  packet with sequence 0 once a minute (the legacy capture holds 372 of them).
+  It is a poll, not a NAK of anything we sent, and must never be answered. An
+  unsolicited `Y` in reply is a "valid packet, wrong place", after which the
+  analyzer rejects the next send-init with `0005 INVALID PACKET USAGE`. Before
+  this was understood, every first download after ~2 minutes of quiet failed
+  that way (29 of 57 on 2026-09-11) and succeeded only on the retry. The
+  solicitation is now surfaced as `lastSolicitAt` in the analyzer status and
+  closes the download breaker, since it is proof the instrument is receptive.
+- **One session at a time.** An upload is "in progress" from the analyzer's
+  `S` to its `B`, not from its first data packet; a download must not start
+  inside that window, and if the two send-inits genuinely cross, the analyzer
+  yields to the host (§5.6.7) — the host just waits for its `Y`.
+- **Busy is not broken.** `E 0000 RECEIVER BUSY` means "try again after a
+  minute"; `E 0002 RECEIVER DISABLED` means an operator has turned RECEIVE
+  TESTS off at the console. Neither counts toward the download breaker.
+
+Set `logLevel: "debug"` to get one log line per Kermit packet in each
+direction — the only way to see *why* the analyzer sent an `E` packet.
+`npm run vitros:link` pins the behaviours above; `npm run vitros:pacing`
+the per-packet timing; `npm run kermit:corpus` replays the site's capture.
+
 ## Prerequisites
 
 - Node.js ≥ 20 on the lab PC.
@@ -128,6 +159,13 @@ Edit `config.json`:
     analyzer (recommended for privacy). Turn on only if the analyzer needs it.
   - `qc.sampleIdPrefixes` — barcodes starting with these are treated as QC, not
     patient results.
+  - `allowTestCodes` — the ONLY analyzer codes this interface files (empty =
+    no allow-list). It scopes both directions: result values outside it are
+    dropped at delivery, and **pending rows HMIS offers for parameters outside
+    it are ignored** — not stored, not counted as waiting, not acknowledged.
+    Codes mapped through `testCodeAliases` count under either spelling. This
+    is how the BC-6000 is held to its 22 interfaced CBC analytes while HMIS
+    raises rows for 38.
 
 ## Run
 

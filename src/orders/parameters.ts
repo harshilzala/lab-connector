@@ -238,6 +238,17 @@ export class ParameterCatalogue {
     return out;
   }
 
+  /** Every distinct identifier HMIS has offered under this analyzer, spelled as
+   *  HMIS spells it — the console sets the configured allow-list against this
+   *  so an operator can see the two agree without opening config.json. */
+  identifiers(): string[] {
+    const seen = new Map<string, string>();
+    for (const entry of Object.values(this.read().services)) {
+      for (const [key, p] of Object.entries(entry.parameters)) if (!seen.has(key)) seen.set(key, p.identifier);
+    }
+    return [...seen.values()].sort((a, b) => a.localeCompare(b));
+  }
+
   /** How many services and parameters are held — for the console/status page. */
   counts(): { services: number; parameters: number } {
     const cat = this.read();
