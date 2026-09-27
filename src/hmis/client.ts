@@ -47,7 +47,34 @@ export interface HmisClientOptions {
   logger: Logger;
   /** Records every call to the gateway — request, response and verdict. */
   audit?: HmisAudit;
+  /** Extra headers on every call (config hmis.headers) — a Mirth listener
+   *  behind basic auth or a token. */
+  headers?: Record<string, string>;
+  /** Names this client in the exchange ring ("mirth", "im-mirth"). */
+  label?: string;
 }
+
+/** One call as the IM dashboard's Mirth screen shows it. Bodies are clipped. */
+export interface MirthExchange {
+  ts: string;
+  client: string;
+  kind: HmisAuditKind;
+  method: 'GET' | 'POST';
+  url: string;
+  sampleId: string | string[] | null;
+  httpStatus: number | null;
+  outcome: HmisAuditOutcome;
+  durationMs: number;
+  rows?: number;
+  error?: string;
+  request?: string;
+  response?: string;
+}
+
+/** Exchanges kept in memory for the console. The audit file keeps them all. */
+const EXCHANGE_RING = 150;
+/** Clip each body in the ring — a bulk poll can be 300 KB. */
+const EXCHANGE_BODY_CHARS = 6000;
 
 /** Query parameters for GET {pendingPath}. The server treats every one as
  *  optional, so only what the analyzer config supplies is sent. */
@@ -63,6 +90,37 @@ export interface PendingQuery {
 }
 
 export class HmisClient {
+  private readonly exchanges: MirthExchange[] = [];
+  /** Every column name the pending endpoint has returned, with how often —
+   *  the Mirth screen's answer to "what is Mirth actually sending us?". */
+  private readonly columns = new Map<string, { count: number; example: string }>();
+
+  /** The latest calls, newest first. */
+  recentExchanges(limit = EXCHANGE_RING): MirthExchange[] {
+    return this.exchanges.slice(-limit).reverse();
+  }
+
+  /** Columns seen on pending rows since start, most frequent first. */
+  seenColumns(): Array<{ column: string; count: number; example: string }> {
+    return [...this.columns.entries()]
+      .map(([column, v]) => ({ column, ...v }))
+      .sort((a, b) => b.count - a.count || a.column.localeCompare(b.column));
+  }
+
+  /** What this client talks to, for the Mirth screen. Header VALUES are not
+   *  returned — only their names, so a token is never echoed to a browser. */
+  describe(): { label: string; baseUrl: string; pendingPath: string; acknowledgePath: string; resultsPath: string; timeoutMs: number; headers: string[] } {
+    return {
+      label: this.opts.label ?? 'mirth',
+      baseUrl: this.opts.baseUrl,
+      pendingPath: this.opts.pendingPath,
+      acknowledgePath: this.opts.acknowledgePath,
+      resultsPath: this.opts.resultsPath,
+      timeoutMs: this.opts.timeoutMs,
+      headers: Object.keys(this.opts.headers ?? {}),
+    };
+  }
+
   /** The site-wide siteId every pending call carries unless the analyzer
    *  block names its own. Read by the status page so the console can show
    *  what each machine's orders are keyed on. */
@@ -109,6 +167,7 @@ export class HmisClient {
       // The question this log exists to answer: did the sample get work back?
       const rowList = unwrapRows(body);
       const rows = rowList.length;
+      this.noteColumns(rowList);
       this.record({
         kind: 'query',
         sampleId: q.sampleId ?? null,
@@ -327,6 +386,28 @@ export class HmisClient {
     rows?: number;
     error?: string;
   }): void {
+    const url = this.opts.baseUrl.replace(/\/$/, '') + e.path;
+    const clip = (v: unknown): string | undefined => {
+      if (v === undefined) return undefined;
+      const s = typeof v === 'string' ? v : JSON.stringify(v);
+      return s.length > EXCHANGE_BODY_CHARS ? `${s.slice(0, EXCHANGE_BODY_CHARS)}…[${s.length - EXCHANGE_BODY_CHARS} more chars]` : s;
+    };
+    this.exchanges.push({
+      ts: new Date().toISOString(),
+      client: this.opts.label ?? 'mirth',
+      kind: e.kind,
+      method: e.method,
+      url,
+      sampleId: e.sampleId,
+      httpStatus: e.httpStatus,
+      outcome: e.outcome,
+      durationMs: Date.now() - e.startedAt,
+      rows: e.rows,
+      error: e.error,
+      request: clip(e.request),
+      response: clip(e.response),
+    });
+    if (this.exchanges.length > EXCHANGE_RING) this.exchanges.shift();
     this.opts.audit?.record({
       ts: new Date().toISOString(),
       kind: e.kind,
@@ -354,9 +435,11 @@ export class HmisClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
     try {
+      const base: Record<string, string> =
+        body === undefined ? { accept: 'application/json' } : { 'content-type': 'application/json', accept: 'application/json' };
       const res = await fetch(url, {
         method,
-        headers: body === undefined ? { accept: 'application/json' } : { 'content-type': 'application/json', accept: 'application/json' },
+        headers: { ...base, ...(this.opts.headers ?? {}) },
         body,
         signal: controller.signal,
       });
@@ -382,6 +465,16 @@ export class HmisClient {
       throw err;
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  private noteColumns(rows: MirthPendingRow[]): void {
+    for (const r of rows.slice(0, 200)) {
+      for (const [k, v] of Object.entries(r)) {
+        const have = this.columns.get(k);
+        if (have) have.count++;
+        else if (this.columns.size < 300) this.columns.set(k, { count: 1, example: String(v ?? '').slice(0, 60) });
+      }
     }
   }
 

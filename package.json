@@ -51,7 +51,8 @@
     "vitros:link": "tsx test/vitros250-link.test.ts",
     "prefixes": "tsx test/download-prefixes.test.ts",
     "params": "tsx test/parameter-catalogue.test.ts",
-    "replay:0028": "tsx test/ch2609080028-replay.ts"
+    "replay:0028": "tsx test/ch2609080028-replay.ts",
+    "im": "tsx test/im.test.ts"
   },
   "dependencies": {
     "pino": "^9.5.0",

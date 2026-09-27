@@ -117,15 +117,21 @@ export function toResultUploads(analyzer: AnalyzerConfig, msg: ParsedMessage): H
       completedAt: r.completedAt ?? null,
     }));
     const barcode = normalizeBarcode(sampleId);
+    // Hashed BEFORE the reference ranges are attached, so a re-send of the same
+    // values keeps the messageId it had before ranges were carried at all.
+    const messageId = deterministicMessageId(analyzer.equipmentCode, barcode, payload);
     uploads.push({
       equipmentId: analyzer.equipmentId ?? null,
       eqCode: analyzer.equipmentCode,
       barcode,
       // Either the protocol said so (HL7 MSH-11 = Q) or the barcode shape does.
       isQc: msg.isQc === true || isQcSample(sampleId, analyzer.qc),
-      results: payload,
+      results: payload.map((p, i) => {
+        const range = results[i]!.referenceRange;
+        return range ? { ...p, referenceRange: range } : p;
+      }),
       raw: msg.raw,
-      messageId: deterministicMessageId(analyzer.equipmentCode, barcode, payload),
+      messageId,
     });
   }
   return uploads;

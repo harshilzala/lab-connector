@@ -299,6 +299,9 @@ function sameRow(a: MirthAcknowledgeItem, b: MirthAcknowledgeItem): boolean {
     a.labResultId === b.labResultId &&
     a.labServiceId === b.labServiceId &&
     a.parameterId === b.parameterId &&
-    String(a.equipmentId ?? '') === String(b.equipmentId ?? '')
+    String(a.equipmentId ?? '') === String(b.equipmentId ?? '') &&
+    (a.refLow ?? null) === (b.refLow ?? null) &&
+    (a.refHigh ?? null) === (b.refHigh ?? null) &&
+    (a.refText ?? null) === (b.refText ?? null)
   );
 }

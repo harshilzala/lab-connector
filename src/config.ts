@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { DEFAULT_DIALECT, ASTM_DIALECT_NAMES, type AstmDialect } from './codec/astm/records.js';
 import { PROFILE_NAMES, applyProfiles } from './profiles/index.js';
 import { compileCompletion } from './results/complete.js';
+import { DEFAULT_GATE_CONFIG, type GateConfig } from './im/gate.js';
 
 // Minimal .env loader (no dependency). Reads KEY=VALUE lines and populates
 // process.env without overwriting variables already set in the real environment.
@@ -157,6 +158,31 @@ const Gh900Options = z.object({
    *  much). Off by default: a mis-sampled run is not a result; it is logged
    *  and dropped, and the rerun files. */
   fileOnSamplingError: z.boolean().default(false),
+});
+
+// ---- IM (auto-certification) ------------------------------------------------
+// See src/im/gate.ts for what each setting does to a value. Every field is
+// optional here so the same shape serves as the site-wide defaults (top-level
+// `im.gate`) and as a per-analyzer override (analyzer `im`), merged in
+// imGateFor() — the analyzer wins, and `ranges` merge per test code.
+const ImRange = z.object({
+  low: z.number().finite().optional(),
+  high: z.number().finite().optional(),
+  criticalLow: z.number().finite().optional(),
+  criticalHigh: z.number().finite().optional(),
+});
+const ImGateOverride = z.object({
+  /** Run this analyzer's results through the gate. Unset = follow im.enabled. */
+  enabled: z.boolean().optional(),
+  /** Analyzer test codes that always go to a person, whatever the value. */
+  alwaysReview: z.array(z.string()).optional(),
+  /** Lab-set reference ranges, keyed by the analyzer's own test code. These
+   *  win over a range from Mirth or from the analyzer. */
+  ranges: z.record(ImRange).optional(),
+  holdOnAnalyzerFlag: z.boolean().optional(),
+  holdWhenNoRange: z.boolean().optional(),
+  /** Qualitative values certified as normal ("Negative", "Absent" …). */
+  normalWords: z.array(z.string()).optional(),
 });
 
 const AnalyzerSchema = z.object({
@@ -439,6 +465,8 @@ const AnalyzerSchema = z.object({
   kermit: KermitOptions.default({}),
   hl7: Hl7Options.default({}),
   gh900: Gh900Options.default({}),
+  /** IM auto-certification overrides for this analyzer — see ImGateOverride. */
+  im: ImGateOverride.default({}),
 });
 
 const ConfigSchema = z.object({
@@ -466,6 +494,10 @@ const ConfigSchema = z.object({
     resultsPath: z.string().default('/mirth/results'),
     timeoutMs: z.number().int().positive().default(15000),
     tlsRejectUnauthorized: z.boolean().default(true),
+    /** Extra request headers on every Mirth call — for a Mirth HTTP listener
+     *  put behind basic auth or a token ({"Authorization": "Basic …"}). Keep
+     *  secrets in .env: HMIS_AUTHORIZATION fills Authorization when set. */
+    headers: z.record(z.string()).default({}),
     /** Line-delimited JSON record of every gateway call: the query for a
      *  sample and whether orders came back, and each result upload with the
      *  request payload and the response it got. This is the BASE name: entries
@@ -519,6 +551,52 @@ const ConfigSchema = z.object({
       password: z.string().default(''),
     })
     .default({ password: '' }),
+  /** IM — auto-certification of analyzer results before they reach Mirth.
+   *
+   *  With it on, every value is judged against a reference range (IM config,
+   *  then Mirth's pending row, then the analyzer's own). In range: filed to
+   *  Mirth straight away, marked certified. Anything else: held on the IM
+   *  dashboard (/im) as "action required" until a person verifies it (filed,
+   *  marked certified by them) or rejects it (never filed). Off by default —
+   *  the connector files exactly as before. */
+  im: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Site-wide gate settings; each analyzer's `im` block overrides them. */
+      gate: ImGateOverride.default({}),
+      mirth: z
+        .object({
+          /** Where certified results go. Default: hmis.baseUrl + hmis.resultsPath
+           *  — set these only when Mirth exposes a separate IM channel. */
+          baseUrl: z.string().url().optional(),
+          resultsPath: z.string().optional(),
+          /** Extra headers on the IM result post, on top of hmis.headers.
+           *  IM_MIRTH_AUTHORIZATION in .env fills Authorization. */
+          headers: z.record(z.string()).default({}),
+          /** VERIFY-SPEC: the certification columns added to each result row.
+           *  The gateway binds with Gson, which ignores unknown properties, so
+           *  these are safe to send before Mirth maps them — but confirm the
+           *  names with the Mirth channel owner. Set one to null to leave that
+           *  column out entirely. */
+          fields: z
+            .object({
+              certified: z.string().nullable().default('isCertified'),
+              autoCertified: z.string().nullable().default('isAutoCertified'),
+              certifiedBy: z.string().nullable().default('certifiedBy'),
+              certifiedAt: z.string().nullable().default('certifiedAt'),
+              abnormal: z.string().nullable().default('isAbnormal'),
+              referenceRange: z.string().nullable().default('referenceRange'),
+              remarks: z.string().nullable().default('remarks'),
+            })
+            .default({}),
+          /** The certifiedBy value on an auto-certified row. */
+          autoCertifiedBy: z.string().default('IM-AUTO'),
+        })
+        .default({}),
+      /** A fully decided review sample stays on the dashboard this long. */
+      reviewKeepDays: z.number().int().min(1).max(365).default(30),
+    })
+    .default({}),
   analyzers: z.array(AnalyzerSchema).min(1),
 });
 
@@ -635,10 +713,39 @@ export function parseJsonc(text: string): unknown {
   return JSON.parse(stripTrailingCommas(stripJsonComments(text)));
 }
 
+/**
+ * The IM gate settings one analyzer actually runs with: the site-wide
+ * `im.gate` under the analyzer's own `im` block, ranges merged per code.
+ * `enabled` is false whenever the top-level switch is off, so an analyzer
+ * block cannot turn IM on for a site that has not.
+ */
+export function imGateFor(app: AppConfig, a: AnalyzerConfig): GateConfig {
+  const site = app.im.gate;
+  const own = a.im;
+  const pick = <K extends keyof GateConfig>(k: K): GateConfig[K] =>
+    ((own as Partial<GateConfig>)[k] ?? (site as Partial<GateConfig>)[k] ?? DEFAULT_GATE_CONFIG[k]) as GateConfig[K];
+  return {
+    enabled: app.im.enabled && (own.enabled ?? site.enabled ?? true),
+    alwaysReview: pick('alwaysReview'),
+    ranges: { ...(site.ranges ?? {}), ...(own.ranges ?? {}) },
+    holdOnAnalyzerFlag: pick('holdOnAnalyzerFlag'),
+    holdWhenNoRange: pick('holdWhenNoRange'),
+    normalWords: pick('normalWords'),
+  };
+}
+
 function applyEnvOverrides(raw: any): any {
   const cfg = structuredClone(raw);
   if (process.env.LOG_LEVEL) cfg.logLevel = process.env.LOG_LEVEL;
   if (process.env.HMIS_BASE_URL) cfg.hmis = { ...cfg.hmis, baseUrl: process.env.HMIS_BASE_URL };
+  if (process.env.HMIS_AUTHORIZATION) {
+    cfg.hmis = { ...cfg.hmis, headers: { ...(cfg.hmis?.headers ?? {}), Authorization: process.env.HMIS_AUTHORIZATION } };
+  }
+  if (process.env.IM_MIRTH_AUTHORIZATION) {
+    const im = cfg.im ?? {};
+    const mirth = im.mirth ?? {};
+    cfg.im = { ...im, mirth: { ...mirth, headers: { ...(mirth.headers ?? {}), Authorization: process.env.IM_MIRTH_AUTHORIZATION } } };
+  }
   if (process.env.ADMIN_AUTH_FILE) cfg.admin = { ...cfg.admin, authFile: process.env.ADMIN_AUTH_FILE };
   return cfg;
 }

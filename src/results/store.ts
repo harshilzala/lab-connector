@@ -42,8 +42,12 @@ export interface StagedValue {
   labResultId: number | null;
   /** Set when the value will never be filed: a non-interfaced code, or a
    *  placeholder the analyzer sent instead of a number. Not counted as
-   *  waiting. */
-  dropped: 'ignored' | 'void' | null;
+   *  waiting. "review" is the IM gate holding an out-of-range value for a
+   *  person to verify: not waiting either, and filed (which clears it) only
+   *  once someone has. */
+  dropped: 'ignored' | 'void' | 'review' | null;
+  /** The analyzer's own reference range, when it sent one. */
+  referenceRange?: string | null;
 }
 
 export interface StagedSample {
@@ -91,6 +95,8 @@ export interface StagedSummary {
   filed: number;
   waiting: number;
   dropped: number;
+  /** Values the IM gate is holding for a person to verify. */
+  review: number;
   waitingCodes: string[];
   complete: boolean;
   /** The interfaced parameters of this sample, in the order received — what
@@ -106,8 +112,9 @@ export interface StagedValueView {
   unit: string | null;
   abnormalFlag: string | null;
   /** "filed" — accepted by HMIS; "waiting" — no order row yet; "void" — the
-   *  analyzer sent a placeholder instead of a number. */
-  state: 'filed' | 'waiting' | 'void';
+   *  analyzer sent a placeholder instead of a number; "review" — held by the
+   *  IM gate until someone verifies it. */
+  state: 'filed' | 'waiting' | 'void' | 'review';
   filedAt: string | null;
   /** The HMIS identifier it was filed against, once filed. */
   identifier: string | null;
@@ -132,7 +139,8 @@ export function summarize(s: StagedSample): StagedSummary {
   const values = Object.values(s.values).filter((v) => v.dropped !== 'ignored');
   const waiting = values.filter(isWaiting);
   const filed = values.filter((v) => v.filedAt !== null).length;
-  const dropped = values.filter((v) => v.dropped !== null).length;
+  const dropped = values.filter((v) => v.dropped !== null && v.dropped !== 'review').length;
+  const review = values.filter((v) => v.filedAt === null && v.dropped === 'review').length;
   return {
     barcode: s.barcode,
     isQc: s.isQc,
@@ -147,6 +155,7 @@ export function summarize(s: StagedSample): StagedSummary {
     filed,
     waiting: waiting.length,
     dropped,
+    review,
     waitingCodes: waiting.map((v) => v.testCode),
     complete: waiting.length === 0,
     values: values
@@ -156,7 +165,7 @@ export function summarize(s: StagedSample): StagedSummary {
         value: v.value,
         unit: v.unit,
         abnormalFlag: v.abnormalFlag,
-        state: v.filedAt !== null ? 'filed' : v.dropped === 'void' ? 'void' : 'waiting',
+        state: v.filedAt !== null ? 'filed' : v.dropped === 'void' ? 'void' : v.dropped === 'review' ? 'review' : 'waiting',
         filedAt: v.filedAt,
         identifier: v.identifier,
       })),
@@ -232,6 +241,7 @@ export class ResultStore {
         identifier: null,
         labResultId: null,
         dropped: null,
+        referenceRange: r.referenceRange ?? null,
       };
       changed.push(r.testCode);
     }
@@ -293,6 +303,12 @@ export class ResultStore {
     return this.uploadOf(sample, messageId, (v) => v.dropped === null);
   }
 
+  /** Every real value, including those the IM gate is holding for review —
+   *  what the IM dashboard's "what would go to Mirth" preview judges. */
+  previewUpload(sample: StagedSample, messageId: string): HmisResultUpload {
+    return this.uploadOf(sample, messageId, (v) => v.dropped === null || v.dropped === 'review');
+  }
+
   private uploadOf(sample: StagedSample, messageId: string, pick: (v: StagedValue) => boolean): HmisResultUpload {
     const results = Object.values(sample.values)
       .filter(pick)
@@ -303,6 +319,7 @@ export class ResultStore {
         abnormalFlag: v.abnormalFlag,
         status: v.status ?? 'F',
         completedAt: v.completedAt,
+        referenceRange: v.referenceRange ?? null,
       }));
     return {
       equipmentId: sample.equipmentId,
@@ -335,7 +352,7 @@ export class ResultStore {
     this.write(s);
   }
 
-  markDropped(barcode: string, codes: string[], reason: 'ignored' | 'void'): void {
+  markDropped(barcode: string, codes: string[], reason: 'ignored' | 'void' | 'review'): void {
     if (codes.length === 0) return;
     const s = this.get(barcode);
     if (!s) return;

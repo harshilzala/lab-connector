@@ -6,6 +6,7 @@ import type { SpoolEnvelope } from '../queue/spool.js';
 import type { HmisResultUpload } from '../types.js';
 import { renderDashboard } from './dashboard.js';
 import { renderConnectorTool } from './connector-tool.js';
+import { renderImDashboard } from './im-dashboard.js';
 import { ProbeSession, type ProbeTransportConfig } from '../probe/session.js';
 import { FAMILY_LABELS, identify, knownProtocols, parsePayload } from '../probe/identify.js';
 import { listSerialPorts, scanTcp, sweepBaudRates } from '../probe/discover.js';
@@ -44,9 +45,26 @@ export interface AdminBackend {
   forceEnabled(): boolean;
   forcePasswordOk(given: string): boolean;
   force(id: string, barcode: string): Promise<ForceReport | null>;
+
+  // ---- IM dashboard (src/im) — all read-only except verify / reject ----
+  imEnabled(): boolean;
+  imOverview(): unknown;
+  imReview(): unknown[];
+  imOrders(): unknown[];
+  /** One order's stored rows, held values and full transaction history. */
+  imOrder(id: string, barcode: string): unknown | null;
+  imLog(id: string): unknown[] | null;
+  /** File held values as certified by `user`. Null for an unknown sample;
+   *  throws with Mirth's reason when the post fails. */
+  imVerify(id: string, barcode: string, codes: string[], user: string, comment: string | null): Promise<VerifyReport | null>;
+  /** Refuse held values — never filed. Null for an unknown sample. */
+  imReject(id: string, barcode: string, codes: string[], user: string, comment: string | null): number | null;
+  imMirth(): unknown;
+  imMirthProbe(id: string, sampleId: string): Promise<MirthProbe | null>;
+  imMirthPreview(id: string, barcode: string): MirthPreview | null;
 }
 import type { StagedSummary } from '../results/store.js';
-import type { OrderView, ResendReport } from '../session/orchestrator.js';
+import type { MirthPreview, MirthProbe, OrderView, ResendReport, VerifyReport } from '../session/orchestrator.js';
 
 /** Plenty for a login form; anything larger is not a request we serve. */
 const MAX_BODY_BYTES = 16 * 1024;
@@ -313,6 +331,17 @@ export class AdminServer {
         return this.json(res, ok ? { ok } : { error: 'unknown sample' }, ok ? 200 : 404);
       }
 
+      // ---- IM dashboard ----
+      if (method === 'GET' && p === '/im') {
+        return this.html(res, renderImDashboard({ username: session.username, enabled: this.backend.imEnabled() }));
+      }
+      if (p.startsWith('/api/im/')) {
+        if (method !== 'GET' && !this.sameOrigin(req)) {
+          return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        }
+        return await this.imRoutes(req, res, p, method, session.username);
+      }
+
       // ---- Connector Tool: the universal device monitor ----
       if (method === 'GET' && p === '/connector') {
         return this.html(res, renderConnectorTool({ username: session.username }));
@@ -491,6 +520,109 @@ export class AdminServer {
       this.logger.warn({ err: message, path: p }, 'connector-tool request failed');
       return this.json(res, { error: message }, 400);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // IM dashboard API
+  //
+  // Everything is read-only except verify / reject, which release or refuse
+  // patient results held by the IM gate. Those record WHO decided: the console
+  // has one shared sign-in, so the person types their name and it is stored
+  // beside the session user ("Dr A Shah (admin)") on the review item, in the
+  // IM transaction log and in the certifiedBy column sent to Mirth.
+  // ---------------------------------------------------------------------------
+  private async imRoutes(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    p: string,
+    method: string,
+    username: string,
+  ): Promise<void> {
+    if (!this.backend.imEnabled() && p !== '/api/im/overview') {
+      return this.json(res, { error: 'IM is not enabled — set im.enabled in config.json' }, 404);
+    }
+    if (method === 'GET' && p === '/api/im/overview') return this.json(res, this.backend.imOverview());
+    if (method === 'GET' && p === '/api/im/review') return this.json(res, { samples: this.backend.imReview() });
+    if (method === 'GET' && p === '/api/im/orders') return this.json(res, { orders: this.backend.imOrders() });
+    if (method === 'GET' && p === '/api/im/mirth') return this.json(res, this.backend.imMirth());
+
+    const logMatch = p.match(/^\/api\/im\/analyzers\/([a-z0-9-]+)\/log$/);
+    if (method === 'GET' && logMatch) {
+      const log = this.backend.imLog(logMatch[1]!);
+      return log ? this.json(res, { log }) : this.json(res, { error: 'unknown analyzer' }, 404);
+    }
+
+    const orderMatch = p.match(/^\/api\/im\/analyzers\/([a-z0-9-]+)\/orders\/([^/]+)$/);
+    if (method === 'GET' && orderMatch) {
+      const o = this.backend.imOrder(orderMatch[1]!, decodeURIComponent(orderMatch[2]!));
+      return o ? this.json(res, o) : this.json(res, { error: 'unknown analyzer' }, 404);
+    }
+
+    const previewMatch = p.match(/^\/api\/im\/analyzers\/([a-z0-9-]+)\/mirth\/preview\/([^/]+)$/);
+    if (method === 'GET' && previewMatch) {
+      const pv = this.backend.imMirthPreview(previewMatch[1]!, decodeURIComponent(previewMatch[2]!));
+      return pv ? this.json(res, pv) : this.json(res, { error: 'no stored values for that barcode on this analyzer' }, 404);
+    }
+
+    const body = async (): Promise<Record<string, unknown>> => {
+      const raw = await readBody(req);
+      if (raw === null) throw new Error('request body too large');
+      if (!raw) return {};
+      try {
+        return JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        throw new Error('request body is not valid JSON');
+      }
+    };
+
+    const probeMatch = p.match(/^\/api\/im\/analyzers\/([a-z0-9-]+)\/mirth\/probe$/);
+    if (method === 'POST' && probeMatch) {
+      let b: Record<string, unknown>;
+      try {
+        b = await body();
+      } catch (err) {
+        return this.json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+      }
+      const sampleId = String(b.sampleId ?? '').trim();
+      if (!sampleId) return this.json(res, { error: 'a barcode is required' }, 400);
+      const r = await this.backend.imMirthProbe(probeMatch[1]!, sampleId);
+      return r ? this.json(res, r) : this.json(res, { error: 'unknown analyzer' }, 404);
+    }
+
+    const decideMatch = p.match(/^\/api\/im\/analyzers\/([a-z0-9-]+)\/review\/([^/]+)\/(verify|reject)$/);
+    if (method === 'POST' && decideMatch) {
+      const id = decideMatch[1]!;
+      const barcode = decodeURIComponent(decideMatch[2]!);
+      const action = decideMatch[3]!;
+      let b: Record<string, unknown>;
+      try {
+        b = await body();
+      } catch (err) {
+        return this.json(res, { error: err instanceof Error ? err.message : String(err) }, 400);
+      }
+      const codes = Array.isArray(b.codes) ? b.codes.map((c) => String(c)).filter(Boolean) : [];
+      const by = String(b.verifiedBy ?? '').trim().slice(0, 80);
+      const comment = String(b.comment ?? '').trim().slice(0, 500) || null;
+      if (!by) return this.json(res, { error: 'enter the name of the person verifying' }, 400);
+      if (codes.length === 0) return this.json(res, { error: 'select at least one value' }, 400);
+      if (action === 'reject' && !comment) return this.json(res, { error: 'a reason is required to reject' }, 400);
+      const user = by.toLowerCase() === username.toLowerCase() ? by : `${by} (${username})`;
+      this.logger.warn({ analyzer: id, barcode, codes, user, action }, `IM ${action} requested from the dashboard`);
+
+      if (action === 'reject') {
+        const n = this.backend.imReject(id, barcode, codes, user, comment);
+        return n === null ? this.json(res, { error: 'unknown sample' }, 404) : this.json(res, { ok: true, rejected: n });
+      }
+      try {
+        const r = await this.backend.imVerify(id, barcode, codes, user, comment);
+        return r ? this.json(res, r) : this.json(res, { error: 'unknown sample' }, 404);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return this.json(res, { error: message }, 502);
+      }
+    }
+
+    return this.json(res, { error: 'not found' }, 404);
   }
 
   /**

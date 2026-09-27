@@ -35,6 +35,14 @@ const PRIORITY_KEYS = ['priority', 'isStat', 'stat', 'urgent', 'isUrgent', 'isEm
 // (the row is the entire service). Carried so the parameter catalogue can tell
 // the two apart; it is never sent back to the gateway.
 const RESULT_TYPE_KEYS = ['resultType', 'result_type', 'resulttype'];
+// Reference ranges, where the gateway sends them on the pending row. Read for
+// the IM validation gate only; never echoed back. Nothing here is guessed: a
+// column that is absent leaves the range to the IM config or the analyzer.
+const RANGE_TEXT_KEYS = ['referenceRange', 'refRange', 'normalRange', 'bioRefRange', 'biologicalRefRange', 'rangeText', 'refRangeText'];
+const RANGE_LOW_KEYS = ['refLow', 'refRangeLow', 'lowRange', 'minRange', 'normalMin', 'minValue', 'lowerLimit', 'lowValue'];
+const RANGE_HIGH_KEYS = ['refHigh', 'refRangeHigh', 'highRange', 'maxRange', 'normalMax', 'maxValue', 'upperLimit', 'highValue'];
+const CRITICAL_LOW_KEYS = ['criticalLow', 'panicLow', 'critLow', 'criticalMin'];
+const CRITICAL_HIGH_KEYS = ['criticalHigh', 'panicHigh', 'critHigh', 'criticalMax'];
 
 const PATIENT_ID_KEYS = ['uhid', 'UHID', 'patientId', 'patientID', 'patientCode', 'mrn', 'mrNo'];
 const FIRST_NAME_KEYS = ['firstName', 'patientFirstName', 'fname'];
@@ -124,6 +132,7 @@ export function normalizePending(body: unknown, opts: NormalizeOptions): Pending
       portNo: String(row.portNo ?? opts.portNo ?? ''),
       parameterId: toNumber(row.parameterId),
       resultType: pickString(row, RESULT_TYPE_KEYS),
+      ...rangeOf(row),
     });
 
     // Sample-level attributes repeat on every row; take the first non-empty.
@@ -176,6 +185,28 @@ function pick(row: Record<string, unknown>, keys: string[]): unknown {
 function pickString(row: Record<string, unknown>, keys: string[]): string | null {
   const v = pick(row, keys);
   return v === null ? null : String(v).trim();
+}
+
+/** The reference-range columns of one pending row; only what is present. */
+function rangeOf(row: Record<string, unknown>): Partial<MirthAcknowledgeItem> {
+  const out: Partial<MirthAcknowledgeItem> = {};
+  const num = (keys: string[]) => {
+    const v = pick(row, keys);
+    if (v === null || String(v).trim() === '') return null;
+    const n = Number(String(v).trim());
+    return Number.isFinite(n) ? n : null;
+  };
+  const low = num(RANGE_LOW_KEYS);
+  const high = num(RANGE_HIGH_KEYS);
+  const cLow = num(CRITICAL_LOW_KEYS);
+  const cHigh = num(CRITICAL_HIGH_KEYS);
+  const text = pickString(row, RANGE_TEXT_KEYS);
+  if (low !== null) out.refLow = low;
+  if (high !== null) out.refHigh = high;
+  if (cLow !== null) out.criticalLow = cLow;
+  if (cHigh !== null) out.criticalHigh = cHigh;
+  if (text) out.refText = text;
+  return out;
 }
 
 function toNumber(v: unknown): number | null {

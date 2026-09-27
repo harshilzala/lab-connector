@@ -142,6 +142,16 @@ export interface MirthAcknowledgeItem {
    *  row plus a remembered parameterId, rather than HMIS offering it. See
    *  orders/parameters.ts. */
   synthesized?: boolean;
+  /** Reference range HMIS attached to this row, when the pending row carries
+   *  one (column names vary — see the RANGE_* aliases in hmis/pending.ts).
+   *  Connector-side only, like resultType: read by the IM validation gate and
+   *  never echoed in the acknowledge body. */
+  refLow?: number | null;
+  refHigh?: number | null;
+  criticalLow?: number | null;
+  criticalHigh?: number | null;
+  /** The range as HMIS spells it ("3.5 - 5.5", "< 200", "Negative"). */
+  refText?: string | null;
 }
 
 /** Pending rows for one barcode, collapsed into a single downloadable order. */
@@ -184,6 +194,10 @@ export interface HmisResultUpload {
     abnormalFlag?: string | null;
     status?: string | null; // F | P | C | X
     completedAt?: string | null;
+    /** The analyzer's own reference range for the value, when it sends one
+     *  (ASTM R-record field 6, HL7 OBX-7). One of the IM gate's range sources;
+     *  left out of the messageId so adding it changed no idempotency key. */
+    referenceRange?: string | null;
   }>;
   /** Raw wire text for the server-side interface message log. */
   raw?: string;

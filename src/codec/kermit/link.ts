@@ -337,7 +337,7 @@ export class KermitLink extends EventEmitter implements ProtocolLink {
     } while (this.rxActive);
     this.sending = true;
     this.unparsedWhileSending = Buffer.alloc(0);
-    this.emit('wire', { direction: 'OUT', text: `${fileName}: ${payload}` });
+    let failure: string | null = null;
     try {
       let seq = 0;
       // Send-init carries no data, matching the host the analyzer has accepted

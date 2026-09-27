@@ -77,26 +77,29 @@ for (const m of matched) {
 console.log('✓ every acknowledge item carries sampleID / identifier / labResultId / labServiceId');
 
 // ---- 5) the orchestrator calls them in the right order --------------------
-// Guarded by reading the source: acknowledge must appear AFTER postResults in
-// the spool handler, and must not appear in the order-download path at all.
+// Guarded by reading the source. Every result post goes through postToMirth()
+// and every acknowledge through acknowledgeRows() (so the IM transaction log
+// sees both); the gateway calls themselves live only inside those helpers.
+// Each path must post before it acknowledges, and the order-download path
+// must never acknowledge at all.
 const src = readFileSync(join(here, '..', 'src', 'session', 'orchestrator.ts'), 'utf8');
-// The queued delivery (spool handler) is the LAST occurrence of each call; the
-// earlier pair is the staged filer being wired up in the constructor.
-const post = src.lastIndexOf('this.hmis.postResults(');
-const ack = src.lastIndexOf('this.hmis.acknowledge(');
-assert.ok(post !== -1 && ack !== -1, 'both calls present');
-assert.ok(ack > post, 'acknowledge is called after postResults in the queued delivery');
-{
-  // The console force-push is its own path: it must post before it acknowledges too.
-  const fp = src.indexOf('FORCE push to HMIS from the admin console');
-  const fpPost = src.indexOf('this.hmis.postResults(', fp);
-  const fpAck = src.indexOf('this.hmis.acknowledge(', fp);
-  assert.ok(fp !== -1 && fpPost !== -1 && fpAck > fpPost, 'force-push acknowledges only after postResults');
-}
+assert.equal(src.split('this.hmis.acknowledge(').length - 1, 1, 'the gateway acknowledge is called from one helper only');
+assert.equal(src.split('this.hmis.postResults(').length - 1, 0, 'result posts all go through postToMirth');
+const helper = src.indexOf('private async acknowledgeRows(');
+assert.ok(helper !== -1 && src.indexOf('this.hmis.acknowledge(') > helper, 'the gateway acknowledge sits inside acknowledgeRows');
+const postsBeforeAck = (marker: string, label: string) => {
+  const at = src.indexOf(marker);
+  const p = src.indexOf('this.postToMirth(', at);
+  const a = src.indexOf('this.acknowledgeRows(', at);
+  assert.ok(at !== -1 && p !== -1 && a > p, label);
+};
+postsBeforeAck('this.spool.start(async (payload)', 'queued delivery acknowledges only after postResults');
+postsBeforeAck('FORCE push to HMIS from the admin console', 'force-push acknowledges only after postResults');
+postsBeforeAck('async imVerify(', 'IM verify acknowledges only after the verified values are filed');
 assert.equal(
-  src.split('this.hmis.acknowledge(').length - 1,
-  3,
-  'acknowledge is wired from exactly three places: the queued delivery, the staged filer, and the console force-push (which also posts first)',
+  src.split('this.acknowledgeRows(').length - 1,
+  4,
+  'acknowledge is wired from exactly four places: the staged filer, the queued delivery, the console force-push and IM verify (each posts first)',
 );
 // The staged filer (filing.mode "staged") must keep the same order: post, then
 // acknowledge, and only once.

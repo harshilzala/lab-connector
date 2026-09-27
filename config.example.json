@@ -37,7 +37,10 @@
     "resultsPath": "/mirth/labresult",
     "timeoutMs": 15000,
     "tlsRejectUnauthorized": true,
-    "auditLog": "./logs/hmis.log"
+    "auditLog": "./logs/hmis.log",
+    // Extra headers on every Mirth call, for a listener behind auth. Keep the
+    // value in .env instead: HMIS_AUTHORIZATION=Basic ... fills Authorization.
+    "headers": {}
   },
 
   "admin": {
@@ -56,6 +59,44 @@
   // and is logged on every use. Empty = the button is not shown.
   "Force_Hmis": {
     "password": ""
+  },
+
+  // IM: auto-certification (see README "IM — auto-certification"). Off by
+  // default. When on, a value inside its reference range is filed to Mirth
+  // already certified; everything else waits on the IM dashboard (/im) for a
+  // person to Verify & send or Reject. Ranges come from `gate.ranges` first,
+  // then the Mirth pending row, then the analyzer. A value with no range is
+  // held. An analyzer's own "im" block overrides `gate` ("im": {"enabled":
+  // false} keeps one machine out).
+  "im": {
+    "enabled": false,
+    "gate": {
+      "ranges": {
+        // "GLU": { "low": 70, "high": 110, "criticalLow": 40, "criticalHigh": 400 }
+      },
+      "alwaysReview": [],
+      "holdWhenNoRange": true,
+      "holdOnAnalyzerFlag": true
+    },
+    "mirth": {
+      // Only when certified results go to a different Mirth channel than
+      // hmis.resultsPath:
+      // "baseUrl": "https://mirth.example-hospital.local/api",
+      // "resultsPath": "/mirth/im/labresult",
+      // VERIFY-SPEC: agree these column names with the Mirth channel owner;
+      // null leaves a column out.
+      "fields": {
+        "certified": "isCertified",
+        "autoCertified": "isAutoCertified",
+        "certifiedBy": "certifiedBy",
+        "certifiedAt": "certifiedAt",
+        "abnormal": "isAbnormal",
+        "referenceRange": "referenceRange",
+        "remarks": "remarks"
+      },
+      "autoCertifiedBy": "IM-AUTO"
+    },
+    "reviewKeepDays": 30
   },
 
   "analyzers": [

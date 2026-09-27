@@ -8,6 +8,8 @@ import { RetentionSweeper } from './maintenance/retention.js';
 import { AnalyzerRuntime } from './session/orchestrator.js';
 import { AdminServer, type AdminBackend } from './admin/server.js';
 import { AuthStore } from './admin/auth.js';
+import { imGateFor } from './config.js';
+import { ImTracker } from './im/tracker.js';
 
 // Top-level app: one HMIS client, one AnalyzerRuntime per configured analyzer,
 // and the local admin server. Implements AdminBackend so the dashboard can read
@@ -15,6 +17,8 @@ import { AuthStore } from './admin/auth.js';
 export class Connector implements AdminBackend {
   private readonly runtimes = new Map<string, AnalyzerRuntime>();
   private readonly hmis: HmisClient;
+  /** IM's own Mirth channel for certified results, when im.mirth names one. */
+  private readonly imMirthClient: HmisClient | null = null;
   private readonly admin: AdminServer;
   private readonly auth: AuthStore;
   /** Absent when retention.days is 0 — the sweep is then switched off. */
@@ -38,7 +42,29 @@ export class Connector implements AdminBackend {
       tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
       logger: logger.child({ mod: 'hmis' }),
       audit,
+      headers: cfg.hmis.headers,
+      label: 'mirth',
     });
+
+    // A second client only when IM posts somewhere the pending/acknowledge
+    // calls do not: its own base URL, results path or credentials.
+    const im = cfg.im;
+    if (im.enabled && (im.mirth.baseUrl || im.mirth.resultsPath || Object.keys(im.mirth.headers).length)) {
+      this.imMirthClient = new HmisClient({
+        baseUrl: im.mirth.baseUrl ?? cfg.hmis.baseUrl,
+        siteId: cfg.hmis.siteId,
+        siteIds: cfg.hmis.siteIds,
+        pendingPath: cfg.hmis.pendingPath,
+        acknowledgePath: cfg.hmis.acknowledgePath,
+        resultsPath: im.mirth.resultsPath ?? cfg.hmis.resultsPath,
+        timeoutMs: cfg.hmis.timeoutMs,
+        tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
+        logger: logger.child({ mod: 'im-mirth' }),
+        audit,
+        headers: { ...cfg.hmis.headers, ...im.mirth.headers },
+        label: 'im-mirth',
+      });
+    }
 
     const spoolRoot = resolve(cfg.spoolDir);
     for (const a of cfg.analyzers) {
@@ -47,7 +73,27 @@ export class Connector implements AdminBackend {
       // answerable after a restart — for retention.logDays, after which the
       // sweeper removes the day file.
       const wireLogFile = resolve(cfg.retention.logDir, `wire-${a.id}.log`);
-      this.runtimes.set(a.id, new AnalyzerRuntime(a, this.hmis, spoolRoot, logger, wireLogFile, cfg.retention.days || 7));
+      // IM on for the site: every analyzer is tracked on the IM dashboard;
+      // only those whose gate is enabled have results held for review.
+      const tracker = im.enabled
+        ? new ImTracker(
+            a.id,
+            imGateFor(cfg, a),
+            im.mirth.fields,
+            im.mirth.autoCertifiedBy,
+            spoolRoot,
+            cfg.retention.logDir,
+            logger.child({ mod: 'im', analyzer: a.id }),
+          )
+        : null;
+      this.runtimes.set(
+        a.id,
+        new AnalyzerRuntime(a, this.hmis, spoolRoot, logger, wireLogFile, cfg.retention.days || 7, {
+          im: tracker,
+          imMirth: this.imMirthClient,
+          imReviewKeepDays: im.reviewKeepDays,
+        }),
+      );
     }
 
     if (cfg.retention.days > 0) {
@@ -105,6 +151,12 @@ export class Connector implements AdminBackend {
         wireLogs: `${this.cfg.retention.logDir}/wire-<analyzer>-YYYY-MM-DD.log`,
         retentionDays: this.cfg.retention.days || 'disabled',
         logRetentionDays: this.cfg.retention.days ? this.cfg.retention.logDays : 'disabled',
+        im: this.cfg.im.enabled
+          ? {
+              gating: [...this.runtimes.values()].filter((r) => r.imTracker()?.enabled).map((r) => r.status().id),
+              results: this.imMirthClient ? this.imMirthClient.describe().baseUrl + this.imMirthClient.describe().resultsPath : 'hmis.resultsPath',
+            }
+          : 'disabled',
       },
       'lab-connector started',
     );
@@ -186,5 +238,92 @@ export class Connector implements AdminBackend {
 
   force(id: string, barcode: string) {
     return this.runtimes.get(id)?.stagedForce(barcode) ?? Promise.resolve(null);
+  }
+
+  // ---- IM dashboard -----------------------------------------------------------
+  imEnabled() {
+    return this.cfg.im.enabled;
+  }
+
+  imOverview() {
+    const analyzers = [...this.runtimes.values()].map((rt) => {
+      const t = rt.imTracker();
+      return {
+        status: rt.status(),
+        im: t
+          ? {
+              gating: t.enabled,
+              counts: t.counts(),
+              ranges: Object.keys(t.gateConfig.ranges).length,
+              alwaysReview: t.gateConfig.alwaysReview,
+              holdWhenNoRange: t.gateConfig.holdWhenNoRange,
+              holdOnAnalyzerFlag: t.gateConfig.holdOnAnalyzerFlag,
+            }
+          : null,
+      };
+    });
+    return { enabled: this.cfg.im.enabled, analyzers };
+  }
+
+  imReview() {
+    return [...this.runtimes.values()]
+      .flatMap((rt) => rt.imTracker()?.reviewList() ?? [])
+      .sort((a, b) => {
+        if ((a.pending > 0) !== (b.pending > 0)) return a.pending > 0 ? -1 : 1;
+        return a.updatedAt < b.updatedAt ? 1 : -1;
+      });
+  }
+
+  imOrders() {
+    return [...this.runtimes.values()]
+      .flatMap((rt) => rt.imTracker()?.orders() ?? [])
+      .sort((a, b) => (a.lastAt < b.lastAt ? 1 : -1));
+  }
+
+  imOrder(id: string, barcode: string) {
+    const rt = this.runtimes.get(id);
+    const t = rt?.imTracker();
+    if (!rt || !t) return null;
+    return {
+      analyzer: id,
+      barcode: barcode.trim().toUpperCase(),
+      order: rt.storedOrder(barcode),
+      review: t.reviewSample(barcode),
+      history: t.history(barcode),
+    };
+  }
+
+  imLog(id: string) {
+    return this.runtimes.get(id)?.imTracker()?.transactions.recent(200) ?? null;
+  }
+
+  imVerify(id: string, barcode: string, codes: string[], user: string, comment: string | null) {
+    return this.runtimes.get(id)?.imVerify(barcode, codes, user, comment) ?? Promise.resolve(null);
+  }
+
+  imReject(id: string, barcode: string, codes: string[], user: string, comment: string | null) {
+    return this.runtimes.get(id)?.imReject(barcode, codes, user, comment) ?? null;
+  }
+
+  imMirth() {
+    const clients = [this.hmis, ...(this.imMirthClient ? [this.imMirthClient] : [])];
+    return {
+      clients: clients.map((c) => c.describe()),
+      fields: this.cfg.im.mirth.fields,
+      autoCertifiedBy: this.cfg.im.mirth.autoCertifiedBy,
+      columns: this.hmis.seenColumns(),
+      exchanges: clients
+        .flatMap((c) => c.recentExchanges())
+        .sort((a, b) => (a.ts < b.ts ? 1 : -1))
+        .slice(0, 150),
+    };
+  }
+
+  imMirthProbe(id: string, sampleId: string) {
+    return this.runtimes.get(id)?.mirthProbe(sampleId) ?? Promise.resolve(null);
+  }
+
+  imMirthPreview(id: string, barcode: string) {
+    return this.runtimes.get(id)?.mirthPreview(barcode) ?? null;
   }
 }

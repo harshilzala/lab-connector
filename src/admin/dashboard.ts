@@ -220,6 +220,7 @@ ${FONT_LINK}
     <div class="tools">
       <span class="clock" id="clock"></span>
       <span class="who"><span class="avatar">${initial}</span>${esc(o.username)}</span>
+      <a class="btn btn-ghost btn-sm" href="/im" title="Auto-certification: held results, order transactions, Mirth">IM Dashboard</a>
       <a class="btn btn-ghost btn-sm" href="/connector" title="Identify and connect a new machine">Connector Tool</a>
       <button class="btn btn-ghost btn-sm" type="button" onclick="openPw()">Change password</button>
       <form method="post" action="/logout" style="margin:0">
@@ -397,6 +398,22 @@ function filterBlock(f) {
             }).join('') + '</span></span></div>';
   }
   return html;
+}
+
+// The parameters this machine is scoped to send, from its config: the
+// allow-list (with the HMIS name each is filed as, where that differs), the
+// HMIS rows it must never touch, and the instrument channels it ignores.
+function paramsLine(i) {
+  if (!i) return '—';
+  const n = i.syncCodes.length;
+  const alias = i.aliases || {};
+  const codes = i.syncCodes.map(c => alias[c] ? esc(c) + '<span class="p-as">&rarr;' + esc(alias[c]) + '</span>' : esc(c));
+  const head = n ? n + ' sync' : 'all sent (no allow-list)';
+  const more = (i.excluded && i.excluded.length ? ' · never into ' + esc(i.excluded.join(', ')) : '') +
+    (i.ignored && i.ignored.length ? ' · ' + i.ignored.length + ' channel' + (i.ignored.length === 1 ? '' : 's') + ' ignored' : '');
+  return n
+    ? '<details class="plist"><summary>' + head + more + '</summary><div class="plist-body">' + codes.join('<span class="sep">·</span>') + '</div></details>'
+    : head + more;
 }
 
 function renderStats(analyzers) {

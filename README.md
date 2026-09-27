@@ -411,6 +411,108 @@ and while the service is up, and it refuses an analyzer with `testCodeScale`
 because the log holds values after scaling. Shela moved the ECi and the 250
 to staged on 2026-09-19 and ran it for the two days before.
 
+## IM — auto-certification and the IM dashboard
+
+IM puts a reference-range check between the analyzer and Mirth. It is **off**
+until `im.enabled` is set; with it off the connector files exactly as described
+above.
+
+```
+Mirth pending ──► order store ──► order line to the analyzer (poll / host query)
+                                            │
+analyzer result ──► join to the Mirth row ──┴─► IM gate
+                                                   ├─ in range ──► Mirth, certified (certifiedBy IM-AUTO) ──► acknowledge
+                                                   └─ anything else ──► ACTION REQUIRED on /im
+                                                          ├─ Verify & send ──► Mirth, certified by that person ──► acknowledge
+                                                          └─ Reject ──► never sent; the row stays pending in Mirth
+```
+
+**What passes.** A value is auto-certified only when it is a plain number
+inside its reference range, with status F and no abnormal flag from the
+analyzer (or a qualitative value listed in `normalWords`, such as "Negative").
+Everything else is held: out of range, past a critical limit, flagged H/L/A by
+the analyzer, preliminary, `<0.02`-style values, text for a numeric test, and
+any value with **no range to judge it by**. That last rule is deliberate: an
+auto-certified result reaches a patient report with nobody having looked at
+it, so IM only lets through what it can prove is unremarkable
+(`holdWhenNoRange: false` relaxes it per analyzer).
+
+**Where the range comes from**, first match wins, and the review screen says
+which one was used:
+
+1. `ranges` in the IM config: the lab's own table, per analyzer test code.
+2. The Mirth pending row, when the gateway sends one. Columns read:
+   `refLow`/`minValue`/`lowRange`/`normalMin`…, `refHigh`/`maxValue`/…,
+   `criticalLow`/`criticalHigh`, or a text form in `referenceRange`/`refRange`/
+   `normalRange` ("3.5 - 5.5", "< 200"). See `src/hmis/pending.ts`.
+3. The range the analyzer sent with the value (ASTM R-record field 6, HL7 OBX-7).
+
+**Held values** are stored under `spool/<analyzer>/im-review/<barcode>.json`
+with the exact row they will be filed as, so a verification files the number
+the person saw against the labResultId they saw. On a staged analyzer they are
+marked `review` in the result store, so the filing pass stops retrying them. A
+rerun that comes back in range supersedes the held value automatically; one
+that is still out of range replaces it and goes back to pending.
+
+**Verify & send** needs a name typed in (the console has one shared login, so
+the name is recorded beside it as `Dr A (admin)`), and **Reject** also needs
+a reason. Both are logged. A verify whose post to Mirth fails keeps the values
+verified-but-unsent and says why; pressing it again resends them.
+
+**What IM adds to each result row.** The usual row, plus the columns in
+`im.mirth.fields` (default `isCertified`, `isAutoCertified`, `certifiedBy`,
+`certifiedAt`, `isAbnormal`, `referenceRange`, `remarks`). **VERIFY-SPEC:**
+these names must be agreed with whoever owns the Mirth channel. The gateway
+binds with Gson, which ignores unknown properties, so sending them early is
+harmless, but until Mirth maps them it will not mark anything certified. Set
+a field to `null` to leave it out. If certified results must go to a different
+Mirth channel, set `im.mirth.baseUrl` / `im.mirth.resultsPath`. Credentials go
+in `hmis.headers` / `im.mirth.headers`, or in `.env` as `HMIS_AUTHORIZATION` /
+`IM_MIRTH_AUTHORIZATION`.
+
+**The dashboard** is at `/im` (a button on the main dashboard):
+
+- **Action required**: held samples, worst first (critical, then out of
+  range, then flagged…). *Review* shows every value with its range, where the
+  range came from and why it was held, plus what was already auto-certified on
+  the sample. From here a person can Verify & send, Reject, or *Re-run on
+  analyzer* (pushes the order to the machine again).
+- **Orders & transactions**: every order IM has seen, filterable by machine,
+  status and barcode. Status runs Ordered → Sent to analyzer → Result received →
+  Action required / Sent to Mirth, or Send failed, Mirth error, Rejected.
+  Expanding an order shows its Mirth rows (with ranges and whether each went to
+  the analyzer) and its **whole transaction log** in order: order received,
+  analyzer query, order line sent, results received, certified or held,
+  verified or rejected, filed, acknowledged, plus every failure.
+- **Machines**: the analyzers, as on the main dashboard, each expandable to
+  its IM log and wire log.
+- **Mirth**: where IM connects (header *names* only, never values), which
+  certification columns it adds, every column Mirth has sent on pending rows
+  (range-like ones highlighted), a read-only *look up a barcode* that shows
+  Mirth's raw answer and how IM reads it, a *what would we send?* preview of
+  the exact POST body, and the latest exchanges with request and response.
+
+The per-order history is written to `logs/im-<analyzer>-YYYY-MM-DD.log` (one
+JSON line per event) and ages out with the other logs; the last three days are
+reloaded on start. Decided review samples are dropped after
+`im.reviewKeepDays`; pending ones are never swept.
+
+```jsonc
+"im": {
+  "enabled": true,
+  "gate": {                                  // site-wide; each analyzer's "im" block overrides
+    "ranges": { "GLU": { "low": 70, "high": 110, "criticalHigh": 400 } },
+    "alwaysReview": [],                      // codes that always need a person
+    "holdWhenNoRange": true,
+    "holdOnAnalyzerFlag": true
+  },
+  "mirth": { "fields": { "certified": "isCertified" /* … */ }, "autoCertifiedBy": "IM-AUTO" }
+}
+// per analyzer:  "im": { "enabled": false }  or  "im": { "ranges": { "K": { "low": 3.5, "high": 5.1 } } }
+```
+
+Run `npm run im` for the gate and review tests.
+
 ## Log & spool retention
 
 Four things grow on disk. Each is bounded, but by a different mechanism.
@@ -530,7 +632,12 @@ position to confirm:
    and known samples**; confirm values match on the HMIS result-entry screen.
 3. Verify QC/control samples route to the QC module, **not** patient results.
 4. Confirm interfaced results require **tech verification/certification** before
-   clinicians see them (they land as `RESULT_INTERFACE`).
+   clinicians see them (they land as `RESULT_INTERFACE`). **With IM on this
+   changes by design:** in-range values arrive already certified. Before
+   enabling it, get the lab director to sign off the range source for every
+   interfaced test (the Mirth screen's *what would we send?* shows the range
+   and its source per value), and confirm Mirth maps the certification
+   columns.
 5. Confirm an **unmatched barcode** or **unmapped test code** is surfaced (admin
    dashboard + server log), never silently dropped.
 6. **Parallel run** (interface + manual entry) until 100% agreement, then cut over.

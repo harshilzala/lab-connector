@@ -2,7 +2,15 @@ import { join } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { AnalyzerConfig } from '../config.js';
 import type { HmisClient } from '../hmis/client.js';
-import type { HmisResultUpload, HostQuery, MirthAcknowledgeItem, OrderDownload, ParsedMessage, PendingOrders } from '../types.js';
+import type {
+  HmisResultUpload,
+  HostQuery,
+  LisInboundResultRow,
+  MirthAcknowledgeItem,
+  OrderDownload,
+  ParsedMessage,
+  PendingOrders,
+} from '../types.js';
 import type { ProtocolLink, WireEvent } from '../codec/types.js';
 import { createTransport } from '../transport/index.js';
 import type { Transport } from '../transport/types.js';
@@ -32,6 +40,9 @@ import { assayKey } from '../codec/astm/records.js';
 import { OrderStore, ORDER_RETENTION_DAYS, codeKey } from '../orders/store.js';
 import { ParameterCatalogue } from '../orders/parameters.js';
 import { WireAudit } from './wire-audit.js';
+import type { ImTracker } from '../im/tracker.js';
+import { gateJoined } from '../im/gate.js';
+import { unwrapRows } from '../hmis/pending.js';
 
 /** How often the order store drops entries past ORDER_RETENTION_DAYS. */
 const ORDER_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -99,6 +110,9 @@ export interface AnalyzerStatus {
   orders: OrderPollStatus;
   /** What this machine is scoped to send — the console's "parameters" line. */
   interface: InterfaceScope;
+  /** allowTestCodes / ignoreTestCodes set against the identifiers HMIS has
+   *  actually offered — the console's filter block. */
+  filter: { allow: string[]; ignore: string[]; hmis: string[] };
 }
 
 export interface InterfaceScope {
@@ -147,6 +161,52 @@ export interface OrderView {
   }>;
   syncCount: number;
   noSyncCount: number;
+}
+
+/** What a person's "Verify & send" did for one held sample. */
+export interface VerifyReport {
+  barcode: string;
+  /** Values moved to verified by this request. */
+  verified: number;
+  /** Rows posted to Mirth — this request's plus any verified earlier whose
+   *  filing had failed. */
+  sent: number;
+  accepted: number;
+  message: string;
+}
+
+/** The Mirth screen's live lookup: what Mirth returns for one barcode, raw
+ *  and as the connector reads it. Read-only — nothing is stored or sent. */
+export interface MirthProbe {
+  analyzer: string;
+  sampleId: string;
+  calls: Array<{
+    eqCode: string;
+    /** The body exactly as Mirth sent it, clipped. */
+    raw: string;
+    rows: number;
+    columns: string[];
+    /** As normalised for this analyzer: the rows it would store. */
+    parsed: Array<{
+      identifier: string;
+      labResultId: number | null;
+      labServiceId: number | null;
+      parameterId: number | null;
+      range: string | null;
+    }>;
+    error?: string;
+  }>;
+}
+
+/** "What would go to Mirth": a sample's values joined, gated and decorated
+ *  exactly as the filing pass would — without sending anything. */
+export interface MirthPreview {
+  analyzer: string;
+  barcode: string;
+  rows: LisInboundResultRow[];
+  verdicts: Array<{ testCode: string; identifier: string; value: string; decision: string; reason: string; range: string | null; rangeSource: string | null }>;
+  unmatched: string[];
+  note: string;
 }
 
 /** What the console's "Re-send" did for one barcode. */
@@ -241,6 +301,13 @@ export class AnalyzerRuntime {
   /** Circuit breaker for order download — see `pauseDownloads`. */
   private downloadFailStreak = 0;
   private downloadPausedUntil = 0;
+  /** IM: the per-order transaction log and review list. Null when IM is off
+   *  for the site; present but `enabled === false` when it is on for the site
+   *  and off for this analyzer (orders are then tracked, not gated). */
+  private readonly im: ImTracker | null;
+  /** Where certified results are posted when IM names its own Mirth channel. */
+  private readonly imMirth: HmisClient | null;
+  private readonly imReviewKeepDays: number;
 
   constructor(
     private readonly cfg: AnalyzerConfig,
@@ -252,7 +319,11 @@ export class AnalyzerRuntime {
     /** retention.days — how long a staged value waits for its order before it
      *  is discarded. */
     private readonly retentionDays = 7,
+    ext: { im?: ImTracker | null; imMirth?: HmisClient | null; imReviewKeepDays?: number } = {},
   ) {
+    this.im = ext.im ?? null;
+    this.imMirth = ext.imMirth ?? null;
+    this.imReviewKeepDays = ext.imReviewKeepDays ?? 30;
     this.log = logger.child({ analyzer: cfg.id });
     this.interfacedIdentifiers = AnalyzerRuntime.interfacedIdentifiersFor(cfg);
     this.transport = createTransport(cfg.transport, this.log);
@@ -268,8 +339,9 @@ export class AnalyzerRuntime {
         store: this.staged,
         orderRows: (barcode, opts) => this.resolveOrderRows(barcode, opts),
         join: (upload, rows) => this.joinRows(upload, rows),
-        postResults: (rows) => this.hmis.postResults(rows, this.cfg.equipmentCode),
-        acknowledge: (rows) => this.hmis.acknowledge(rows),
+        postResults: (rows) => this.postToMirth(rows, this.imGating ? 'auto' : 'uncertified'),
+        acknowledge: (rows) => this.acknowledgeRows(rows),
+        gate: this.imGating ? (upload, joined, rows) => this.gateUpload(upload, joined, rows) : undefined,
         log: this.log,
         recheckMs: cfg.filing.recheckMs,
         completeBarcode: cfg.barcodeCompletion ? compileCompletion(cfg.barcodeCompletion) : undefined,
@@ -343,9 +415,21 @@ export class AnalyzerRuntime {
         this.log.warn({ barcode: payload.barcode, voided }, 'analyzer reported no value for these assays — not filed; the rerun will file');
       }
 
+      // IM: only what the gate certifies files now; held values are written to
+      // the review list (durably, before anything is posted) and wait there
+      // for a person. They are NOT re-queued — the review list is their home.
+      let held: string[] = [];
+      if (this.imGating && rows.length > 0) {
+        const g = this.gateUpload(payload, { rows, matched, filedCodes: join(orderRows).filedCodes }, orderRows);
+        rows = g.rows;
+        matched = g.matched;
+        held = g.held;
+      }
+
       // Nothing filable and nothing outstanding — every value in this item was
-      // a placeholder or a configured non-result. Returning clears it from the
-      // spool; throwing would retry a message that can never produce a row.
+      // a placeholder or a configured non-result, or held for review. Returning
+      // clears it from the spool; throwing would retry a message that can never
+      // produce a row.
       if (rows.length === 0 && unmatched.length === 0) return;
 
       if (unmatched.length) {
@@ -363,9 +447,9 @@ export class AnalyzerRuntime {
       // eqCode rides along so the audit entry names the interface that filed
       // the value — without it a result line in hmis.log cannot be attributed
       // to a machine, only inferred from the identifier's spelling.
-      const res = await this.hmis.postResults(rows, this.cfg.equipmentCode);
+      const res = await this.postToMirth(rows, this.imGating ? 'auto' : 'uncertified');
       this.log.info(
-        { barcode: payload.barcode, filed: res.filed, sent: rows.length, message: res.message },
+        { barcode: payload.barcode, filed: res.filed, sent: rows.length, held, message: res.message },
         'results filed to HMIS',
       );
 
@@ -380,7 +464,7 @@ export class AnalyzerRuntime {
       // that the rows stay pending and may be downloaded again — the same cost
       // the acknowledge has always had, and much cheaper than a double file.
       try {
-        await this.hmis.acknowledge(matched);
+        await this.acknowledgeRows(matched);
         this.log.info({ barcode: payload.barcode, rows: matched.length }, 'pending rows acknowledged after filing');
       } catch (err) {
         this.log.error(
@@ -418,6 +502,7 @@ export class AnalyzerRuntime {
 
     const sweep = () => {
       this.orders.sweep(ORDER_RETENTION_DAYS);
+      this.im?.sweep(this.imReviewKeepDays);
       if (this.staged) {
         const r = this.staged.sweep(this.retentionDays, this.cfg.filing.keepFiledDays);
         if (r.discarded || r.cleared) {
@@ -566,6 +651,7 @@ export class AnalyzerRuntime {
               // it is the catalogue's main source.
               this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
               const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll');
+              this.im?.orderSeen(order, 'poll');
               if (!download || newCodes.length === 0) continue;
               if (!downloadable(order.sampleId)) {
                 // The gateway lists this barcode under our eqCode, but the
@@ -596,6 +682,7 @@ export class AnalyzerRuntime {
                   },
                 ]);
                 this.orders.markDownloaded(order.sampleId, newCodes);
+                this.im?.orderSent(order.barcode, newCodes, 'poll');
                 this.downloadedCount++;
                 pushed++;
                 this.resumeDownloads('an order was accepted');
@@ -603,6 +690,7 @@ export class AnalyzerRuntime {
               } catch (err) {
                 // Not marked downloaded, so it is retried once the breaker closes.
                 this.downloadFailStreak++;
+                this.im?.orderSendFailed(order.barcode, newCodes, err instanceof Error ? err.message : String(err));
                 this.log.error(
                   {
                     barcode: order.sampleId,
@@ -807,6 +895,7 @@ export class AnalyzerRuntime {
     const source: ResendReport['source'] = pending?.found ? 'hmis' : 'store';
     const stored = pending?.found ? this.orders.upsert(lookup, pending, 'resend').order : this.orders.get(lookup);
     if (!stored) return null;
+    this.im?.orderSeen(stored, 'resend');
     const order: OrderDownload = {
       sampleId: stored.sampleId,
       testCodes: this.programmable(stored.testCodes),
@@ -821,10 +910,12 @@ export class AnalyzerRuntime {
       await this.link.sendOrders([order]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      this.im?.orderSendFailed(lookup, order.testCodes, message);
       this.log.error({ barcode: lookup, tests: order.testCodes, err: message }, 're-send failed — the analyzer did not take the order');
       throw new Error(`the analyzer did not accept the order: ${message}`);
     }
     this.orders.markDownloaded(lookup, order.testCodes);
+    this.im?.orderSent(lookup, order.testCodes, 'resend');
     this.downloadedCount++;
     this.resumeDownloads('an operator re-sent an order');
     this.log.info({ barcode: lookup, tests: order.testCodes, source }, 'order re-sent to analyzer');
@@ -904,12 +995,12 @@ export class AnalyzerRuntime {
       report.message = 'nothing could be mapped to an HMIS parameter from the cached order rows or the catalogue';
       return report;
     }
-    const res = await this.hmis.postResults(joined.rows, this.cfg.equipmentCode);
+    const res = await this.postToMirth(joined.rows, 'uncertified');
     report.accepted = res.filed;
     report.message = res.message;
     this.staged.markFiled(s.barcode, joined.filedCodes);
     try {
-      await this.hmis.acknowledge(joined.matched);
+      await this.acknowledgeRows(joined.matched);
     } catch (err) {
       this.log.error(
         { barcode: s.barcode, err: err instanceof Error ? err.message : String(err) },
@@ -1076,6 +1167,7 @@ export class AnalyzerRuntime {
           );
           continue;
         }
+        this.im?.resultsReceived(u);
         if (this.staged && this.filer) {
           // Stored first, filed after — the old middleware's order of events.
           const { changed, unchanged } = this.staged.upsert(u);
@@ -1121,7 +1213,10 @@ export class AnalyzerRuntime {
 
       // Remember the rows: the result comes back in a LATER message and needs
       // their labResultId to be filable.
-      if (pending.ackItems.length) this.orders.upsert(lookup, pending, 'query', { neverDownload: this.neverDownload() });
+      if (pending.ackItems.length) {
+        const { order } = this.orders.upsert(lookup, pending, 'query', { neverDownload: this.neverDownload() });
+        this.im?.orderSeen(order, 'query');
+      }
 
       // HMIS drops a sample's rows from the pending list and offers them
       // again later. LB2609180027, 2026-09-17: 21 rows on the 18:42Z poll,
@@ -1133,6 +1228,7 @@ export class AnalyzerRuntime {
       // Only a barcode neither side knows gets the empty download.
       const stored = pending.found ? null : this.orders.get(lookup);
       const source = pending.found ? pending : stored?.rows.length ? stored : null;
+      this.im?.querySeen(lookup, source !== null, source?.testCodes ?? []);
       if (!source) {
         this.log.info({ barcode, lookup }, 'no pending orders — sending empty download');
         await this.link.sendOrders([]); // header + terminator = "no work"
@@ -1152,6 +1248,7 @@ export class AnalyzerRuntime {
       await this.link.sendOrders([order]);
       // A query answer is a full download, so the poller need not repeat it.
       this.orders.markDownloaded(lookup, source.testCodes);
+      this.im?.orderSent(lookup, source.testCodes, 'query');
       this.log.info(
         { barcode, tests: source.testCodes, from: pending.found ? 'hmis' : 'order store' },
         pending.found ? 'order download sent to analyzer' : 'HMIS lists no pending rows — order download sent from the cached rows',
@@ -1263,9 +1360,274 @@ export class AnalyzerRuntime {
     // rows after a previous upload already acknowledged them.
     const pending = await this.fetchPending(lookup, true);
     if (pending.ackItems.length) {
-      return this.orders.upsert(lookup, pending, 'result').order.rows;
+      const { order } = this.orders.upsert(lookup, pending, 'result');
+      this.im?.orderSeen(order, 'result');
+      return order.rows;
     }
     return stored?.rows ?? [];
+  }
+
+  // ---- IM --------------------------------------------------------------------
+
+  /** True when this analyzer's results go through the IM gate. */
+  private get imGating(): boolean {
+    return this.im?.enabled ?? false;
+  }
+
+  /** The gate, with this sample's patient for the review screen. */
+  private gateUpload(
+    upload: HmisResultUpload,
+    joined: { rows: LisInboundResultRow[]; matched: MirthAcknowledgeItem[]; filedCodes: Array<{ testCode: string; identifier: string; labResultId: number | null }> },
+    orderRows: MirthAcknowledgeItem[],
+  ) {
+    const patient = this.orders.get(upload.barcode)?.patient ?? null;
+    return this.im!.gate(upload, joined, orderRows, patient);
+  }
+
+  /**
+   * Every result post from this analyzer goes through here, so the IM log has
+   * one place to record what Mirth said. Certified rows go to the IM channel
+   * when one is configured (im.mirth.baseUrl / resultsPath), else to the
+   * usual results endpoint.
+   */
+  private async postToMirth(rows: LisInboundResultRow[], how: 'auto' | 'verified' | 'uncertified') {
+    const client = how !== 'uncertified' && this.imMirth ? this.imMirth : this.hmis;
+    const byBarcode = new Map<string, LisInboundResultRow[]>();
+    for (const r of rows) byBarcode.set(r.sampleId, [...(byBarcode.get(r.sampleId) ?? []), r]);
+    try {
+      const res = await client.postResults(rows, this.cfg.equipmentCode);
+      for (const [b, rs] of byBarcode) this.im?.filed(normalizeBarcode(b), rs, byBarcode.size === 1 ? res.filed : rs.length, how);
+      return res;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      for (const [b, rs] of byBarcode) this.im?.fileFailed(normalizeBarcode(b), rs, message);
+      throw err;
+    }
+  }
+
+  private async acknowledgeRows(rows: MirthAcknowledgeItem[]): Promise<void> {
+    const byBarcode = new Map<string, MirthAcknowledgeItem[]>();
+    for (const r of rows) byBarcode.set(r.sampleID, [...(byBarcode.get(r.sampleID) ?? []), r]);
+    try {
+      await this.hmis.acknowledge(rows);
+      for (const [b, rs] of byBarcode) this.im?.acknowledged(normalizeBarcode(b), rs, null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      for (const [b, rs] of byBarcode) this.im?.acknowledged(normalizeBarcode(b), rs, message);
+      throw err;
+    }
+  }
+
+  /** The IM tracker, for the dashboard. Null when IM is off for the site. */
+  imTracker(): ImTracker | null {
+    return this.im;
+  }
+
+  /** One stored order as the order detail shows it: every Mirth row with its
+   *  range and whether it went to the analyzer. Null when not stored. */
+  storedOrder(barcode: string) {
+    const o = this.orders.get(normalizeBarcode(barcode));
+    if (!o) return null;
+    const downloaded = new Set(o.downloaded.map(codeKey));
+    return {
+      barcode: o.barcode,
+      sampleId: o.sampleId,
+      priority: o.priority,
+      specimenType: o.specimenType,
+      patient: o.patient,
+      firstSeenAt: o.firstSeenAt,
+      updatedAt: o.updatedAt,
+      rows: o.rows.map((r) => ({
+        identifier: r.identifier,
+        labResultId: r.labResultId,
+        parameterId: r.parameterId,
+        range: r.refText ?? (r.refLow != null || r.refHigh != null ? `${r.refLow ?? ''} - ${r.refHigh ?? ''}` : null),
+        downloaded: downloaded.has(codeKey(r.identifier)),
+      })),
+    };
+  }
+
+  /**
+   * A person verified held values: file them to Mirth as certified by that
+   * person, then retire their pending rows. Values verified earlier whose
+   * filing failed go again with them. A filing failure leaves the values
+   * verified-but-unfiled (the next Verify retries them) and is thrown with
+   * the gateway's reason.
+   */
+  async imVerify(barcode: string, codes: string[], user: string, comment: string | null): Promise<VerifyReport | null> {
+    if (!this.im) return null;
+    const lookup = normalizeBarcode(barcode);
+    if (!this.im.review.get(lookup)) return null;
+    const moved = this.im.verify(lookup, codes, user, comment);
+    const items = this.im.review.unfiledVerified(lookup);
+    const report: VerifyReport = { barcode: lookup, verified: moved.length, sent: 0, accepted: 0, message: '' };
+    if (items.length === 0) {
+      report.message = 'nothing pending to verify';
+      return report;
+    }
+    const at = new Date().toISOString();
+    const rows = items.map((i) =>
+      this.im!.certifyRow(i.row, {
+        auto: false,
+        by: i.decidedBy ?? user,
+        at: i.decidedAt ?? at,
+        verdict: { testCode: i.testCode, identifier: i.identifier, value: i.value, unit: i.unit, verdict: i.verdict },
+        remarks: i.comment,
+      }),
+    );
+    const itemCodes = items.map((i) => i.testCode);
+    let res;
+    try {
+      res = await this.postToMirth(rows, 'verified');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.im.review.markFiled(lookup, itemCodes, { error: message });
+      this.log.error({ barcode: lookup, codes: itemCodes, err: message }, 'IM: verified values could not be filed — they stay verified, retry from the dashboard');
+      throw new Error(`Mirth did not take the verified values: ${message}`);
+    }
+    this.im.review.markFiled(lookup, itemCodes, { error: null });
+    this.staged?.markFiled(
+      lookup,
+      items.map((i) => ({ testCode: i.testCode, identifier: i.identifier, labResultId: i.row.labResultId })),
+    );
+    report.sent = rows.length;
+    report.accepted = res.filed;
+    report.message = res.message;
+    this.log.info({ barcode: lookup, codes: itemCodes, user, accepted: res.filed }, 'IM: verified values filed to Mirth');
+
+    // Retire the pending rows last, never fatally — as on every other path.
+    const acks: MirthAcknowledgeItem[] = [];
+    const seen = new Set<string>();
+    for (const i of items) {
+      if (!i.ack) continue;
+      const k = `${i.ack.identifier}#${i.ack.labResultId}#${i.ack.parameterId}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      acks.push(i.ack);
+    }
+    try {
+      await this.acknowledgeRows(acks);
+    } catch (err) {
+      this.log.error(
+        { barcode: lookup, err: err instanceof Error ? err.message : String(err) },
+        'IM: acknowledge failed after verified values were filed — rows stay pending in Mirth',
+      );
+    }
+    return report;
+  }
+
+  /** A person refused held values: never filed. Null for an unknown sample. */
+  imReject(barcode: string, codes: string[], user: string, comment: string | null): number | null {
+    if (!this.im) return null;
+    const lookup = normalizeBarcode(barcode);
+    if (!this.im.review.get(lookup)) return null;
+    const moved = this.im.reject(lookup, codes, user, comment);
+    if (moved.length) this.log.warn({ barcode: lookup, codes: moved.map((i) => i.testCode), user }, 'IM: held values rejected — not filed');
+    return moved.length;
+  }
+
+  /**
+   * The Mirth screen's lookup: ask Mirth for one barcode under every code this
+   * machine is registered as and show the answer raw and as parsed. Stores
+   * nothing and sends nothing to the analyzer.
+   */
+  async mirthProbe(sampleId: string): Promise<MirthProbe> {
+    const lookup = normalizeBarcode(sampleId);
+    const out: MirthProbe = { analyzer: this.cfg.id, sampleId: lookup, calls: [] };
+    for (const eqCode of this.equipmentCodes()) {
+      try {
+        const body = await this.hmis.getPending({
+          sampleId: lookup,
+          eqCode,
+          siteId: this.cfg.siteId,
+          showCulture: this.cfg.showCulture,
+          date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
+        });
+        const rowList = unwrapRows(body);
+        const parsed = normalizePending(body, {
+          sampleId: lookup,
+          eqCode,
+          equipmentId: this.cfg.equipmentId ?? null,
+          ipAddress: this.ackIpAddress,
+          portNo: this.ackPortNo,
+          includeTransmitted: true,
+        });
+        const raw = JSON.stringify(body, null, 2) ?? '';
+        out.calls.push({
+          eqCode,
+          raw: raw.length > 20000 ? `${raw.slice(0, 20000)}
+…[${raw.length - 20000} more chars]` : raw,
+          rows: rowList.length,
+          columns: [...new Set(rowList.flatMap((r) => Object.keys(r)))],
+          parsed: parsed.ackItems.map((r) => ({
+            identifier: r.identifier,
+            labResultId: r.labResultId,
+            labServiceId: r.labServiceId,
+            parameterId: r.parameterId,
+            range: r.refText ?? (r.refLow != null || r.refHigh != null ? `${r.refLow ?? ''} - ${r.refHigh ?? ''}` : null),
+          })),
+        });
+      } catch (err) {
+        out.calls.push({ eqCode, raw: '', rows: 0, columns: [], parsed: [], error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * "What would we send to Mirth for this sample?" — its values joined to the
+   * cached order rows, judged by the gate and decorated as certified, exactly
+   * as the filing pass would. Nothing is sent, stored or held.
+   */
+  mirthPreview(barcode: string): MirthPreview | null {
+    const lookup = normalizeBarcode(barcode);
+    const orderRows = this.orders.get(lookup)?.rows ?? [];
+    const sample = this.staged?.get(lookup) ?? null;
+    const held = this.im?.review.get(lookup) ?? null;
+    if (!sample && !held) return null;
+    const preview: MirthPreview = { analyzer: this.cfg.id, barcode: lookup, rows: [], verdicts: [], unmatched: [], note: '' };
+    const at = new Date().toISOString();
+
+    if (sample) {
+      const upload = this.staged!.previewUpload(sample, `${lookup}-preview`);
+      const joined = this.joinRows(upload, orderRows);
+      preview.unmatched = joined.unmatched;
+      const gateCfg = this.im?.gateConfig;
+      if (gateCfg && this.im) {
+        const g = gateJoined({ ...gateCfg, enabled: true }, upload, joined, orderRows);
+        preview.verdicts = g.verdicts.map((v) => ({
+          testCode: v.testCode,
+          identifier: v.identifier,
+          value: v.value,
+          decision: v.verdict.decision,
+          reason: v.verdict.reason,
+          range: v.verdict.range?.text ?? null,
+          rangeSource: v.verdict.range?.source ?? null,
+        }));
+        const certified = g.verdicts.filter((v) => v.verdict.decision === 'certify');
+        preview.rows = g.certify.rows.map((r, i) =>
+          this.im!.certifyRow(r, { auto: true, by: '(auto)', at, verdict: certified[i] }),
+        );
+        preview.note = this.im.enabled
+          ? `${preview.rows.length} row(s) would be auto-certified; ${g.hold.length} would wait for verification.`
+          : `IM is off for this analyzer — shown as it WOULD be gated. Today these ${joined.rows.length} row(s) file uncertified.`;
+      } else {
+        preview.rows = joined.rows;
+        preview.note = 'IM is off — rows are filed exactly as shown, with no certification columns.';
+      }
+    } else if (held && this.im) {
+      preview.rows = Object.values(held.items).map((i) =>
+        this.im!.certifyRow(i.row, {
+          auto: false,
+          by: i.decidedBy ?? '(verifier)',
+          at,
+          verdict: { testCode: i.testCode, identifier: i.identifier, value: i.value, unit: i.unit, verdict: i.verdict },
+          remarks: i.comment,
+        }),
+      );
+      preview.note = 'Held values, as they would be filed once verified.';
+    }
+    return preview;
   }
 
   /** Reported in the acknowledge body; derived from a TCP transport when the

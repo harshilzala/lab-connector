@@ -42,6 +42,15 @@ export interface FilerDeps {
    *  barcode a short instrument id stands for, or null when the id is not of
    *  that shape. See src/results/complete.ts. */
   completeBarcode?: (barcode: string, receivedAt: Date) => string | null;
+  /** IM validation gate (src/im). Given what the join matched, returns the
+   *  subset that may file now — decorated with the certification columns —
+   *  and the test codes held for a person. Absent = everything files. */
+  gate?: (upload: HmisResultUpload, joined: JoinResult, orderRows: MirthAcknowledgeItem[]) => {
+    rows: LisInboundResultRow[];
+    matched: MirthAcknowledgeItem[];
+    filedCodes: JoinResult['filedCodes'];
+    held: string[];
+  };
 }
 
 export interface FilerReport {
@@ -181,20 +190,30 @@ export class StagedFiler {
         log.info({ barcode, scaled: joined.scaled }, 'unit conversion applied before filing');
       }
 
-      if (joined.rows.length > 0) {
-        const res = await this.deps.postResults(joined.rows);
-        store.markFiled(barcode, joined.filedCodes);
+      // IM: only what the gate certifies files now. Held values are marked
+      // "review" so the pass stops offering them — they wait for a person on
+      // the IM dashboard, not for an order row.
+      let toFile: Pick<JoinResult, 'rows' | 'matched' | 'filedCodes'> = joined;
+      if (this.deps.gate && joined.rows.length > 0) {
+        const g = this.deps.gate(upload, joined, rows);
+        if (g.held.length) store.markDropped(barcode, g.held, 'review');
+        toFile = g;
+      }
+
+      if (toFile.rows.length > 0) {
+        const res = await this.deps.postResults(toFile.rows);
+        store.markFiled(barcode, toFile.filedCodes);
         log.info(
-          { barcode, filed: res.filed, sent: joined.rows.length, stillWaiting: joined.unmatched, message: res.message, reason },
+          { barcode, filed: res.filed, sent: toFile.rows.length, stillWaiting: joined.unmatched, message: res.message, reason },
           'results filed to HMIS',
         );
         // Acknowledge LAST, and never fatally: the values are already saved.
         try {
-          await this.deps.acknowledge(joined.matched);
-          log.info({ barcode, rows: joined.matched.length }, 'pending rows acknowledged after filing');
+          await this.deps.acknowledge(toFile.matched);
+          log.info({ barcode, rows: toFile.matched.length }, 'pending rows acknowledged after filing');
         } catch (err) {
           log.error(
-            { barcode, rows: joined.matched.length, err: err instanceof Error ? err.message : String(err) },
+            { barcode, rows: toFile.matched.length, err: err instanceof Error ? err.message : String(err) },
             'acknowledge failed AFTER results were filed — rows stay pending and may be downloaded again',
           );
         }
@@ -203,7 +222,7 @@ export class StagedFiler {
       const after = summarize(store.get(barcode) ?? sample);
       if (after.waiting === 0) {
         store.recordAttempt(barcode, { error: null, checkedHmis: checked });
-        return joined.rows.length > 0 ? 'filed' : 'nothing';
+        return toFile.rows.length > 0 ? 'filed' : 'nothing';
       }
 
       // Still waiting for order rows. Not an error — say so once per change
@@ -216,7 +235,7 @@ export class StagedFiler {
         );
       }
       store.recordAttempt(barcode, { error: why, checkedHmis: checked });
-      return joined.rows.length > 0 ? 'partial' : 'waiting';
+      return toFile.rows.length > 0 ? 'partial' : 'waiting';
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       store.recordAttempt(barcode, { error: message });
