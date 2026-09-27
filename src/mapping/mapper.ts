@@ -23,6 +23,28 @@ export function normalizeBarcode(sampleId: string): string {
   return (sampleId || '').trim().toUpperCase();
 }
 
+/**
+ * The barcode a rerun repeats, when the operator marked the repeat on the id
+ * itself — "PL2609240011/R", "PL2609190003R", "PL2609260017-R2".
+ *
+ * HMIS never registers those, so the values behind them cannot file. Naming the
+ * base barcode is what lets the connector SAY so (see reportRerun); the suffix
+ * is deliberately not stripped for filing, because a rerun repeats an assay the
+ * original has usually already filed.
+ *
+ * Conservative on purpose. A trailing R with an optional separator and an
+ * optional repeat number is the only shape read as a rerun mark, and only when
+ * the remainder is a barcode this analyzer actually holds an order for — so a
+ * genuine barcode that happens to end in R is left exactly as it came.
+ */
+export function rerunBaseBarcode(sampleId: string, known: (barcode: string) => boolean): string | null {
+  const id = normalizeBarcode(sampleId);
+  const m = /^(.+?)[/\\\-_ ]?R\d*$/.exec(id);
+  if (!m) return null;
+  const base = m[1];
+  return base && base !== id && known(base) ? base : null;
+}
+
 export function isQcSample(sampleId: string, cfg: AnalyzerConfig['qc']): boolean {
   const id = (sampleId || '').trim();
   if (!id) return false;

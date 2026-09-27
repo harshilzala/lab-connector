@@ -17,6 +17,7 @@ import {
   isVoidResult,
   keepInterfacedResults,
   normalizeBarcode,
+  rerunBaseBarcode,
   toLisResultRows,
   toResultUploads,
   willSyncIdentifier,
@@ -29,6 +30,7 @@ import {
   normalizePending,
 } from '../hmis/pending.js';
 import { assayKey } from '../codec/astm/records.js';
+import { encodeTestCode } from '../codec/kermit/vitros250.js';
 import { OrderStore, ORDER_RETENTION_DAYS, codeKey } from '../orders/store.js';
 import { ParameterCatalogue } from '../orders/parameters.js';
 import { WireAudit } from './wire-audit.js';
@@ -332,6 +334,13 @@ export class AnalyzerRuntime {
         );
       }
       if (rows.length === 0) {
+        // A repeat the operator marked on the sample id can never match a row,
+        // so retrying it 50 times only delays the day it is discarded unnamed.
+        const base = rerunBaseBarcode(payload.barcode, (b) => this.orders.get(b) !== null);
+        if (base) {
+          this.reportRerun(payload, base);
+          return;
+        }
         // Throwing keeps the item spooled: the order may simply not be raised
         // in HMIS yet. It parks in failed/ once attempts run out.
         throw new Error(`no order rows matched barcode ${payload.barcode} — nothing to file`);
@@ -1085,21 +1094,93 @@ export class AnalyzerRuntime {
    * this assay did not run" versus "the order never got there". Logged per
    * transmission, which is also per rerun: an assay still missing on the third
    * run of a tube is worth saying three times.
+   *
+   * Both sides are compared on the dialect's CANONICAL assay key, for the same
+   * reason joinRows does it: HMIS spells an ECiQ assay as the full
+   * "1.000000+035+1" where the analyzer's R record reports "035". Compared
+   * raw, every assay that did come back was also named as outstanding — 31
+   * such false alarms on the ECiQ between 16 and 27 Sep 2026, beside 33
+   * genuine ones on the VITROS 250, which reports bare codes and was never
+   * affected.
    */
   private reportOutstandingProgrammedAssays(msg: ParsedMessage): void {
+    const key = this.assayJoinKey();
     for (const sampleId of new Set(msg.results.map((r) => r.sampleId))) {
       const order = this.orders.get(normalizeBarcode(sampleId));
       if (!order?.downloaded.length) continue; // never programmed from here
       const returned = new Set(
-        msg.results.filter((r) => r.sampleId === sampleId).map((r) => codeKey(r.testCode)),
+        msg.results.filter((r) => r.sampleId === sampleId).map((r) => key(r.testCode)),
       );
-      const outstanding = order.downloaded.filter((c) => !returned.has(codeKey(c)));
+      const outstanding = order.downloaded
+        // A code the wire could never carry was dropped before transmission, so
+        // "the order did reach it" would be a lie about this one. markDownloaded
+        // records it all the same — deliberately, or the poller would re-send it
+        // every 30s for ever — so the exclusion belongs here. HMIS code 986 on
+        // PL2609240002 (2026-09-24) is the case: no single byte can hold it.
+        .filter((c) => this.couldReachAnalyzer(c))
+        .filter((c) => !returned.has(key(c)));
       if (!outstanding.length) continue;
       this.log.warn(
         { barcode: order.sampleId, outstanding, returned: [...returned] },
         'analyzer answered this sample without these programmed assays — the order did reach it; these assays did not run',
       );
     }
+  }
+
+  /**
+   * A repeat the operator keyed with a suffix — "PL2609240011/R" for a rerun of
+   * PL2609240011 — put on the record instead of thrown away.
+   *
+   * HMIS holds no such barcode, so the join finds nothing, and until now the
+   * item retried 50 times, parked in failed/ and was then discarded past the
+   * retention window without ever being named: that is how 32=117 on
+   * PL2609190003R went missing on 20 Sep 2026.
+   *
+   * The suffix is NOT stripped and the values are NOT filed under the base
+   * barcode. Every rerun seen here repeated an assay HMIS had already accepted
+   * — PL2609240011 filed 90=57 and its rerun said 56; PL2609260017 filed 46=1.3
+   * and its rerun said 1.3 — so filing them would overwrite an acknowledged
+   * result with a duplicate or a near-miss, silently, on a judgement that is
+   * the lab's to make. What the connector owes is the record: which barcode
+   * this repeats, what the instrument now reports, and which of those assays
+   * the original order covers. Warn, drop the item, let the lab decide.
+   */
+  private reportRerun(payload: HmisResultUpload, base: string): void {
+    const key = this.assayJoinKey();
+    const ordered = new Set((this.orders.get(base)?.downloaded ?? []).map(key));
+    const values = payload.results.map((r) => `${r.testCode}=${r.value}`);
+    this.log.warn(
+      {
+        barcode: payload.barcode,
+        rerunOf: base,
+        values,
+        onOriginalOrder: payload.results.filter((r) => ordered.has(key(r.testCode))).map((r) => r.testCode),
+      },
+      'rerun of an existing barcode — HMIS has no such sample, so these values were NOT filed; check them against the original at the instrument and re-key under the base barcode if the repeat should stand',
+    );
+  }
+
+  /**
+   * How an assay identifier is compared, whichever side named it.
+   *
+   * HMIS and the instrument do not always spell the same assay alike: on the
+   * ECiQ the pending row's identifier is the full "1.000000+035+1" where the
+   * analyzer's R record reports "035". Everything that matches a returned code
+   * against an ordered one goes through here, for the same reason joinRows
+   * does it — compared raw, an assay that did come back looks like one that
+   * never ran.
+   */
+  private assayJoinKey(): (identifier: string) => string {
+    const canonical = this.cfg.protocol === 'astm' ? assayKey(this.cfg.astm.dialect) : undefined;
+    return (identifier) => codeKey(canonical ? canonical(identifier) : identifier);
+  }
+
+  /** Whether this assay code can physically go down this link. The VITROS 250
+   *  carries a code as ONE byte, so anything outside 1–126 is dropped by the
+   *  codec before the transfer (see unencodableTestCodes) — it was ordered in
+   *  HMIS but never programmed on the instrument. */
+  private couldReachAnalyzer(code: string): boolean {
+    return this.cfg.protocol === 'kermit' ? encodeTestCode(code) !== null : true;
   }
 
   private async answerQuery(barcode: string): Promise<void> {

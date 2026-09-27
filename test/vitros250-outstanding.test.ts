@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AnalyzerRuntime } from '../src/session/orchestrator.js';
 import { parseResultFile } from '../src/codec/kermit/vitros250.js';
+import { parseMessage } from '../src/codec/astm/records.js';
 import type { HmisClient } from '../src/hmis/client.js';
 import type { AnalyzerConfig } from '../src/config.js';
 
@@ -203,6 +204,140 @@ console.log('\n[3] The runtime names the programmed assays a result came back wi
     `a complete sample must not warn, got ${JSON.stringify(warned.map((w) => w.msg))}`,
   );
   console.log(`  ${G} a sample that returned everything programmed says nothing`);
+
+  rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n[4] On the ECiQ the two sides spell an assay differently — and that is not "did not run"');
+{
+  // HMIS carries the ECiQ's eqIdntifier as the FULL "1.000000+035+1"; the
+  // analyzer's R record names the same assay "035". Compared raw, all five
+  // assays that DID come back were reported as outstanding — 31 such false
+  // alarms in logs/lab-interface.out.log between 16 and 27 Sep 2026, which
+  // would have buried the genuine ones. Both sides go through the dialect's
+  // canonical key instead, exactly as the filing join does.
+  const dir = mkdtempSync(join(tmpdir(), 'lab-eciq-outstanding-'));
+  const warned: Array<{ barcode?: string; outstanding?: string[]; msg: string }> = [];
+  const log = {
+    child: () => log,
+    info() {},
+    debug() {},
+    trace() {},
+    fatal() {},
+    error() {},
+    warn(o: unknown, m?: string) {
+      if (typeof o === 'object' && o && typeof m === 'string') warned.push({ ...(o as object), msg: m } as never);
+    },
+  } as never;
+
+  const hmis = {
+    async getPending() {
+      return { status: 'success', data: [] };
+    },
+    async acknowledge() {},
+    async postResults() {
+      return { status: 'success', message: 'ok', successData: [], filed: 0 };
+    },
+  } as unknown as HmisClient;
+
+  const cfg = {
+    id: 'vitros-eciq-outstanding-test',
+    equipmentCode: 'ZHPN004',
+    extraEquipmentCodes: [],
+    siteIds: [],
+    protocol: 'astm',
+    transport: { type: 'tcp', mode: 'client', host: '127.0.0.1', port: 15256 },
+    sendDemographics: true,
+    hostQuery: false,
+    sendDate: false,
+    qc: { sampleIdPrefixes: [], sampleIdRegex: '^[0-9]+$', patientPrefixes: [] },
+    testCodeAliases: {},
+    excludeIdentifiers: [],
+    excludeParameterIds: [],
+    ignoreTestCodes: [],
+    allowTestCodes: [],
+    testCodeScale: {},
+    testValueMap: {},
+    fillMissingOrderRows: false,
+    equipmentId: 224895587,
+    ipAddress: '10.20.4.53',
+    portNo: '4001',
+    orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: true, downloadPrefixes: [], excludeTestCodes: [] },
+    astm: { ackTimeoutMs: 15000, frameMaxData: 240, senderId: 'HOST', receiverId: '', dialect: 'vitros-eciq' },
+    kermit: { ackTimeoutMs: 10000, maxRetries: 5, interPacketDelayMs: 0, interTransferDelayMs: 0 },
+    filing: { mode: 'queue', passIntervalMs: 15000, recheckMs: 300000, keepFiledDays: 2 },
+    hl7: { sendingApp: 'LIS', sendingFacility: '', charset: 'UNICODE', ack: true, valueTypes: ['NM'], encoding: 'utf8', idleFlushMs: 0 },
+  } as unknown as AnalyzerConfig;
+
+  const rt = new AnalyzerRuntime(cfg, hmis, dir, log);
+  const inner = rt as unknown as {
+    orders: {
+      upsert(b: string, p: unknown, s: string): { order: unknown; newCodes: string[] };
+      markDownloaded(b: string, c: string[]): void;
+    };
+    onMessage(m: unknown): Promise<void>;
+  };
+
+  const ECIQ = 'PL2609270011';
+  /** Verbatim from spool/vitros-eciq/orders/PL2609270011.json — HMIS's own
+   *  identifier spelling, full universal test ids. */
+  const six = [
+    '1.000000+035+1',
+    '1.000000+003+1',
+    '1.000000+002+1',
+    '1.000000+032+1',
+    '1.000000+074+1',
+    '1.000000+038+1',
+  ];
+  inner.orders.upsert(
+    ECIQ,
+    {
+      sampleId: ECIQ,
+      found: true,
+      testCodes: six,
+      patient: null,
+      specimenType: 'Serum',
+      priority: 'R',
+      ackItems: six.map((identifier, i) => ({
+        sampleID: ECIQ,
+        identifier,
+        equipmentId: 224895587,
+        labResultId: 93660000 + i,
+        labServiceId: 3300,
+        parameterId: null,
+        ipAddress: '10.20.4.53',
+        portNo: '4001',
+        resultType: 'Numeric',
+      })),
+    },
+    'poll',
+  );
+  inner.orders.markDownloaded(ECIQ, six);
+
+  // Verbatim from logs/wire-vitros-eciq-2026-09-27.log — five of the six came
+  // back; 003 is the one that genuinely did not run.
+  const lines = [
+    'H|\\^&|||VECI|||||||||20260927103909',
+    `P|1|10002024452215|||BANERJI^URNA|||F`,
+    `O|1|${ECIQ}^01^0||^^^1.000000+002+1\\032+1\\035+1\\038+1\\074+1|R||||||N||||4||||||||||F`,
+    'R|1|^^^1.000000+002+1|90.9|nmol/L||^0^||V|||20260927094021|20260927100339|',
+    'R|2|^^^1.000000+032+1|289|pg/mL||^0^||V|||20260927101541|20260927103859|',
+    'R|3|^^^1.000000+035+1|1.129|uIU/mL||^0^||V|||20260927094141|20260927100459|',
+    'R|4|^^^1.000000+038+1|5.5|U/mL||^5^OR||V|||20260927094101|20260927101758|',
+    'R|5|^^^1.000000+074+1|26.2|ng/mL||^0^||V|||20260927094221|20260927100539|',
+    'L|1|N',
+  ];
+  await inner.onMessage(parseMessage(lines, lines.join('\r\n'), 'vitros-eciq'));
+
+  const hit = warned.find((w) => w.msg.startsWith('analyzer answered this sample without'));
+  assert.ok(hit, `expected the outstanding-assay warning, got ${JSON.stringify(warned.map((w) => w.msg))}`);
+  assert.equal(hit!.barcode, ECIQ);
+  assert.deepEqual(
+    hit!.outstanding,
+    ['1.000000+003+1'],
+    `only 003 is outstanding; got ${JSON.stringify(hit!.outstanding)}`,
+  );
+  console.log(`  ${G} outstanding: ${hit!.outstanding!.join(',')} — the five that returned are no longer named`);
 
   rmSync(dir, { recursive: true, force: true });
 }
