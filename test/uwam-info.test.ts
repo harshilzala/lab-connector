@@ -49,23 +49,29 @@ function join_(values: Record<string, string>) {
 }
 
 check('RBC-Info codes 1-3 file as the manual’s words into the RBC-Info row', () => {
-  assert.equal(join_({ 'RBC-Info.': '1' }).values['RBC-Info'], 'Isomorphic?');
-  assert.equal(join_({ 'RBC-Info.': '2' }).values['RBC-Info'], 'Dysmorphic?');
-  assert.equal(join_({ 'RBC-Info.': '3' }).values['RBC-Info'], 'Mixed?');
+  // HMIS holds the row as a coded list (lab, 2026-09-21): the CODE is sent.
+  // 1 Isomorphic type, 2 Dismorphic type, 3 Mixed type, 0 Unclassified.
+  assert.equal(join_({ 'RBC-Info.': '1' }).values['RBC-Info'], '1');
+  assert.equal(join_({ 'RBC-Info.': '2' }).values['RBC-Info'], '2');
+  assert.equal(join_({ 'RBC-Info.': '3' }).values['RBC-Info'], '3');
+  assert.equal(join_({ 'RBC-Info.': '0' }).values['RBC-Info'], '0');
 });
 check('BACT-Info codes 1-4 file as the manual’s words into the BACT-Info row', () => {
   // Settings-screen order (BO), confirmed on LB2609190776: code 2 = Gram Positive?
-  assert.equal(join_({ 'BACT-Info.': '1' }).values['BACT-Info'], 'Gram Negative?');
-  assert.equal(join_({ 'BACT-Info.': '2' }).values['BACT-Info'], 'Gram Positive?');
-  assert.equal(join_({ 'BACT-Info.': '3' }).values['BACT-Info'], 'Gram Pos/Neg?');
-  assert.equal(join_({ 'BACT-Info.': '4' }).values['BACT-Info'], 'Unclassified');
+  // 1 Gram Negative, 2 Gram positive, 3 Gram mixed, 0 Unclassified.
+  assert.equal(join_({ 'BACT-Info.': '1' }).values['BACT-Info'], '1');
+  assert.equal(join_({ 'BACT-Info.': '2' }).values['BACT-Info'], '2');
+  assert.equal(join_({ 'BACT-Info.': '3' }).values['BACT-Info'], '3');
+  assert.equal(join_({ 'BACT-Info.': '0' }).values['BACT-Info'], '0');
+  // Wire 4 is Sysmex's "Unclassified" (too few bacteria to type) → the lab's 0.
+  assert.equal(join_({ 'BACT-Info.': '4' }).values['BACT-Info'], '0');
 });
-check('code 0 (no judgement) is not filed, not unmatched, and the rest of the tube still files', () => {
-  const j = join_({ 'RBC-Info.': '0', 'BACT-Info.': '0', RBC: '2.1', BACT: '27.2' });
-  assert.deepEqual(j.values, { RBC: '2.1', BACT: '27.2' });
-  assert.deepEqual(j.voided.sort(), ['BACT-Info.', 'RBC-Info.']);
+check('code 0 files as 0 (the lab\'s Unclassified), and the rest of the tube files with it', () => {
+  const j = join_({ 'RBC-Info.': '0', 'BACT-Info.': '4', RBC: '2.1', BACT: '27.2' });
+  assert.deepEqual(j.values, { 'RBC-Info': '0', 'BACT-Info': '0', RBC: '2.1', BACT: '27.2' });
+  assert.deepEqual(j.voided, []);
   assert.deepEqual(j.unmatched, []);
-  assert.deepEqual(j.translated, []);
+  assert.deepEqual(j.translated, ['BACT-Info. 4->0']);
 });
 check('UTI-Info. is still ignored (HMIS has no row for it)', () => {
   const j = join_({ 'UTI-Info.': '1', RBC: '1.0' });

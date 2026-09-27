@@ -622,12 +622,19 @@ const UWAM_VALUE_MAP: Record<string, Record<string, string>> = {
   //             glossary — CONFIRMED on LB2609190776 (2026-09-19): wire code 2,
   //             U-WAM screen "Gram Positive?". RBC-Info. 1/2/3 still follow
   //             the glossary order; check one tube of each on the screen.
-  // 0 = "judgment is not performed and the field is left blank" (GI §5.6.4:
-  // RBC under 20/µL, or BACT / WBC under the set thresholds) — an empty word
-  // means NOT FILED, the HMIS row is left as it is. The "?" is part of
-  // Sysmex's wording: the item is an inference, not a measurement.
-  'RBC-Info.': { '0': '', '1': 'Isomorphic?', '2': 'Dysmorphic?', '3': 'Mixed?' },
-  'BACT-Info.': { '0': '', '1': 'Gram Negative?', '2': 'Gram Positive?', '3': 'Gram Pos/Neg?', '4': 'Unclassified' },
+  // HMIS holds RBC Morphology and Type of Bacteria as CODED lists, so it is
+  // sent the code, not a word (lab, 2026-09-21 — a word typed into the field
+  // showed as literal text on the report):
+  //   RBC Morphology   Isomorphic type 1   Dismorphic type 2   Mixed type 3   Unclassified 0
+  //   Type of Bacteria Gram Negative 1    Gram positive 2     Gram mixed 3   Unclassified 0
+  // The UF-4000's own codes are the same numbers for 1/2/3 (manual order,
+  // confirmed on LB2609190776: wire 2 = "Gram Positive?" on the U-WAM screen).
+  // Two differences, both mapped to the lab's 0:
+  //   * wire 0 = "judgement not performed" (GI §5.6.4; 82% of tubes) → 0;
+  //   * wire 4 on BACT-Info. = Sysmex's "Unclassified" (42 tubes, all with
+  //     10–258 bacteria/µl — too few to Gram-type; LB2609210717 was one) → 0.
+  'RBC-Info.': { '0': '0', '1': '1', '2': '2', '3': '3' },
+  'BACT-Info.': { '0': '0', '1': '1', '2': '2', '3': '3', '4': '0' },
 };
 
 /** What the U-WAM wants to see in an ORDER for a strip item, keyed by the
