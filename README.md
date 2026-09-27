@@ -169,6 +169,14 @@ Edit `config.json`:
     Use it where the gateway lists more work under an equipment code than the
     instrument actually runs — the VITROS 250 is offered six barcode prefixes
     and returns results only for `ZC`. Empty means download everything.
+    `excludeTestCodes` restricts which *assay codes* are programmed: listed
+    codes are left out of every download (their rows are still cached and a
+    result for them would still be joined). Use it for a test HMIS lists under
+    the machine that the instrument does not have — the VITROS 250 drops a
+    whole sample program that names an assay it lacks (HMIS's derived LFT
+    values 107/108/109), leaving the tube "not programmed".
+    On the VITROS 250 every download carries the *whole* panel, because the
+    instrument keeps one program per sample and a later download replaces it.
   - `sendDate` — send today's date (`dd-MM-yyyy`) as the `date` parameter.
     Default **false**, so an order raised yesterday for a tube run today is
     still found.
@@ -383,7 +391,17 @@ Each analyzer chooses how its results reach HMIS with `filing.mode`:
 
 The Cancer site runs the ABL9 and the BC-6000 staged and both VITROS queued.
 Switching an analyzer to staged migrates whatever its queue still holds into
-the store on the next start, so nothing already received is lost.
+the store on the next start, so nothing already received is lost. What the
+queue had already *delivered* is gone from disk, though — a queued analyzer
+kept nothing once HMIS accepted an upload — so those samples are not on the
+console and cannot be Forced. `npm run import:filed` (`-- --days N`,
+`-- --analyzer <id>`) restores them from the HMIS transaction log
+(`logs/hmis-<day>.log`): every accepted upload's rows come back as filed
+values, under the analyzer's own code, latest upload first. It only adds
+(a value the store already holds is never touched), it is safe to run twice
+and while the service is up, and it refuses an analyzer with `testCodeScale`
+because the log holds values after scaling. Shela moved the ECi and the 250
+to staged on 2026-09-19 and ran it for the two days before.
 
 ## Log & spool retention
 

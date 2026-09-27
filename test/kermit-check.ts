@@ -192,5 +192,80 @@ const silentOrder = { sampleId: 'ZC2609160012', testCodes: ['Z'], priority: 'R',
   eq('wrong-baud analyzer: the bytes it sent are in the wire log', wire.some((w) => w.startsWith('IN (not Kermit') && w.includes('<F8>')), true);
 }
 
+console.log('\n[11] The analyzer\'s idle heartbeat — a bare NAK(0) every ~60 s — is never answered');
+// Legacy capture: 51,501 heartbeats, none answered by the host. This link used
+// to answer the second one with a Y (as "a repeat of the last acknowledged
+// packet"), after which the analyzer refused the next send-init with "0005
+// INVALID PACKET USAGE" — 28 of 28 downloads after ≥2 min of quiet, 16–17 Sep.
+{
+  const t = new FakeTransport();
+  const link = new KermitLink(t as never, { ackTimeoutMs: 20, maxRetries: 2, interPacketDelayMs: 0, interTransferDelayMs: 0, logger: quiet });
+  await link.start();
+  const heartbeat = encodePacket({ seq: 0, type: 'N', data: '' });
+  for (let i = 0; i < 4; i++) t.emit('data', heartbeat);
+  t.emit('data', encodePacket({ seq: 0, type: 'Y', data: '' })); // a stray ACK is noise too
+  eq('four heartbeats and a stray Y: nothing written back', t.writes.length, 0);
+}
+
+console.log('\n[12] Our acknowledgement of the analyzer\'s send-init is the legacy host\'s bare "# Y>"');
+// Vitros250_String.txt: every one of 1,598 captured receives was opened with
+// a Y carrying no parameters (SOH '#' ' ' 'Y' '>'). Matching it exactly.
+{
+  const t = new FakeTransport();
+  const link = new KermitLink(t as never, { ackTimeoutMs: 20, maxRetries: 2, interPacketDelayMs: 0, interTransferDelayMs: 0, logger: quiet });
+  await link.start();
+  t.emit('data', encodePacket({ seq: 0, type: 'S', data: '~* @-#N1\\' }));
+  eq('exactly one packet went back', t.writes.length, 1);
+  eq('and it is "# Y>" + CR, byte for byte', t.writes[0]!.toString('latin1'), '\x01# Y>\r');
+}
+
+console.log('\n[13] Every wire line carries the packet exchange behind it');
+{
+  // A full result receive: S F D Z B from the analyzer, our Y to each.
+  const t = new FakeTransport();
+  const link = new KermitLink(t as never, { ackTimeoutMs: 20, maxRetries: 2, interPacketDelayMs: 0, interTransferDelayMs: 0, logger: quiet });
+  const wire: { direction: string; text: string; trace?: string }[] = [];
+  link.on('wire', (w: { direction: string; text: string; trace?: string }) => wire.push(w));
+  link.on('message', () => {});
+  await link.start();
+  for (const pk of buildTransfer('R0000007', RESULT)) t.emit('data', encodePacket(pk));
+  eq('one IN line for the file', wire.map((w) => w.direction), ['IN']);
+  eq('its trace opens with the S and our bare Y', wire[0]!.trace?.startsWith('←S0 →Y0 ←F1(R0000007) →Y1 ←D2['), true);
+  eq('and closes with the B and its Y', wire[0]!.trace?.endsWith('←Z4 →Y4 ←B5 →Y5'), true);
+
+  // A download the analyzer acknowledges packet by packet.
+  const t2 = new FakeTransport();
+  const link2 = new KermitLink(t2 as never, { ackTimeoutMs: 50, maxRetries: 2, interPacketDelayMs: 0, interTransferDelayMs: 0, logger: quiet });
+  const wire2: { direction: string; text: string; trace?: string }[] = [];
+  link2.on('wire', (w: { direction: string; text: string; trace?: string }) => wire2.push(w));
+  await link2.start();
+  const origWrite = t2.write.bind(t2);
+  t2.write = async (d: Buffer) => {
+    await origWrite(d);
+    const [{ packet }] = new KermitDecoder().push(d);
+    setImmediate(() => t2.emit('data', encodePacket({ seq: packet!.seq, type: 'Y', data: packet!.type === 'S' ? '~* @-#N1\\' : '' })));
+  };
+  await link2.sendOrders([silentOrder]);
+  eq('one OUT line for the download', wire2.map((w) => w.direction), ['OUT']);
+  const dLen = buildOrderRecord(silentOrder as never).length;
+  eq('its trace shows each packet and its acknowledgement', wire2[0]!.trace, `→S0 ←Y0(~* @-#N1\\) →F1(SFILE1.D) ←Y1 →D2[${dLen}] ←Y2 →Z3 ←Y3 →B4 ←Y4`);
+
+  // A download the analyzer refuses: the refusal is on the same line.
+  const t3 = new FakeTransport();
+  const link3 = new KermitLink(t3 as never, { ackTimeoutMs: 50, maxRetries: 2, interPacketDelayMs: 0, interTransferDelayMs: 0, logger: quiet });
+  const wire3: { direction: string; text: string; trace?: string }[] = [];
+  link3.on('wire', (w: { direction: string; text: string; trace?: string }) => wire3.push(w));
+  await link3.start();
+  const origWrite3 = t3.write.bind(t3);
+  t3.write = async (d: Buffer) => {
+    await origWrite3(d);
+    setImmediate(() => t3.emit('data', encodePacket({ seq: 0, type: 'E', data: '0005 INVALID PACKET USAGE    ' })));
+  };
+  let refused = '';
+  try { await link3.sendOrders([silentOrder]); } catch (e) { refused = (e as Error).message; }
+  eq('the error names the analyzer\'s reason', refused, 'VITROS rejected the transfer: 0005 INVALID PACKET USAGE');
+  eq('and the wire line records S → E', wire3[0]!.trace, '→S0 ←E0(0005 INVALID PACKET USAGE) ✗ VITROS rejected the transfer: 0005 INVALID PACKET USAGE');
+}
+
 console.log(failures ? `\n${B} ${failures} assertion(s) failed\n` : `\n${G} all assertions passed\n`);
 process.exit(failures ? 1 : 0);

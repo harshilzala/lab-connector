@@ -31,6 +31,10 @@ export interface AdminBackend {
   staged(id: string): StagedSummary[] | null;
   /** The order store, each HMIS row marked sync / no-sync. */
   ordersView(id: string): OrderView[] | null;
+  /** Push one barcode's order to the analyzer again (whole order, rows read
+   *  from HMIS afresh). Null for an unknown barcode; throws with the reason
+   *  when the push cannot be made. */
+  resendOrder(id: string, barcode: string): Promise<ResendReport | null>;
   fileNow(id: string, barcode: string): Promise<boolean>;
   /** Returns the barcode the sample now sits under, or null. */
   rekey(id: string, from: string, to: string): string | null;
@@ -42,7 +46,7 @@ export interface AdminBackend {
   force(id: string, barcode: string): Promise<ForceReport | null>;
 }
 import type { StagedSummary } from '../results/store.js';
-import type { OrderView } from '../session/orchestrator.js';
+import type { OrderView, ResendReport } from '../session/orchestrator.js';
 
 /** Plenty for a login form; anything larger is not a request we serve. */
 const MAX_BODY_BYTES = 16 * 1024;
@@ -198,6 +202,26 @@ export class AdminServer {
       if (method === 'GET' && ordersList) {
         const o = this.backend.ordersView(ordersList[1]!);
         return o ? this.json(res, { orders: o }) : this.json(res, { error: 'unknown analyzer' }, 404);
+      }
+
+      // "Re-send": hand a barcode's order to the analyzer again, whole. The
+      // poller never offers an order twice, so this is the operator's way to
+      // recover one the instrument lost. Logged on every attempt: it programs
+      // work on the machine.
+      const ordersResend = p.match(/^\/api\/analyzers\/([a-z0-9-]+)\/orders\/([^/]+)\/resend$/);
+      if (method === 'POST' && ordersResend) {
+        if (!this.sameOrigin(req)) return this.json(res, { error: 'cross-origin request rejected' }, 403);
+        const id = ordersResend[1]!;
+        const barcode = decodeURIComponent(ordersResend[2]!);
+        this.logger.warn({ analyzer: id, barcode }, 'order re-send requested from the admin console');
+        try {
+          const report = await this.backend.resendOrder(id, barcode);
+          return report ? this.json(res, report) : this.json(res, { error: 'unknown barcode' }, 404);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.logger.error({ analyzer: id, barcode, err: message }, 'order re-send failed');
+          return this.json(res, { error: message }, 502);
+        }
       }
 
       // ---- staged result store (filing.mode "staged") ----

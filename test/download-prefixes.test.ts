@@ -90,7 +90,7 @@ async function pollWith(downloadPrefixes: string[]): Promise<{ sent: string[]; s
   const dir = mkdtempSync(join(tmpdir(), 'lab-prefix-'));
   const cfg = {
     ...baseCfg,
-    orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: true, downloadPrefixes },
+    orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: true, downloadPrefixes, excludeTestCodes: [] },
   } as unknown as AnalyzerConfig;
 
   const rt = new AnalyzerRuntime(cfg, hmis, dir, quiet);

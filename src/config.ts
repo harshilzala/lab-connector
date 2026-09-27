@@ -221,6 +221,17 @@ const AnalyzerSchema = z.object({
        *  Vitros250.exe applied SamplePrefix=ZC to both directions, and the
        *  VITROS 250 has only ever returned results for ZC barcodes. */
       downloadPrefixes: z.array(z.string().min(1)).default([]),
+      /** Assay codes never programmed onto the analyzer, whatever HMIS lists.
+       *  Their rows are still cached (a result for them would still be
+       *  joined); they are simply left out of every download and never count
+       *  as waiting. For an instrument that DROPS a whole sample program when
+       *  it names an assay it does not have — the VITROS 250 given the HMIS
+       *  LFT panel's derived values 107/108/109 beside 36/37/89: every such
+       *  tube on 16–17 Sep 2026 had to be keyed in by hand, and the legacy
+       *  capture shows the same tubes running from the download the moment
+       *  they were re-sent without those codes (2026-06-19) — this is what
+       *  keeps the rest of the panel downloadable. Exact after trim/upper-case. */
+      excludeTestCodes: z.array(z.string().min(1)).default([]),
     })
     .default({}),
   /** Recognising a control/QC run so it is not filed as a patient result.

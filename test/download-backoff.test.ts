@@ -71,7 +71,7 @@ const cfg = {
   sendDemographics: false,
   hostQuery: false,
   sendDate: false,
-  orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: true, downloadPrefixes: [] },
+  orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: true, downloadPrefixes: [], excludeTestCodes: [] },
   qc: { sampleIdPrefixes: [], sampleIdRegex: null },
   testCodeAliases: {},
   astm: { ackTimeoutMs: 15000, frameMaxData: 240, senderId: 'HOST', receiverId: '', dialect: 'vitros-eciq' },

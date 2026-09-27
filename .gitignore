@@ -37,3 +37,6 @@ captures/
 
 # Set by Lab-Interface-stop.bat; tells the watchdog the stop was deliberate.
 .lab-maintenance
+
+# Lab-Watch-Agent memory and run state — per machine, never committed
+scripts/agent/state/
