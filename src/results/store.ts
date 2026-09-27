@@ -1,5 +1,5 @@
 import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { HmisResultUpload } from '../types.js';
 import { safeSpoolId } from '../queue/spool.js';
@@ -440,20 +440,67 @@ export class ResultStore {
 
   private files(): string[] {
     try {
+      // Only this directory's own .json files; quarantined ones live in
+      // corrupt/ and carry a timestamp suffix, so both are skipped here.
       return readdirSync(this.dir).filter((f) => f.endsWith('.json'));
     } catch {
       return [];
     }
   }
 
+  /**
+   * Read one staged sample, and QUARANTINE the file if it cannot be read.
+   *
+   * A staged file holds patient values that have not reached HMIS yet, so a
+   * file that will not parse is lost work — and it used to vanish in silence:
+   * this method returned null, list() skipped it, and the sample simply was
+   * not there. Seven such files were found on the Prahlad Nagar BC-5150 on
+   * 23 Sep 2026, every one 8 KB of NUL bytes and every one stamped 20 Sep
+   * 13:05, the signature of an unclean shutdown losing the data blocks of
+   * recently written files. (The writer is not at fault: write() goes to a
+   * temp file and renames.) Nothing was lost to HMIS that time — all five
+   * real barcodes had already filed — but nothing in the logs said so either.
+   *
+   * So: move the file to <dir>/corrupt/ and say which sample it was. Moving
+   * it means the warning is not repeated on every pass, list() stops walking
+   * over it, and the file is still on disk for anyone who wants to look. A
+   * sample whose values never reached HMIS can then be re-run or forced from
+   * the console; one that already filed costs nothing.
+   */
   private read(path: string): StagedSample | null {
+    let raw: string;
     try {
-      const s = JSON.parse(readFileSync(path, 'utf8')) as StagedSample;
-      if (!s || typeof s.barcode !== 'string' || typeof s.values !== 'object') return null;
-      return s;
+      raw = readFileSync(path, 'utf8');
     } catch {
+      return null; // gone between readdir and here — nothing to quarantine
+    }
+    try {
+      const s = JSON.parse(raw) as StagedSample;
+      if (!s || typeof s.barcode !== 'string' || typeof s.values !== 'object') {
+        this.quarantine(path, 'staged result file is not a staged sample');
+        return null;
+      }
+      return s;
+    } catch (err) {
+      this.quarantine(path, err instanceof Error ? err.message : String(err));
       return null;
     }
+  }
+
+  /** Move an unreadable staged file aside, once, and name it in the log. */
+  private quarantine(path: string, why: string): void {
+    const dir = join(this.dir, 'corrupt');
+    const dst = join(dir, `${basename(path)}.${Date.now()}`);
+    try {
+      mkdirSync(dir, { recursive: true });
+      renameSync(path, dst);
+    } catch {
+      // Could not move it — still worth the warning; the next pass retries.
+    }
+    this.log.warn(
+      { file: basename(path), movedTo: dst, reason: why },
+      'staged results for this sample could not be read and were moved aside — if they never reached HMIS the sample must be re-run or forced',
+    );
   }
 
   private write(s: StagedSample): void {

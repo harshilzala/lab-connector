@@ -9,6 +9,7 @@ import {
   unquote,
 } from '../src/codec/kermit/packets.js';
 import { buildOrderRecord, orderFileName, parseResultFile } from '../src/codec/kermit/vitros250.js';
+import { isVoidResult } from '../src/mapping/mapper.js';
 import { KermitLink } from '../src/codec/kermit/link.js';
 import { EventEmitter } from 'node:events';
 
@@ -81,15 +82,18 @@ eq('file names cycle SFILE1..8', [1, 7, 8, 9].map(orderFileName), ['SFILE1.D', '
 
 console.log('\n[4] Result file — the captured upload for SF2608310014');
 // Legacy Result_Flow.log recorded exactly: test=90 result=76, test=46 result=.7
-// (assay 76 came back "NO RESULT" and must NOT be filed).
+// (assay 76 came back "NO RESULT" and must NOT be filed — it is parsed as a
+// VOID carrying the analyzer's condition code, so the log can name it, and
+// isVoidResult keeps it out of every upload).
 const RESULT = '1131410831               SF2608310014   10%41.000LNO RESULT060MENSPF}Z   76.   000}.     .7  000}|**250*    ]';
 const parsed = parseResultFile(RESULT, new Date('2026-08-31T12:00:00'));
 eq('results', parsed.results.map((r) => [r.sampleId, r.testCode, r.value, r.abnormalFlag]), [
+  ['SF2608310014', '76', 'NO RESULT', '060MENSPF'],
   ['SF2608310014', '90', '76', null],
   ['SF2608310014', '46', '.7', null],
 ]);
-eq('"NO RESULT" is not filed', parsed.results.some((r) => r.value.includes('RESULT')), false);
-eq('completedAt carries the year the record omits', parsed.results[0]!.completedAt, '20260831113141');
+eq('"NO RESULT" is a void, never a filable value', parsed.results.filter((r) => !isVoidResult(r.value)).map((r) => r.testCode), ['90', '46']);
+eq('completedAt carries the year the record omits', parsed.results[1]!.completedAt, '20260831113141');
 
 console.log('\n[5] Result file — alarm flags and multiple records in one transfer');
 const FLAGGED = '0904270831TP             G2905          10!01.000)  114.2  000}    84.5  0C0NQ}$  113.0  0C0NQ}|**250*    ]';

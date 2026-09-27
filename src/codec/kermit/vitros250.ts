@@ -155,12 +155,20 @@ export interface Vitros250Record {
 }
 
 /**
- * A result is reportable only when the value field actually carries a number.
- * The analyzer fills the field with text such as "NO RESULT" for an assay it
- * could not complete, and filing that as a value would put a non-numeric
- * string into the patient's record.
+ * Only a value field that actually carries a number is filable. The analyzer
+ * fills the field with "NO RESULT" for an assay it could not complete, and
+ * that block is still parsed — as a VOID result (mapper.isVoidResult) with the
+ * analyzer's condition flags in abnormalFlag — so the connector can say WHICH
+ * assay failed and why. Dropping it here left the lab with "results: 0" and
+ * nothing to act on: PL2609220007 (2026-09-22) came back three times as
+ * "NO RESULT 060MEPF / 060MENSPF" and read as "the barcode is not being
+ * read", when the analyzer had read it and run it. Assay 76 in particular
+ * has answered 060MENSPF on every run in every capture (SF2608310014 in the
+ * legacy log, 5 of 5 PL samples on 21–22 Sep). The void never reaches HMIS:
+ * toResultUploads drops it at intake and the delivery join skips it.
  */
 const hasNumber = (v: string): boolean => /\d/.test(v);
+const NO_RESULT = 'NO RESULT';
 
 /** Build YYYYMMDDHHMMSS from the record's HHMMSS+MMDD stamp, which omits the year. */
 function completedAt(stamp: string, now = new Date()): string | null {
@@ -191,17 +199,22 @@ export function parseResultRecord(rec: string, now = new Date()): Vitros250Recor
   for (const block of body.split(BLOCK_END)) {
     if (block.length < 1 + VALUE_WIDTH) continue;
     const value = block.slice(1, 1 + VALUE_WIDTH).trim();
-    if (!hasNumber(value)) continue; // "NO RESULT" and friends
     const alarm = block.slice(1 + VALUE_WIDTH).trim();
+    // Not a number: a void. "NO RESULT" is kept verbatim (isVoidResult names
+    // it); any other placeholder text becomes the empty value, which is void
+    // too — so nothing non-numeric can ever be filed from here.
+    const numeric = hasNumber(value);
     results.push({
       sampleId,
       testCode: decodeTestCode(block[0]!),
       // Values arrive as "122." / ".7" / "1.09"; drop the bare trailing point so
       // HMIS receives "122" rather than "122.".
-      value: value.replace(/\.$/, ''),
+      value: numeric ? value.replace(/\.$/, '') : value.toUpperCase() === NO_RESULT ? NO_RESULT : '',
       unit: null,
       referenceRange: null,
-      abnormalFlag: alarm && alarm !== NO_ALARM ? alarm : null,
+      // On a void the field is the analyzer's condition code ("060MENSPF"),
+      // the only clue it gives to why — keep it even when it reads 000.
+      abnormalFlag: alarm && (!numeric || alarm !== NO_ALARM) ? alarm : null,
       status: 'F',
       completedAt: when,
       instrument: null,

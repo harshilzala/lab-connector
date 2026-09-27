@@ -131,19 +131,42 @@ export class OrderStore {
       source,
     };
 
+    // ROWS ARE KEYED ON THE PARAMETER, NOT ON THE IDENTIFIER ALONE.
+    //
+    // One HMIS identifier can name TWO parameters of the same service, and
+    // then keeping one row per identifier silently throws the other away.
+    // PL2609240006, 24 Sep 2026: HMIS offered service 3141 with both
+    // "RBC" #2152 (the peripheral-smear line) and "RBC" #2124 (RBC COUNT),
+    // and both "WBC" #2166 and "WBC" #2123 — 26 rows. Keyed on the
+    // identifier, 24 were stored and #2124 and #2123 were gone, because the
+    // gateway returns the rows in a different order on every poll and the
+    // last one of a pair won. #2152 is in that analyzer's
+    // excludeParameterIds (it must never be filed into), so the instrument's
+    // RBC then matched nothing, the "RBC COUNT" alias matched nothing, and
+    // fillMissingOrderRows invented a row — which HMIS accepted at the API
+    // and which never appeared on the report. "RBC Count not transferred",
+    // intermittently, depending on which row won the coin flip that poll.
+    //
+    // With the parameter in the key both rows survive, and
+    // excludeParameterIds then does exactly what it documents: RBC resolves
+    // to #2124 and WBC to #2123, uniquely, carrying HMIS's own identifier
+    // spelling and real labResultId. Nothing is rebuilt and no alias is
+    // needed. A row with no parameterId (the "Numeric" services on the
+    // VITROS) keys on its labResultId instead, which is what distinguishes
+    // those, and falls back to the bare identifier if it has neither.
     const byCode = new Map<string, MirthAcknowledgeItem>();
-    for (const row of order.rows) byCode.set(codeKey(row.identifier), row);
+    for (const row of order.rows) byCode.set(rowKey(row), row);
     const downloaded = new Set(order.downloaded.map(codeKey));
 
     let changed = existing === null;
     for (const row of pending.ackItems) {
-      const k = codeKey(row.identifier);
+      const k = rowKey(row);
       if (!k) continue;
       const have = byCode.get(k);
       if (have && sameRow(have, row)) continue;
       if (have && have.labResultId !== row.labResultId) {
         // Re-ordered: the instrument must run it again.
-        downloaded.delete(k);
+        downloaded.delete(codeKey(row.identifier));
       }
       byCode.set(k, row);
       changed = true;
@@ -164,7 +187,18 @@ export class OrderStore {
     }
 
     order.rows = [...byCode.values()];
-    order.testCodes = order.rows.map((r) => r.identifier);
+    // One entry per CODE, even though two rows may now share one: testCodes is
+    // what the analyzer is programmed with and what "waiting" is counted from,
+    // and the same assay must not be asked for twice.
+    const codesSeen = new Set<string>();
+    order.testCodes = order.rows
+      .map((r) => r.identifier)
+      .filter((c) => {
+        const k = codeKey(c);
+        if (!k || codesSeen.has(k)) return false;
+        codesSeen.add(k);
+        return true;
+      });
     order.downloaded = order.downloaded.filter((c) => downloaded.has(codeKey(c)));
     const skip = opts.neverDownload ?? new Set<string>();
     const newCodes = order.testCodes.filter((c) => !downloaded.has(codeKey(c)) && !skip.has(codeKey(c)));
@@ -292,6 +326,28 @@ export class OrderStore {
       return [];
     }
   }
+}
+
+/**
+ * Identity of one order row within a sample: the identifier plus the PARAMETER
+ * it belongs to, and nothing else.
+ *
+ * Two rows of one service can share an identifier and differ only by
+ * parameterId — HMIS names both #2152 and #2124 "RBC" (see the note in
+ * upsert) — so the identifier alone is not an identity and both must survive.
+ *
+ * labResultId is deliberately NOT part of the key. A re-order of the same test
+ * arrives as the same identifier and parameter with a NEW labResultId, and it
+ * must REPLACE the old row so the instrument is asked to run it again
+ * (test/order-store.test.ts). Keying on it left the stale row in place beside
+ * the new one and the re-order was never offered. Rows carrying no
+ * parameterId — the ECiQ's and VITROS's "Numeric" services — therefore share
+ * one bucket per code, which is what they had before and all that can be told
+ * apart about them.
+ */
+function rowKey(row: MirthAcknowledgeItem): string {
+  const k = codeKey(row.identifier);
+  return k ? `${k}#${row.parameterId ?? ''}` : '';
 }
 
 function sameRow(a: MirthAcknowledgeItem, b: MirthAcknowledgeItem): boolean {

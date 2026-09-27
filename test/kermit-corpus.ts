@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { KermitDecoder, checksum, tochar, unquote } from '../src/codec/kermit/packets.js';
 import { buildOrderRecord, parseOrderRecord, parseResultFile } from '../src/codec/kermit/vitros250.js';
+import { isVoidResult } from '../src/mapping/mapper.js';
 
 // =============================================================================
 // CORPUS REPLAY — run the ENTIRE production capture of the legacy VITROS 250
@@ -171,11 +172,11 @@ for (const run of rx.runs) {
     values++;
     if (r.abnormalFlag) flagged++;
     samples.add(r.sampleId);
-    if (!/\d/.test(r.value)) noResult++;
+    if (!/\d/.test(r.value) && !isVoidResult(r.value)) noResult++;
   }
 }
 check('parsed results from every transmission', values > 0, `${values} results across ${samples.size} samples`);
-check('no non-numeric value was filed', noResult === 0, `bad=${noResult}`);
+check('no non-numeric value is filable (voids excepted)', noResult === 0, `bad=${noResult}`);
 console.log(`      ${records} records, ${values} results, ${flagged} carrying alarm flags`);
 
 console.log(failures ? `\n${B} corpus replay FAILED (${failures})\n` : `\n${G} corpus replay clean\n`);

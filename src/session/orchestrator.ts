@@ -419,7 +419,7 @@ export class AnalyzerRuntime {
       this.log.info(
         {
           codes: this.equipmentCodes(),
-          siteId: this.cfg.siteId ?? this.hmis.defaultSiteId ?? null,
+          siteId: this.cfg.siteId ?? this.hmis.siteId ?? null,
           intervalMs,
           lookbackDays,
           download,
@@ -1013,10 +1013,17 @@ export class AnalyzerRuntime {
       const voids = msg.results.filter((r) => isVoidResult(r.value));
       if (voids.length) {
         this.log.warn(
-          { samples: [...new Set(voids.map((r) => r.sampleId))], codes: voids.map((r) => r.testCode) },
+          {
+            samples: [...new Set(voids.map((r) => r.sampleId))],
+            // With the analyzer's own condition code where it gives one — the
+            // VITROS 250's "76 (060MENSPF)" is the difference between a short
+            // sample and an assay the instrument cannot run at all.
+            codes: voids.map((r) => (r.abnormalFlag ? `${r.testCode} (${r.abnormalFlag})` : r.testCode)),
+          },
           'analyzer reported no value for these assays — not filed; the rerun will file',
         );
       }
+      this.reportOutstandingProgrammedAssays(msg);
       const uploads = toResultUploads(this.cfg, msg);
       for (const full of uploads) {
         // A control run has no order row in HMIS. Filing it would query pending
@@ -1056,6 +1063,42 @@ export class AnalyzerRuntime {
         this.spool.enqueue(u, u.messageId); // messageId is deterministic → idempotent
         this.log.info({ barcode: u.barcode, count: u.results.length, qc: u.isQc }, 'results queued for upload');
       }
+    }
+  }
+
+  /**
+   * Name the assays an analyzer was PROGRAMMED with and then answered without.
+   *
+   * An assay the instrument simply omits — no value and not even the
+   * "NO RESULT" placeholder — leaves no trace anywhere: the sample files its
+   * other values, HMIS keeps the missing row pending for ever, and the lab
+   * reasonably concludes the worklist never reached the machine at all. That
+   * is what "the VITROS 250 is working one-directional" meant on 2026-09-23.
+   * It was not: between 16 and 23 Sep every one of 10/10 sample programs was
+   * acknowledged packet by packet and every result came back on the same
+   * barcode. What did not come back were particular ASSAYS — 107, 108 and 109
+   * (the calculated members of HMIS service 3221) programmed 7 times each and
+   * returned zero times, while 36, 37 and 89 on the very same tubes filed
+   * normally, and 76 programmed 29 times across 12 samples with never a value.
+   *
+   * So the difference the log must show is "the order reached the analyzer and
+   * this assay did not run" versus "the order never got there". Logged per
+   * transmission, which is also per rerun: an assay still missing on the third
+   * run of a tube is worth saying three times.
+   */
+  private reportOutstandingProgrammedAssays(msg: ParsedMessage): void {
+    for (const sampleId of new Set(msg.results.map((r) => r.sampleId))) {
+      const order = this.orders.get(normalizeBarcode(sampleId));
+      if (!order?.downloaded.length) continue; // never programmed from here
+      const returned = new Set(
+        msg.results.filter((r) => r.sampleId === sampleId).map((r) => codeKey(r.testCode)),
+      );
+      const outstanding = order.downloaded.filter((c) => !returned.has(codeKey(c)));
+      if (!outstanding.length) continue;
+      this.log.warn(
+        { barcode: order.sampleId, outstanding, returned: [...returned] },
+        'analyzer answered this sample without these programmed assays — the order did reach it; these assays did not run',
+      );
     }
   }
 

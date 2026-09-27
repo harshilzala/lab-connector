@@ -367,6 +367,30 @@ const VITROS_ECIQ: AnalyzerProfile = {
 //     the block as qc.patientPrefixes and orderPoll.downloadPrefixes — the
 //     Cancer site measured 95% of HMIS's rows under this eqCode were for tubes
 //     the instrument never sees.
+//   • AN UNKNOWN ASSAY CODE DISCARDS THE WHOLE SAMPLE PROGRAM, silently. The
+//     analyzer does not reject the file — Kermit acknowledges every packet —
+//     it simply does not create the sample, so the tube has to be keyed in by
+//     hand and the interface looks one-directional for exactly those panels.
+//     Measured at Prahlad Nagar over 20–23 Sep 2026 in the fluid-type byte of
+//     the result record (offset 43), which reads '5' on a sample the analyzer
+//     took from a host program and '0' on one an operator typed:
+//
+//         program named 107/108/109    4 results, fluid '0' — 4 of 4 re-keyed
+//         program named none of them  25 results, fluid '5' — 23 of 25 ran
+//                                      from the download (the 2 exceptions are
+//                                      the same tube on 20 Sep, a day 4 of 6
+//                                      downloads failed on ACK timeouts)
+//
+//     Shela saw it first, 16–19 Jun and 16–17 Sep 2026, and its capture holds
+//     the cure: the same samples re-sent WITHOUT 107/108/109 all ran from the
+//     download (test/vitros250-program.test.ts).
+//   • 107, 108 and 109 are HMIS's own numbering for the DERIVED members of
+//     service 3221 — the panel whose measured assays are 36, 37 and 89, which
+//     this analyzer returns normally on the very same tube. It has no assay at
+//     those numbers, never answers them, and never even sends the "NO RESULT"
+//     placeholder for them (0 of 7 programmes each, 16–23 Sep). They are
+//     excluded from the DOWNLOAD only: their HMIS rows are still cached, so a
+//     value entered elsewhere still files against them.
 const VITROS_250: AnalyzerProfile = {
   description: 'Ortho/QuidelOrtho VITROS 250 chemistry, KERMIT file transfer over serial; reached through a Moxa NPort the connector dials',
   defaults: {
@@ -374,7 +398,7 @@ const VITROS_250: AnalyzerProfile = {
     transport: { type: 'tcp', mode: 'client' },
     sendDemographics: true,
     hostQuery: false,
-    orderPoll: { enabled: true, download: true },
+    orderPoll: { enabled: true, download: true, excludeTestCodes: ['107', '108', '109'] },
     qc: { sampleIdPrefixes: ['QC', 'QC-', 'CTRL', 'CONTROL', '$'], upload: false },
     kermit: {
       ackTimeoutMs: 10000,
