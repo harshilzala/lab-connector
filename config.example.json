@@ -58,6 +58,42 @@
     "password": ""
   },
 
+  // Auto Certify: replaces the old Certify_Results Windows service
+  // (Auto_Certify.exe). Each run reads the HIS Oracle database for
+  // machine-interfaced results that are ready for sign-off and certifies each
+  // one through the HIS portal:
+  //   GET <baseUrl><certifyPath>?labresultid=<id>           whole result
+  //   GET <baseUrl><certifyPath>?labparameterresultid=<id>  per parameter, once none
+  //                                                         of the result's parameters is
+  //                                                         still in parameterResultStatus
+  // It certifies patient results with nobody reviewing them, so it is OFF
+  // until enabled. Stop the old service first, or both of them certify the
+  // same results. The Oracle password can come from AUTOCERTIFY_ORACLE_PASSWORD
+  // in the environment instead of this file. Console page: /auto-certify.
+  //
+  // Auto-Certify-only install: with "enabled": true, the "analyzers" list and
+  // the "hmis" block can both be left out. The connector then runs no analyzer
+  // links, only the certify job and the console.
+  "autoCertify": {
+    "enabled": false,
+    "intervalSeconds": 30,
+    "baseUrl": "http://his-portal.example-hospital.local:8050",
+    "certifyPath": "/live/portal/labresult/autocertify",
+    "timeoutMs": 15000,
+    "siteId": "2",                        // LR.siteid (old SiteId)
+    "equipmentIds": ["00000000"],         // ES.equipmentid (old EquipmentIds)
+    "resultStatus": ["0000000", "000"],   // LR.result_status (old ResultStatus)
+    "parameterResultStatus": ["0000"],    // LRP.parameterresultstatus that HOLDS a result back until the analyzer finishes it (old ParameterResultStatus)
+    "lookbackDays": 2,                    // accepted today or in the previous N days
+    "requireHod": true,                   // department must have an HOD
+    "oracle": {
+      "user": "",
+      "password": "",
+      "connectString": "db-host:1521/service_name"
+    },
+    "logFile": "./logs/autocertify.log"
+  },
+
   "analyzers": [
     {
       // ---------------------------------------------------------------------

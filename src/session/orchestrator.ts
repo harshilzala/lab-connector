@@ -99,6 +99,20 @@ export interface AnalyzerStatus {
   orders: OrderPollStatus;
   /** What this machine is scoped to send — the console's "parameters" line. */
   interface: InterfaceScope;
+  /** The same scope checked against what HMIS has actually offered, which is
+   *  what the console's parameter chips are coloured from. */
+  filter: FilterScope;
+}
+
+export interface FilterScope {
+  /** allowTestCodes as configured; empty means "no allow-list". */
+  allow: string[];
+  /** Instrument channels configured as non-results. */
+  ignore: string[];
+  /** HMIS identifiers this analyzer's pending rows have actually carried. An
+   *  allowed code missing from here is a master-data gap, not a wiring fault —
+   *  the console shows those amber rather than hiding them. */
+  hmis: string[];
 }
 
 export interface InterfaceScope {
@@ -560,12 +574,25 @@ export class AnalyzerRuntime {
               ipAddress: this.ackIpAddress,
               portNo: this.ackPortNo,
             });
-            for (const [, pending] of groups) {
+            for (const [, offered] of groups) {
               samples++;
+              const pending = this.interfacedOnly(offered);
+              if (!pending.found) {
+                // Every row HMIS raised for this tube is for a parameter this
+                // interface does not carry — nothing to store, nothing to wait
+                // for, and nothing to acknowledge.
+                notInterfaced++;
+                continue;
+              }
               // The poll is where a complete panel is most likely to be seen, so
               // it is the catalogue's main source.
               this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
-              const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll');
+              // `neverDownload` (orderPoll.excludeTestCodes) has to be passed
+              // here as well as on the query path: the row is stored either way
+              // so a result can still be joined, but the code must not come back
+              // as waiting to be programmed. Leaving it off is what put the
+              // derived values into the VITROS 250's sample program.
+              const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll', { neverDownload });
               if (!download || newCodes.length === 0) continue;
               if (!downloadable(order.sampleId)) {
                 // The gateway lists this barcode under our eqCode, but the
@@ -585,11 +612,17 @@ export class AnalyzerRuntime {
                 held++;
                 continue;
               }
+              // What goes on the wire. An analyzer that keeps ONE program per
+              // sample and lets a later download replace it (VITROS 250, see
+              // KermitLink.downloadReplacesProgram) must be given the whole
+              // panel every time — a delta of the newly seen tests would wipe
+              // the ones it already had. Everything else takes just the delta.
+              const codes = this.link.downloadReplacesProgram ? this.programmable(order.testCodes) : newCodes;
               try {
                 await this.link.sendOrders([
                   {
                     sampleId: order.sampleId,
-                    testCodes: newCodes,
+                    testCodes: codes,
                     priority: order.priority,
                     patient: this.cfg.sendDemographics ? order.patient : null,
                     specimenType: order.specimenType,
@@ -1191,7 +1224,11 @@ export class AnalyzerRuntime {
         }),
       );
     }
-    const merged = mergePending(parts);
+    // Same door as the poll: a row for a parameter this interface does not carry
+    // is not stored, not waited for and not acknowledged, whichever path fetched
+    // it. Filtering in both places is what keeps a host-query answer and a poll
+    // answer describing the same tube identically.
+    const merged = this.interfacedOnly(mergePending(parts));
     this.parameters.learn(merged.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
     return merged;
   }

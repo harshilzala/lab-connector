@@ -11,8 +11,8 @@
 
   That is the point of a force stop, but it means "just start it again" has to
   undo all three. This script does exactly that, in the reverse order, and is
-  what Lab-Interface.bat and magic\magic-start.bat call when they find the
-  connector installed as a Windows service.
+  what magic\magic-start.bat calls when it finds the connector installed as
+  a Windows service.
 
   Windows lets only administrators start a service or change its start type by
   default. service\grant-user-control.ps1 (run once, elevated) gives
@@ -190,7 +190,7 @@ $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
 })
 
 if ($tasks.Count -eq 0) {
-  Write-Step '[2/3] watchdog: no watchdog task is registered (Lab-Interface.bat registers one).'
+  Write-Step '[2/3] watchdog: no watchdog task is registered (magic\magic-add-to-startup.bat registers one).'
 } else {
   foreach ($task in $tasks) {
     if ($task.State -ne 'Disabled') {

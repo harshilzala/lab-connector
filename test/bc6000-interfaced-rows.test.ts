@@ -70,6 +70,10 @@ const baseCfg = {
   id: 'bc6000-rows-test',
   equipmentCode: 'ZCCEQ004',
   extraEquipmentCodes: [],
+  // Schema fields with defaults still have to be present in a hand-built
+  // fixture: nothing runs it through the zod schema, so an omission surfaces
+  // as a TypeError inside the poll rather than a config error.
+  siteIds: [],
   equipmentId: 30285205,
   protocol: 'hl7',
   transport: { type: 'tcp', mode: 'server', host: '127.0.0.1', port: 16060 },
@@ -85,7 +89,7 @@ const baseCfg = {
   kermit: { ackTimeoutMs: 10000, maxRetries: 5, interPacketDelayMs: 0, interTransferDelayMs: 0 },
   filing: { mode: 'queue', passIntervalMs: 15000, recheckMs: 300000, keepFiledDays: 2 },
   hl7: { sendingApp: 'LIS', sendingFacility: '', charset: 'UNICODE', ack: true, valueTypes: ['NM'], encoding: 'utf8', idleFlushMs: 0 },
-  orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: false, downloadPrefixes: [] },
+  orderPoll: { enabled: false, intervalMs: 30000, lookbackDays: 0, download: false, downloadPrefixes: [], excludeTestCodes: [] },
 } as unknown as AnalyzerConfig;
 
 /** One poll tick; returns the identifiers stored per barcode. */

@@ -73,6 +73,10 @@ const cfg = {
   id: 'force-test',
   equipmentCode: 'ZHPN001',
   extraEquipmentCodes: [],
+  // Schema fields with defaults still have to be present in a hand-built
+  // fixture: nothing runs it through the zod schema, so an omission surfaces
+  // as a TypeError inside the poll rather than a config error.
+  siteIds: [],
   equipmentId: 224302864,
   protocol: 'hl7',
   transport: { type: 'tcp', mode: 'client', host: '127.0.0.1', port: 15255 },

@@ -4,8 +4,8 @@
 // so a plain .js file is treated as ESM and `module.exports` would throw. PM2
 // reads CommonJS config, hence the .cjs extension.
 //
-// Day to day this is driven by Lab-Interface.bat (start/redeploy) and
-// Lab-Interface-stop.bat (stop), not by the npm scripts below.
+// Day to day this is driven by magic\magic-start.bat (start/redeploy) and
+// magic\magic-stop.bat (stop), not by the npm scripts below.
 //
 // Build + start together:   npm run pm2:start      (tsc, then pm2 start this)
 // Redeploy after edits:     npm run pm2:restart    (tsc, then pm2 restart)

@@ -70,6 +70,10 @@ const baseCfg = {
   id: 'vitros-250-program-test',
   equipmentCode: 'ZHFC02',
   extraEquipmentCodes: [],
+  // Schema fields with defaults still have to be present in a hand-built
+  // fixture: nothing runs it through the zod schema, so an omission surfaces
+  // as a TypeError inside the poll rather than a config error.
+  siteIds: [],
   equipmentId: 177336856,
   protocol: 'kermit',
   transport: { type: 'tcp', mode: 'client', host: '127.0.0.1', port: 15254 },

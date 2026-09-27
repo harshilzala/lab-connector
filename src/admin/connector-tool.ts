@@ -1,4 +1,5 @@
 import { BASE_CSS, FONT_LINK } from './theme.js';
+import { SHELL_CSS, SHELL_JS, renderSidebar } from './shell.js';
 
 // =============================================================================
 // CONNECTOR TOOL — the universal monitor.
@@ -29,7 +30,7 @@ const PAGE_CSS = `
 body { display:flex; flex-direction:column; min-height:100vh; }
 
 .topbar { position:sticky; top:0; z-index:10; background:#fff; border-bottom:1px solid var(--line); box-shadow:0 1px 3px rgba(54,50,50,.04); }
-.topbar-inner { max-width:1240px; margin:0 auto; padding:12px 24px; display:flex; align-items:center; gap:18px; }
+.topbar-inner { width:100%; padding:12px 28px; display:flex; align-items:center; gap:18px; }
 .brand { display:flex; align-items:center; gap:14px; min-width:0; }
 .brand .divider { width:1px; height:34px; background:var(--line); }
 .brand h1 { font-size:17px; letter-spacing:-.2px; }
@@ -40,7 +41,7 @@ body { display:flex; flex-direction:column; min-height:100vh; }
 .who { display:flex; align-items:center; gap:8px; padding:5px 12px 5px 6px; background:var(--teal-soft); border-radius:999px; font-size:13px; font-weight:700; color:var(--teal-700); }
 .who .avatar { width:26px; height:26px; border-radius:50%; display:grid; place-items:center; background:var(--teal); color:#fff; font-size:12px; font-weight:800; }
 
-main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40px; }
+main { flex:1; width:100%; padding:26px 28px 40px; }
 
 .btn { border:0; cursor:pointer; font:800 13px/1 var(--font); padding:10px 16px; border-radius:9px; background:var(--teal); color:#fff; transition:background .15s; }
 .btn:hover { background:var(--teal-600); }
@@ -153,9 +154,10 @@ export function renderConnectorTool(o: ConnectorToolOptions): string {
 <meta name="robots" content="noindex, nofollow" />
 <title>Connector Tool &middot; Lab Connector</title>
 ${FONT_LINK}
-<style>${BASE_CSS}${PAGE_CSS}</style>
+<style>${BASE_CSS}${SHELL_CSS}${PAGE_CSS}</style>
 </head>
 <body>
+${renderSidebar('connector')}
 <div class="brandbar"></div>
 
 <header class="topbar">
@@ -170,11 +172,7 @@ ${FONT_LINK}
     </div>
     <div class="spacer"></div>
     <div class="tools">
-      <a class="btn btn-ghost btn-sm" href="/">&larr; Dashboard</a>
       <span class="who"><span class="avatar">${initial}</span>${esc(o.username)}</span>
-      <form method="post" action="/logout" style="margin:0">
-        <button class="btn btn-ghost btn-sm" type="submit">Sign out</button>
-      </form>
     </div>
   </div>
 </header>
@@ -647,6 +645,7 @@ loadProtocols();
 poll();
 setInterval(poll, 1500);
 </script>
+<script>${SHELL_JS}</script>
 </body>
 </html>`;
 }

@@ -97,7 +97,12 @@ export class HmisClient {
     const params = new URLSearchParams();
     if (q.sampleId) params.set('sampleId', q.sampleId);
     if (q.eqCode) params.set('eqCode', q.eqCode);
-    if (q.siteId) params.set('siteId', q.siteId);
+    // Fall back to the site-wide id when the caller did not name one. An
+    // explicit q.siteId still wins, so the orchestrator's per-analyzer site is
+    // unaffected — this only stops a caller that omits it from polling HMIS
+    // UNSCOPED, which is how CANCER "ZC" tubes once reached the VITROS 250.
+    const siteId = q.siteId ?? this.opts.siteId;
+    if (siteId) params.set('siteId', siteId);
     if (q.showCulture !== undefined) params.set('showCulture', String(q.showCulture));
     if (q.date) params.set('date', q.date);
 

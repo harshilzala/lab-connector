@@ -441,11 +441,87 @@ const AnalyzerSchema = z.object({
   gh900: Gh900Options.default({}),
 });
 
+// Oracle ids are NUMBER columns. Only digits are accepted, because every one of
+// these is bound into the candidate query.
+const OracleId = z
+  .union([z.string(), z.number()])
+  .transform(String)
+  .refine((s) => /^\d+$/.test(s.trim()), 'must be a numeric id')
+  .transform((s) => s.trim());
+
+/**
+ * Auto Certify: the port of the old Certify_Results Windows service
+ * (Auto_Certify.exe). On every tick it reads the HIS Oracle database for
+ * machine-interfaced results that are waiting for sign-off, then certifies each
+ * one through the HIS portal's autocertify endpoint. The portal does the
+ * certification; this job never writes to Oracle.
+ */
+const AutoCertifySchema = z
+  .object({
+    /** Off by default: this certifies patient results with nobody reviewing them. */
+    enabled: z.boolean().default(false),
+    /** Time between runs (the old service: a 30 s timer). A run is never
+     *  overlapped by the next: the next one is timed from the end of this one. */
+    intervalSeconds: z.number().int().min(10).default(30),
+    /** HIS portal root, e.g. http://98.70.1.180:8050 (old: BaseURL). */
+    baseUrl: z.string().url().optional(),
+    /** GET <baseUrl><certifyPath>?labresultid=… | ?labparameterresultid=… */
+    certifyPath: z.string().default('/live/portal/labresult/autocertify'),
+    timeoutMs: z.number().int().positive().default(15000),
+    /** LR.siteid (old: SiteId). */
+    siteId: OracleId.optional(),
+    /** ES.equipmentid — the HIS equipment whose results are certified (old: EquipmentIds). */
+    equipmentIds: z.array(OracleId).default([]),
+    /** LR.result_status values that mean "ready to certify" (old: ResultStatus). */
+    resultStatus: z.array(OracleId).default([]),
+    /** LRP.parameterresultstatus values that HOLD a result back (old:
+     *  ParameterResultStatus). While any of the equipment's parameters of a
+     *  result is still in one of these, the result waits. Once none is, every
+     *  parameter row of the result is certified. */
+    parameterResultStatus: z.array(OracleId).default([]),
+    /** accepted_date window: today plus this many previous calendar days (old: fixed at 2). */
+    lookbackDays: z.number().int().nonnegative().default(2),
+    /** Only certify for departments that have an HOD (old: always on). */
+    requireHod: z.boolean().default(true),
+    /** HIS Oracle database (old: OracleConnection). connectString is
+     *  host:port/service. The password can come from AUTOCERTIFY_ORACLE_PASSWORD
+     *  in .env instead, which keeps it out of config.json. */
+    oracle: z
+      .object({
+        user: z.string().default(''),
+        password: z.string().default(''),
+        connectString: z.string().default(''),
+      })
+      .default({ user: '', password: '', connectString: '' }),
+    /** One JSON line per certify call, one file per day (old: LogFolder). */
+    logFile: z.string().nullable().default('./logs/autocertify.log'),
+    /** How many recent certify attempts the console keeps in memory. */
+    historySize: z.number().int().positive().default(300),
+  })
+  .default({})
+  .superRefine((c, ctx) => {
+    if (!c.enabled) return;
+    const need = (ok: unknown, path: string, message: string) => {
+      if (!ok) ctx.addIssue({ code: z.ZodIssueCode.custom, path: path.split('.'), message });
+    };
+    need(c.baseUrl, 'baseUrl', 'required when autoCertify is enabled');
+    need(c.siteId, 'siteId', 'required when autoCertify is enabled');
+    need(c.equipmentIds.length, 'equipmentIds', 'list at least one equipment id');
+    need(c.resultStatus.length, 'resultStatus', 'list at least one result status');
+    need(c.parameterResultStatus.length, 'parameterResultStatus', 'list at least one parameter result status');
+    need(c.oracle.user, 'oracle.user', 'required when autoCertify is enabled');
+    need(c.oracle.password, 'oracle.password', 'required (or set AUTOCERTIFY_ORACLE_PASSWORD)');
+    need(c.oracle.connectString, 'oracle.connectString', 'required when autoCertify is enabled');
+  });
+
 const ConfigSchema = z.object({
   logLevel: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),
   spoolDir: z.string().default('./spool'),
   hmis: z.object({
-    baseUrl: z.string().url(),
+    /** The HMIS lab gateway the analyzers file into. Required when any
+     *  analyzer is configured. An Auto-Certify-only install leaves the whole
+     *  hmis block out: Auto Certify talks to the HIS portal (autoCertify.baseUrl). */
+    baseUrl: z.union([z.string().url(), z.literal('')]).default(''),
     /** HMIS site this installation serves. Sent as `siteId` on every pending
      *  call so the gateway returns only this site's orders — on a multi-site
      *  HMIS the eqCode alone does not pick the right order. Leave it unset
@@ -475,7 +551,7 @@ const ConfigSchema = z.object({
     /** A day's file that grows past this continues in a numbered part
      *  (hmis-YYYY-MM-DD.1.log). Nothing is discarded by size. */
     auditMaxBytes: z.number().int().positive().default(10 * 1024 * 1024),
-  }),
+  }).default({}),
   /** Housekeeping: how long logs and unfiled spool items are kept on disk. */
   retention: z
     .object({
@@ -519,12 +595,27 @@ const ConfigSchema = z.object({
       password: z.string().default(''),
     })
     .default({ password: '' }),
-  analyzers: z.array(AnalyzerSchema).min(1),
+  autoCertify: AutoCertifySchema,
+  /** May be empty (or left out) only when autoCertify is enabled: the
+   *  connector then runs as an Auto Certify service with no analyzer links. */
+  analyzers: z.array(AnalyzerSchema).default([]),
+}).superRefine((c, ctx) => {
+  if (!c.analyzers.length && !c.autoCertify.enabled) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['analyzers'],
+      message: 'configure at least one analyzer, or enable autoCertify to run in Auto-Certify-only mode',
+    });
+  }
+  if (c.analyzers.length && !c.hmis.baseUrl) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'baseUrl'], message: 'required when analyzers are configured' });
+  }
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;
 export type AnalyzerConfig = z.infer<typeof AnalyzerSchema>;
 export type TransportConfig = z.infer<typeof TransportSchema>;
+export type AutoCertifyConfig = z.infer<typeof AutoCertifySchema>;
 
 // -----------------------------------------------------------------------------
 // config.json is read as JSONC — JSON plus `//` and `/* */` comments and
@@ -640,6 +731,10 @@ function applyEnvOverrides(raw: any): any {
   if (process.env.LOG_LEVEL) cfg.logLevel = process.env.LOG_LEVEL;
   if (process.env.HMIS_BASE_URL) cfg.hmis = { ...cfg.hmis, baseUrl: process.env.HMIS_BASE_URL };
   if (process.env.ADMIN_AUTH_FILE) cfg.admin = { ...cfg.admin, authFile: process.env.ADMIN_AUTH_FILE };
+  if (process.env.AUTOCERTIFY_ORACLE_PASSWORD) {
+    const ac = cfg.autoCertify ?? {};
+    cfg.autoCertify = { ...ac, oracle: { ...(ac.oracle ?? {}), password: process.env.AUTOCERTIFY_ORACLE_PASSWORD } };
+  }
   return cfg;
 }
 

@@ -8,6 +8,7 @@ import { RetentionSweeper } from './maintenance/retention.js';
 import { AnalyzerRuntime } from './session/orchestrator.js';
 import { AdminServer, type AdminBackend } from './admin/server.js';
 import { AuthStore } from './admin/auth.js';
+import { AutoCertifyService } from './autocertify/service.js';
 
 // Top-level app: one HMIS client, one AnalyzerRuntime per configured analyzer,
 // and the local admin server. Implements AdminBackend so the dashboard can read
@@ -19,11 +20,14 @@ export class Connector implements AdminBackend {
   private readonly auth: AuthStore;
   /** Absent when retention.days is 0 — the sweep is then switched off. */
   private readonly retention?: RetentionSweeper;
+  private readonly autoCertifyService: AutoCertifyService;
 
   constructor(private readonly cfg: AppConfig, private readonly logger: Logger) {
     // Separate from the application log on purpose: this one is the evidence
     // trail for "did HMIS actually take it?", and stays greppable by barcode.
-    const audit = cfg.hmis.auditLog
+    // Not opened in Auto-Certify-only mode (no analyzers): nothing would ever
+    // be written to it.
+    const audit = cfg.hmis.auditLog && cfg.analyzers.length
       ? new HmisAudit(resolve(cfg.hmis.auditLog), logger.child({ mod: 'hmis-audit' }), cfg.hmis.auditMaxBytes)
       : undefined;
 
@@ -62,6 +66,8 @@ export class Connector implements AdminBackend {
       });
     }
 
+    this.autoCertifyService = new AutoCertifyService(cfg.autoCertify, logger.child({ mod: 'auto-certify' }));
+
     this.auth = new AuthStore(cfg.admin.authFile);
     this.admin = new AdminServer(
       this,
@@ -77,11 +83,12 @@ export class Connector implements AdminBackend {
     await this.admin.start();
     // After the runtimes, so a sweep never races the spool dirs being created.
     this.retention?.start();
+    this.autoCertifyService.start();
 
     // A loopback/placeholder HMIS URL starts cleanly but files nothing —
     // results just accumulate in the spool. Say so loudly rather than let a
     // placeholder reach go-live unnoticed.
-    if (/^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:|\/|$)/i.test(this.cfg.hmis.baseUrl)) {
+    if (this.runtimes.size && /^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:|\/|$)/i.test(this.cfg.hmis.baseUrl)) {
       this.logger.warn(
         { baseUrl: this.cfg.hmis.baseUrl },
         'HMIS base URL points at this machine — results will queue in the spool until it is set to the real gateway',
@@ -97,9 +104,18 @@ export class Connector implements AdminBackend {
       );
     }
 
+    if (!this.runtimes.size) {
+      this.logger.info(
+        { autoCertify: this.autoCertifyService.snapshot().config.certifyUrl, dashboard: `http://${this.cfg.admin.host}:${this.cfg.admin.port}/auto-certify` },
+        'lab-connector started in Auto-Certify-only mode (no analyzers configured)',
+      );
+      return;
+    }
+
     this.logger.info(
       {
         analyzers: [...this.runtimes.keys()],
+        autoCertify: this.autoCertifyService.enabled ? 'enabled' : 'disabled',
         hmis: this.cfg.hmis.baseUrl,
         hmisLog: this.cfg.hmis.auditLog ? this.cfg.hmis.auditLog.replace(/(\.[^./\\]+)?$/, '-YYYY-MM-DD$1') : 'disabled',
         wireLogs: `${this.cfg.retention.logDir}/wire-<analyzer>-YYYY-MM-DD.log`,
@@ -112,12 +128,17 @@ export class Connector implements AdminBackend {
 
   async stop(): Promise<void> {
     this.retention?.stop();
+    this.autoCertifyService.stop();
     await this.admin.stop();
     for (const rt of this.runtimes.values()) await rt.stop();
     this.logger.info('lab-connector stopped');
   }
 
   // ---- AdminBackend ---------------------------------------------------------
+  autoCertify(): AutoCertifyService {
+    return this.autoCertifyService;
+  }
+
   statuses() {
     return [...this.runtimes.values()].map((r) => r.status());
   }

@@ -9,7 +9,8 @@ import { runInNewContext } from 'node:vm';
 import { renderDashboard } from '../src/admin/dashboard.js';
 
 const html = renderDashboard({ username: 'Adminx' } as never);
-const script = html.slice(html.indexOf('<script>') + 8, html.lastIndexOf('</script>'));
+// The page's own script is the first one; the sidebar's follows it.
+const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
 
 /** Minimal element: enough for classList toggling and innerHTML capture. */
 const el = (id: string) => {

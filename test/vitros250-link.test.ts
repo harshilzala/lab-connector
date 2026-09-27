@@ -135,7 +135,15 @@ console.log('\n[2] An upload is "in progress" from its S, not from its first D')
   t.send({ seq: 0, type: 'S', data: '~* @-#N1' });
   await tick();
   assert.equal(t.types(), 'Y', `expected only our Y to its S, got ${t.types()}`);
-  assert.equal(t.received[0]!.data, '~* @-#N1', 'the Y to a send-init carries our parameters');
+  // EMPTY, not our parameters. This assertion used to expect "~* @-#N1" on the
+  // reasoning that a Kermit ACK-to-send-init must carry the answerer's
+  // parameters. The wire says otherwise: the legacy host sent an empty Y on all
+  // 1,598 of its captured receives, and while this link did name parameters, 11
+  // of the 32 result transfers on 16-17 Sep 2026 opened with "0009 INVALID
+  // CONSTRUCTION" / "0008 INVALID SEQUENCE USE" and only landed on the
+  // analyzer's own retry ~13 s later. See the case 'S' comment in link.ts —
+  // do not "restore" the parameters here.
+  assert.equal(t.received[0]!.data, '', 'the Y to a send-init must be empty (see link.ts case S)');
   assert.ok(link.receiving, 'link must count the upload as in progress from S');
 
   // Now the orchestrator wants to download. This used to go out at once —

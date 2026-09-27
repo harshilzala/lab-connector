@@ -21,7 +21,7 @@ rem Work from the connector root - see the note in magic-start.bat.
 cd /d "%~dp0.." || goto no_root
 set "ROOT=%CD%"
 
-rem The same PM2 home the start script and Lab-Interface.bat use. Pointing
+rem The same PM2 home the start script uses. Pointing
 rem somewhere else here would mean talking to a daemon that has never heard of
 rem this app, and reporting "nothing to stop" while it kept running.
 set "PM2_HOME=%ROOT%\.pm2"

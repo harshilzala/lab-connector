@@ -1,4 +1,5 @@
 import { BASE_CSS, FONT_LINK } from './theme.js';
+import { SHELL_CSS, SHELL_JS, renderSidebar } from './shell.js';
 
 // Operations dashboard, styled to the Zydus Hospitals brand (teal #00a5a5 /
 // plum #aa55a0 on white, Nunito Sans). Self-contained apart from the webfont.
@@ -23,7 +24,7 @@ body { display:flex; flex-direction:column; min-height:100vh; }
   box-shadow:0 1px 3px rgba(54,50,50,.04);
 }
 .topbar-inner {
-  max-width:1240px; margin:0 auto; padding:12px 24px;
+  width:100%; padding:12px 28px;
   display:flex; align-items:center; gap:18px;
 }
 .brand { display:flex; align-items:center; gap:14px; min-width:0; }
@@ -42,7 +43,7 @@ body { display:flex; flex-direction:column; min-height:100vh; }
   background:var(--teal); color:#fff; font-size:12px; font-weight:800;
 }
 
-main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40px; }
+main { flex:1; width:100%; padding:26px 28px 40px; }
 
 /* ---- summary tiles ---- */
 .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:16px; margin:0 0 26px; }
@@ -63,7 +64,9 @@ main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40
 .section-head .mut { font-size:13px; }
 
 /* ---- analyzer cards ---- */
-.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(400px,1fr)); gap:18px; }
+/* auto-fit, not auto-fill: on a wide screen the cards stretch to fill the row
+   instead of leaving empty columns beside them. */
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(400px,1fr)); gap:18px; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden; }
 .card-top { padding:16px 18px 14px; border-bottom:1px solid var(--line); }
 .card-title { display:flex; align-items:center; justify-content:space-between; gap:12px; }
@@ -158,10 +161,8 @@ main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40
 .params-t tr.o-nosync .p-state { color:var(--warn); }
 .params-t tr.o-nosync .p-code { color:var(--mut); font-weight:400; }
 .params-t .p-id { color:var(--mut); font-size:11px; }
-.plist summary { cursor:pointer; user-select:none; }
-.plist-body { margin-top:4px; font:12px/1.8 "Cascadia Mono",Consolas,monospace; color:var(--ink); white-space:normal; }
-.plist-body .sep { color:var(--mut); padding:0 5px; }
-.plist-body .p-as { color:var(--mut); font-size:11px; }
+/* "instrument code → the HMIS identifier it is filed as", inside a code chip. */
+.code .p-as { color:var(--mut); font-size:11px; margin-left:3px; }
 
 /* ---- change-password dialog ---- */
 .backdrop { position:fixed; inset:0; background:rgba(54,50,50,.45); display:none; align-items:center; justify-content:center; padding:20px; z-index:50; }
@@ -201,9 +202,10 @@ export function renderDashboard(o: DashboardOptions): string {
 <meta name="robots" content="noindex, nofollow" />
 <title>Lab Connector &middot; Zydus Hospitals</title>
 ${FONT_LINK}
-<style>${BASE_CSS}${PAGE_CSS}</style>
+<style>${BASE_CSS}${SHELL_CSS}${PAGE_CSS}</style>
 </head>
 <body>
+${renderSidebar('dashboard')}
 <div class="brandbar"></div>
 
 <header class="topbar">
@@ -220,11 +222,6 @@ ${FONT_LINK}
     <div class="tools">
       <span class="clock" id="clock"></span>
       <span class="who"><span class="avatar">${initial}</span>${esc(o.username)}</span>
-      <a class="btn btn-ghost btn-sm" href="/connector" title="Identify and connect a new machine">Connector Tool</a>
-      <button class="btn btn-ghost btn-sm" type="button" onclick="openPw()">Change password</button>
-      <form method="post" action="/logout" style="margin:0">
-        <button class="btn btn-ghost btn-sm" type="submit">Sign out</button>
-      </form>
     </div>
   </div>
 </header>
@@ -356,7 +353,15 @@ function ordersLine(o) {
 // HMIS has a parameter for it. Amber: in the list but HMIS has not offered it
 // yet — either a code entered by hand on the instrument (ABL9 FIO2/T) or a
 // spelling HMIS does not know. The struck-through chips are ignoreTestCodes.
-function filterBlock(f) {
+// The second argument is the same machine's InterfaceScope. It carries the two
+// things the chips above cannot show — which instrument codes are filed under a
+// DIFFERENT HMIS name, and which identifiers this machine must never file into.
+// Both are config the operator cannot otherwise see from the console, so they
+// are kept here rather than dropped when the chip view replaced the old summary
+// line. NOTE: this function is emitted INTO a template literal, so neither a
+// backtick nor an unescaped dollar-brace may appear anywhere in here — either
+// one ends the literal and the whole module stops compiling.
+function filterBlock(f, scope) {
   if (!f) return '';
   var seen = {};
   (f.hmis || []).forEach(function (id) { seen[String(id).trim().toUpperCase()] = true; });
@@ -396,6 +401,18 @@ function filterBlock(f) {
               return '<span class="code mut" title="ignoreTestCodes: not a reportable result">' + esc(c) + '</span>';
             }).join('') + '</span></span></div>';
   }
+  var alias = (scope && scope.aliases) || {};
+  var aliased = Object.keys(alias);
+  if (aliased.length) {
+    html += '<div class="kv stack"><span class="k">Filed under another name <span class="mut">(' + aliased.length + ')</span></span>' +
+            '<span class="v"><span class="codes">' + aliased.map(function (c) {
+              return '<span class="code" title="testCodeAliases: the instrument code HMIS knows by a different identifier">' +
+                     esc(c) + '<span class="p-as">&rarr;' + esc(alias[c]) + '</span></span>';
+            }).join('') + '</span></span></div>';
+  }
+  if (scope && scope.excluded && scope.excluded.length) {
+    html += '<div class="kv"><span class="k">Never filed into</span><span class="v">' + esc(scope.excluded.join(', ')) + '</span></div>';
+  }
   return html;
 }
 
@@ -407,7 +424,7 @@ function renderStats(analyzers) {
 
   const tiles = [
     { k: 'Analyzers online', v: online + '/' + analyzers.length,
-      n: online === analyzers.length ? 'All links up' : (analyzers.length - online) + ' link(s) down',
+      n: !analyzers.length ? 'None configured' : online === analyzers.length ? 'All links up' : (analyzers.length - online) + ' link(s) down',
       accent: online === analyzers.length ? '' : 'accent-bad' },
     { k: 'Queued uploads', v: pending, n: 'Awaiting delivery to HMIS',
       accent: pending > 0 ? 'accent-warn' : '' },
@@ -430,6 +447,17 @@ function renderCards(analyzers) {
 
   const grid = document.getElementById('cards');
   grid.classList.toggle('has-max', !!state.max);
+
+  // Auto-Certify-only install: config.json has no analyzers, so there is no
+  // link to show. Say so rather than leave an empty grid.
+  if (!analyzers.length) {
+    grid.innerHTML = '<div class="card"><div class="card-body" style="padding:28px 24px;text-align:center">' +
+      '<h3 style="margin-bottom:6px">No analyzers configured</h3>' +
+      '<div class="mut" style="margin-bottom:16px">This connector is running in Auto-Certify-only mode: it certifies interfaced results in HIS and has no analyzer links. ' +
+      'Add an entry under <code>analyzers</code> in config.json to connect a machine.</div>' +
+      '<a class="btn btn-primary btn-sm" href="/auto-certify">Open Auto Certify</a></div></div>';
+    return;
+  }
 
   // Rebuilding the grid throws away the open panel and replaces it with the
   // "Pick a view above" placeholder, and renderPanel only refills it once its
@@ -465,7 +493,7 @@ function renderCards(analyzers) {
         \${a.link === 'offline' && a.linkError ? '<div class="kv"><span class="k">Link</span><span class="v err">' + esc(a.linkError) + '</span></div>' : ''}
         <div class="kv"><span class="k">\${a.filing === 'staged' ? 'Results' : 'Upload queue'}</span><span class="v">\${queuePill(a)}</span></div>
         <div class="kv"><span class="k">Orders</span><span class="v">\${ordersLine(a.orders)}</span></div>
-        <div class="kv"><span class="k">Parameters</span><span class="v">\${paramsLine(a.interface)}</span></div>
+        \${filterBlock(a.filter, a.interface)}
         <div class="tabs">
           <button type="button" data-a="\${esc(a.id)}" data-t="wire"
                   class="\${state.open === a.id && state.tab === 'wire' ? 'active' : ''}">Wire log</button>
@@ -827,9 +855,16 @@ async function submitPw() {
   btn.disabled = false;
 }
 
+// The sidebar's "Change password" on another page lands here as /#password.
+if (location.hash === '#password') {
+  history.replaceState(null, '', location.pathname);
+  openPw();
+}
+
 refresh();
 setInterval(refresh, 5000);
 </script>
+<script>${SHELL_JS}</script>
 </body>
 </html>`;
 }

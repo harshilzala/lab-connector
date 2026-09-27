@@ -30,7 +30,13 @@ const BARCODE = 'CH2609070001';
 
 const cfg = loadConfig(resolve(root, 'config.json'));
 const analyzer = cfg.analyzers.find((a) => a.id === 'cancer-bc6000');
-if (!analyzer) throw new Error('cancer-bc6000 is not configured');
+// Site replay: it needs cancer-bc6000 in the local config.json. That is a lab-floor
+// artefact, so skip rather than fail when running anywhere else — otherwise a
+// real regression hides behind an environment failure.
+if (!analyzer) {
+  console.log('SKIP: cancer-bc6000 is not in this config.json — site replay test');
+  process.exit(0);
+}
 
 let failures = 0;
 const check = (ok: boolean, msg: string) => {

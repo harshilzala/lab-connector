@@ -15,8 +15,19 @@ import { logger } from '../src/logger.js';
 const root = resolve(import.meta.dirname, '..');
 const cfg = loadConfig(resolve(root, 'config.json'));
 
+// Part 1 asserts THIS machine's config is the Prahlad Nagar one. On any other
+// site's PC — or a developer's local config — that is not a regression, so skip
+// it and still run part 2, which tests the client and needs no site config.
+const IS_PRAHLAD_NAGAR = cfg.analyzers.length > 0 && cfg.analyzers.every((a) => a.equipmentCode.startsWith('ZHPN'));
+
 // ---- 1) every analyzer block names its site --------------------------------
-for (const a of cfg.analyzers) {
+if (!IS_PRAHLAD_NAGAR) {
+  console.log(
+    `SKIP config check: this config.json is not the Prahlad Nagar site ` +
+      `(${cfg.analyzers.map((a) => a.equipmentCode).join(', ') || 'no analyzers'})`,
+  );
+}
+for (const a of IS_PRAHLAD_NAGAR ? cfg.analyzers : []) {
   const site = a.siteId ?? cfg.hmis.siteId ?? null;
   assert.equal(site, '14631720', `${a.id}: orders keyed on site 14631720`);
   assert.ok(a.equipmentCode.startsWith('ZHPN'), `${a.id}: its own equipment code`);

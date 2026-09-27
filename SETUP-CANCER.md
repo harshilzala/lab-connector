@@ -2,7 +2,7 @@
 
 Prepared on this server (`10.12.100.172`, `C:\Users\Appsadmin\Desktop\lab-connector`).
 **Nothing is started and nothing auto-starts.** Start it deliberately with
-`Lab-Interface.bat` once the open items below are closed.
+`magic\magic-start.bat` once the open items below are closed.
 
 ## What was installed
 
@@ -266,7 +266,7 @@ PM2 error: EPERM: operation not permitted, open 'C:\ProgramData\pm2\home\pm2.pid
 
 Every call then left a half-started daemon behind — 177 stray `node.exe`
 daemons had accumulated on 7 September before this was found. The scripts now
-set `PM2_HOME` to `.pm2` beside the connector, and `Lab-Interface.bat` grants
+set `PM2_HOME` to `.pm2` beside the connector, and `magic\magic-start.bat` grants
 `BUILTIN\Users` Modify on the folder tree once (marker: `.pm2\.shared-access`).
 Both are done by the folder's owner and need no elevation. The grant also fixes
 the quieter half of the problem: a second operator could not compile into
@@ -281,7 +281,7 @@ remove it.** On Windows, PM2's daemon sockets are the fixed pipes
 `PM2_HOME`. A pipe created by LocalSystem is reachable only by SYSTEM and by
 elevated administrators, so while that service runs, an ordinary session can
 neither talk to its daemon nor start one of its own, whatever `PM2_HOME` says.
-`Lab-Interface.bat` detects the service and prints what to do:
+`magic\magic-start.bat` detects the service and prints what to do:
 
 ```powershell
 sc.exe stop pm2.exe
@@ -297,7 +297,7 @@ unelevated operation — but then the scripts must be run as administrator.
 The watchdog task is now registered per account
 (`Lab-Interface Watchdog - <user>`), because a task runs only in its owner's
 session and rewriting somebody else's task needs elevation. To stop two
-supervisors ever starting two connectors, `Lab-Interface-startup.cmd` first
+supervisors ever starting two connectors, `magic\magic-startup.cmd` first
 checks whether anything is already listening on the dashboard port and exits if
 so. Keep that port in step with `admin.port` in `config.json`.
 
@@ -342,8 +342,11 @@ log. That is damage on the way to disk, not a codec fault.
   "ABL9 — the interfaced parameter set" above.
 - `test/bc6000-allow-codes.test.ts` — its cross-analyzer check asserted that
   only the BC-6000 was allow-listed; the ABL9 is now scoped too.
-- `Lab-Interface.bat`, `-stop.bat`, `-force-stop.ps1`, `-startup.cmd`,
-  `-remove-startup.bat` — run unelevated for any account: project-local
+- The `Lab-Interface-*.bat` / `.cmd` launchers have been REMOVED; `magic\` is
+  the supported set (`magic-start`, `magic-stop`, `magic-force-stop`,
+  `magic-add-to-startup`). `Lab-Interface-force-stop.ps1` stays — it is the
+  engine `magic-force-stop.bat` runs. They run unelevated for any account:
+  project-local
   `PM2_HOME`, a one-time shared-access grant, a per-account watchdog task, a
   port check that stops two supervisors double-starting the connector, and a
   warning when the LocalSystem PM2 service is present. See "Running without
