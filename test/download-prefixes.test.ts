@@ -67,6 +67,7 @@ const baseCfg = {
   id: 'vitros-250-prefix-test',
   equipmentCode: 'ZCCEQ003',
   extraEquipmentCodes: [],
+  siteIds: [],
   equipmentId: 29688657,
   protocol: 'kermit',
   transport: { type: 'tcp', mode: 'client', host: '127.0.0.1', port: 15254 },

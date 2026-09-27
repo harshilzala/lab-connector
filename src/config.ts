@@ -85,6 +85,20 @@ const AstmOptions = z.object({
    *  those samples. Set it only on an analyzer proven to behave this way — on a
    *  normal instrument it would prefer the patient id over the tube barcode. */
   sampleIdFrom: z.enum(['order', 'patient']).default('order'),
+  /** Which of a result's two values to file when the instrument sends both.
+   *
+   *  The Sysmex U-WAM reports every parameter twice: "8.0^RAW" — the
+   *  instrument's native value, /µl for particles — and "1.4^MAINFORMAT" —
+   *  the reporting format configured on the U-WAM (/HPF, /LPF, and the
+   *  strip's "-" / "4+" / "normal"). "main" files what the lab sees on the
+   *  U-WAM's own screen and printout, so the number in HMIS matches it;
+   *  "raw" files the native value. Two things override this choice, both
+   *  from the wire: a blank half is never filed (the other is), and a
+   *  test-strip GRADE ("-", "+-", "1+" …) is filed over a concentration
+   *  whichever half carries it — C-LEU's grade is in RAW with 25/75/500
+   *  c/µL in MAINFORMAT, C-BIL the reverse, and a pad must sit on one
+   *  scale. Other analyzers send one value and are not affected. */
+  valueFormat: z.enum(['main', 'raw']).default('main'),
 });
 
 /** Radiometer ABL9 SOH…EOT record stream — see src/codec/abl9/link.ts. The
@@ -177,6 +191,14 @@ const AnalyzerSchema = z.object({
   machineId: z.number().int().positive().optional(),
   /** Optional pass-through query parameters for the pending call. */
   siteId: z.string().optional(),
+  /** EVERY HMIS site this analyzer takes tubes from. The pending call is made
+   *  once per site (× each equipment code) and the rows are merged, so a lab
+   *  that runs its neighbours' samples sees all of their orders. Equipment
+   *  codes are shared group-wide (EC010 is mapped at Shela, Ahmedabad, Cancer
+   *  and Anand alike), so a single siteId filter hides the other sites' rows
+   *  and no filter at all returns every site's. Overrides `siteId` and the
+   *  site-wide `hmis.siteIds` when non-empty. */
+  siteIds: z.array(z.union([z.string(), z.number()]).transform(String)).default([]),
   showCulture: z.union([z.string(), z.boolean()]).optional(),
   /** Send today's date (dd-MM-yyyy) as the `date` parameter. Off by default —
    *  an order raised yesterday for a tube run today would otherwise be missed. */
@@ -338,6 +360,18 @@ const AnalyzerSchema = z.object({
    *  patient's report, and a wildcard makes it easy to hit an analyte that was
    *  already in the right unit. */
   testCodeScale: z.record(z.number().finite().positive()).default({}),
+  /** Instrument value → the value HMIS is sent, per assay code, for the
+   *  qualitative results a lab reports as WORDS. The Sysmex U-WAM's strip
+   *  pads arrive as "-", "+-", "1+" … while the report says "Absent",
+   *  "trace", "Negative" / "Positive" (nitrite) and "Normal"
+   *  (urobilinogen) — the lab's table of 2026-09-18, carried by the
+   *  sysmex-uwam profile. The code matches case-insensitively; the value
+   *  matches case-insensitively and EXACTLY — no wildcards, because a wrong
+   *  word on a patient's report must not come from a pattern. A value not
+   *  listed passes through unchanged ("1+" stays "1+"). Applied at delivery
+   *  time, like testCodeAliases, so a corrected map also repairs results
+   *  already waiting in the spool. */
+  testValueMap: z.record(z.record(z.string())).default({}),
   /** Rebuild the order rows HMIS has stopped offering, so a result can still be
    *  filed against the parameter it belongs to.
    *
@@ -418,6 +452,12 @@ const ConfigSchema = z.object({
      *  where one connector serves several sites (see the CANCER config).
      *  An analyzer's own `siteId` still overrides it. */
     siteId: z.union([z.string(), z.number()]).transform(String).optional(),
+    /** The sites this installation serves when there is more than one — the
+     *  Ahmedabad lab runs the Cancer hospital's tubes as well (2 and
+     *  3562087 on the group gateway). Each pending call is repeated per site
+     *  and merged. Takes precedence over `siteId`; an analyzer's own
+     *  `siteIds` / `siteId` still override both. */
+    siteIds: z.array(z.union([z.string(), z.number()]).transform(String)).default([]),
     /** GET — load orders. Query: sampleId, eqCode, siteId, showCulture, date. */
     pendingPath: z.string().default('/mirth/pending'),
     /** POST — acknowledge the rows handed to the analyzer. */

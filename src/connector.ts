@@ -30,6 +30,7 @@ export class Connector implements AdminBackend {
     this.hmis = new HmisClient({
       baseUrl: cfg.hmis.baseUrl,
       siteId: cfg.hmis.siteId,
+      siteIds: cfg.hmis.siteIds,
       pendingPath: cfg.hmis.pendingPath,
       acknowledgePath: cfg.hmis.acknowledgePath,
       resultsPath: cfg.hmis.resultsPath,

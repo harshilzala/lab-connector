@@ -43,6 +43,81 @@ export const DEFAULT_DELIMS: Delimiters = { field: '|', repeat: '\\', component:
 // coefficient. Only the DOSE (or an untyped) row carries the result to file.
 const NON_REPORTABLE_RESULT_TYPES = new Set(['RLU', 'COFF']);
 
+// The Sysmex U-WAM sends every parameter twice, the value tagged with its
+// format in the second component of the result field: "8.0^RAW" (the
+// instrument's native value) and "1.4^MAINFORMAT" (the U-WAM's configured
+// reporting format). One of the pair is filed; see `valueFormat`.
+const VALUE_FORMAT_TAGS: Record<string, ValueFormat> = { RAW: 'raw', MAINFORMAT: 'main' };
+export type ValueFormat = 'main' | 'raw';
+
+/** Split "<value>^<FORMAT>" when the tag is one of the U-WAM's; any other
+ *  value (including one that merely contains a component delimiter) is
+ *  returned whole. */
+function splitValueFormat(field: string, d: Delimiters): { value: string; format: ValueFormat | null } {
+  const c = field.split(d.component);
+  if (c.length === 2) {
+    const format = VALUE_FORMAT_TAGS[(c[1] ?? '').trim().toUpperCase()];
+    if (format) return { value: (c[0] ?? '').trim(), format };
+  }
+  return { value: field.trim(), format: null };
+}
+
+// A test-strip GRADE: "-", "+-", "+", "1+" … "4+", "normal". The UC-3500
+// reads every strip pad on this scale and HMIS registers strip parameters
+// against it; the U-WAM's "main format" for some pads is a concentration
+// instead, and then only for a positive pad. Measured over 193 messages on
+// 2026-09-17/18: C-LEU RAW is the grade ("-" ×124, "1+" ×13, "2+" ×11,
+// "3+" ×14) while MAINFORMAT is blank for every negative and 25 / 75 / 500
+// c/µL for the positives; C-BIL is the mirror image (RAW blank or 0.5 / 1.0
+// mg/dL, MAINFORMAT the grade). Filing the configured half would put "-"
+// and "25 c/µL" on the same parameter.
+const GRADE = /^(-|\+-|-\+|\+|\d\+|normal)$/i;
+const isGrade = (v: string) => GRADE.test(v);
+
+/**
+ * Keep ONE of each RAW/MAINFORMAT pair per parameter:
+ *   1. never a blank half — the other is taken (a parameter blank in both is
+ *      not a result and is dropped);
+ *   2. when exactly one half is a strip GRADE, that half — whichever format
+ *      it came in — so a pad is always filed on one scale (C-LEU from RAW,
+ *      C-BIL from MAINFORMAT);
+ *   3. otherwise the preferred format (`valueFormat`): the UF-4000's
+ *      particle counts are numeric in both halves and MAINFORMAT is the
+ *      /HPF the lab reports.
+ * Results that carried no format tag pass through untouched, in order.
+ */
+function collapseValueFormats(
+  results: InstrumentResult[],
+  formats: Map<InstrumentResult, ValueFormat>,
+  prefer: ValueFormat,
+): InstrumentResult[] {
+  if (formats.size === 0) return results;
+  const out: InstrumentResult[] = [];
+  const slot = new Map<string, number>(); // parameter → index in `out`
+  for (const r of results) {
+    const format = formats.get(r);
+    if (!format) {
+      out.push(r);
+      continue;
+    }
+    const key = `${r.sampleId}\u0000${r.testCode.toUpperCase()}`;
+    const at = slot.get(key);
+    if (at === undefined) {
+      slot.set(key, out.length);
+      out.push(r);
+      continue;
+    }
+    const held = out[at]!;
+    let takeThis: boolean;
+    if (r.value === '') takeThis = false;
+    else if (held.value === '') takeThis = true;
+    else if (isGrade(r.value) !== isGrade(held.value)) takeThis = isGrade(r.value); // the grade half wins
+    else takeThis = format === prefer;
+    if (takeThis) out[at] = r;
+  }
+  return out.filter((r) => r.value !== '');
+}
+
 function detectDelims(lines: string[]): Delimiters {
   const h = lines.find((l) => l.startsWith('H'));
   if (!h || h.length < 6) return DEFAULT_DELIMS;
@@ -72,8 +147,13 @@ const reps = (v: string | undefined, d: Delimiters) => (v ?? '').split(d.repeat)
  */
 function testCodeFromUniversalId(field: string | undefined, d: Delimiters, name?: AstmDialect): string {
   const c = comps(field, d);
-  const raw = c[3] && c[3].trim() ? c[3].trim() : (c.find((x) => x.trim())?.trim() ?? '');
-  return raw ? dialect(name).tests.decode(raw) : '';
+  const { tests } = dialect(name);
+  // Sysmex lands the code one component later ("^^^^RBC^1"); the codec says
+  // where. Falling back to the first non-empty component keeps a layout we
+  // have not seen filing SOMETHING rather than nothing.
+  const at = c[tests.component ?? 3];
+  const raw = at && at.trim() ? at.trim() : (c.find((x) => x.trim())?.trim() ?? '');
+  return raw ? tests.decode(raw) : '';
 }
 
 // -----------------------------------------------------------------------------
@@ -88,7 +168,12 @@ export function parseMessage(
   name?: AstmDialect,
   /** Which record carries the barcode HMIS keys on. See `sampleIdFrom` in
    *  src/config.ts — "order" (the ASTM norm) for every analyzer but the ABL9. */
-  opts?: { sampleIdFrom?: 'order' | 'patient' },
+  opts?: {
+    sampleIdFrom?: 'order' | 'patient';
+    /** Which half of a RAW/MAINFORMAT pair to file — see `valueFormat` in
+     *  src/config.ts. Only the Sysmex U-WAM tags its values this way. */
+    valueFormat?: ValueFormat;
+  },
 ): ParsedMessage {
   // Records may arrive one-per-frame OR packed several-per-frame separated by CR
   // (the CareTech/Atellica host puts H/Q/L in a single ETX-terminated frame).
@@ -100,6 +185,9 @@ export function parseMessage(
 
   let currentPatient: PatientDemographics | null = null;
   let currentSampleId = '';
+  // Results that arrived tagged RAW / MAINFORMAT, collapsed to one per
+  // parameter once the whole message is read.
+  const valueFormats = new Map<InstrumentResult, ValueFormat>();
 
   for (const line of lines) {
     const type = line[0]?.toUpperCase();
@@ -144,7 +232,10 @@ export function parseMessage(
         // match the O-record specimen-id logic and the barcode HMIS registers.
         const rangeComps = comps(f[2], d);
         const sampleId = rangeComps.find((x) => x.trim())?.trim() || '';
-        const query: HostQuery = { sampleId, testCodes: [] };
+        // Keep the field verbatim as well: a Sysmex matches the reply on the
+        // padded sample number + rack + tube position it sent, not on the
+        // bare barcode.
+        const query: HostQuery = { sampleId, testCodes: [], specimenIdField: f[2] ?? '' };
         currentSampleId = sampleId;
         msg.queries.push(query);
         break;
@@ -158,9 +249,15 @@ export function parseMessage(
         // HMIS receives one result per analyte (otherwise the COFF value is filed
         // as a second, conflicting result). Analyzers that omit this component
         // (empty index 7) are unaffected and still file.
-        const resultType = comps(f[2], d)[7]?.trim().toUpperCase();
+        const testIdComps = comps(f[2], d);
+        const resultType = testIdComps[7]?.trim().toUpperCase();
         if (resultType && NON_REPORTABLE_RESULT_TYPES.has(resultType)) break;
+        // The dialect may know a record is not a result at all — the Sysmex
+        // U-WAM's scattergram images travel as R records marked "IF".
+        const { tests } = dialect(name);
+        if (tests.reportable && !tests.reportable(testIdComps)) break;
 
+        const { value, format } = splitValueFormat(f[3] || '', d);
         const result: InstrumentResult = {
           // WHICH FIELD IS THE BARCODE — the two orders, and why both exist.
           //
@@ -193,7 +290,7 @@ export function parseMessage(
               ? currentPatient?.patientId || currentSampleId || ''
               : currentSampleId || currentPatient?.patientId || '',
           testCode: testCodeFromUniversalId(f[2], d, name),
-          value: (f[3] || '').trim(),
+          value,
           unit: (f[4] || '').trim() || null,
           referenceRange: (f[5] || '').trim() || null,
           abnormalFlag: (f[6] || '').trim() || null,
@@ -203,7 +300,10 @@ export function parseMessage(
           completedAt: (f[12] || '').trim() || null, // VERIFY-SPEC: date completed position
           instrument: (f[13] || '').trim() || null,
         };
-        if (result.testCode) msg.results.push(result);
+        if (result.testCode) {
+          msg.results.push(result);
+          if (format) valueFormats.set(result, format);
+        }
         break;
       }
       // C (comment) and L (terminator) carry no data we file today.
@@ -211,6 +311,7 @@ export function parseMessage(
         break;
     }
   }
+  msg.results = collapseValueFormats(msg.results, valueFormats, opts?.valueFormat ?? 'main');
   return msg;
 }
 
@@ -266,10 +367,15 @@ export function buildOrderMessage(
       lines.push(renderRecord(fmt.patientAnonymous, { $seq: String(seq) }, d));
     }
 
+    // A query reply may take a different O layout (Sysmex marks it report
+    // type "Q") and may echo the instrument's own specimen-id field.
+    const isReply = !!o.queryReply;
+    const orderMap = isReply && fmt.orderQueryReply ? fmt.orderQueryReply : fmt.order;
+    const sample = isReply && fmt.echoQuerySpecimenId && o.specimenIdField ? o.specimenIdField : o.sampleId;
     const orderRecord = (n: number, codes: readonly string[]) =>
-      renderRecord(fmt.order, {
+      renderRecord(orderMap, {
         $seq: String(n),
-        $sample: o.sampleId,
+        $sample: sample,
         $tests: fmt.tests.encode(codes, d),
         $priority: o.priority ?? 'R',
         $specimen: o.specimenType ?? '',

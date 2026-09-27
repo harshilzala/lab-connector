@@ -39,6 +39,15 @@ export interface TestIdCodec {
   encode(codes: readonly string[], d: Delimiters): string;
   /** Read ONE assay code back out of an R record's Universal Test ID field. */
   decode(component: string): string;
+  /** 0-based component of the Universal Test ID that carries the code. ASTM
+   *  puts it in the 4th (index 3) and that is the default. */
+  readonly component?: number;
+  /** Is this R record a result at all? Given the Universal Test ID's
+   *  components; false drops the record before it is read. The Sysmex U-WAM
+   *  sends its scattergram images as R records ("^^^CW_SSH_AxCW_FSC_W^A^1^IF^…"
+   *  with a PNG path as the value) and marks them "IF" where a measured value
+   *  carries "S". Unset: every R record is a result. */
+  reportable?(components: readonly string[]): boolean;
 }
 
 export interface DialectProfile {
@@ -53,6 +62,15 @@ export interface DialectProfile {
   /** P record when demographics are suppressed. */
   readonly patientAnonymous: FieldMap;
   readonly order: FieldMap;
+  /** O record used when the download ANSWERS a host query, where the vendor
+   *  wants it marked differently from an unsolicited download (ASTM report
+   *  type "Q" — response to query — instead of "O"). Unset: `order` is used
+   *  for both. */
+  readonly orderQueryReply?: FieldMap;
+  /** Echo the instrument's own specimen-id field back verbatim on a query
+   *  reply — Sysmex sends "<sample no>^<rack>^<tube position>" and matches
+   *  the answer on that, not on the bare barcode. Unset: the bare barcode. */
+  readonly echoQuerySpecimenId?: boolean;
   readonly terminator: FieldMap;
   /** One O record per assay, vs one O carrying every assay for the tube. */
   readonly orderPerTest: boolean;
@@ -85,6 +103,26 @@ const plainCode: TestIdCodec = {
 const rankedCode: TestIdCodec = {
   encode: (codes, d) => codes.map((c) => ['', '', '', c, '', '', '1'].join(d.component)).join(d.repeat),
   decode: (component) => component.trim(),
+};
+
+/**
+ * "^^^RBC^A^1^S^  0026^02" — the Sysmex U-WAM shape, from the Ahmedabad
+ * capture of 2026-09-17 (logs/wire-sysmex-uwam-2026-09-17.log). The analyte
+ * is in the ASTM component (index 3): "C-GLU", "C-S.G.(Ref)" for the UC-3500
+ * strip (a "C-" prefix on every chemistry item), "RBC", "X'TAL", "Squa.EC"
+ * for the UF-4000 particles. The components after it are the U-WAM's own:
+ * "A", "1", then "S" for a measured value or "IF" for one of the seven
+ * scattergram / histogram image records (the value is a PNG path), then the
+ * instrument's sample sequence and rack.
+ *
+ * On the O record the panel is listed with the bare "^^^CODE" shape, so a
+ * download uses the same. The "^^^^CODE^1" layout the XN-series uses was
+ * assumed before this capture and is NOT what this U-WAM sends.
+ */
+const sysmexCode: TestIdCodec = {
+  encode: (codes, d) => codes.map((c) => ['', '', '', c].join(d.component)).join(d.repeat),
+  decode: (component) => component.trim(),
+  reportable: (c) => (c[6] ?? '').trim().toUpperCase() !== 'IF',
 };
 
 /**
@@ -219,6 +257,67 @@ export const ASTM_DIALECT_LIBRARY = {
     orderPerTest: false,
     timestamp: 'datetime',
     tests: vitrosDilutionCode,
+  },
+
+  /**
+   * Sysmex UF-4000 / UF-5000 urine particle analyzer, UC-3500 urine chemistry
+   * analyzer and the U-WAM work-area manager that fronts both.
+   *
+   * Result upload as the Ahmedabad U-WAM sends it (capture 2026-09-17,
+   * logs/wire-sysmex-uwam-2026-09-17.log; the second message of that file is
+   * pinned in test/dialects-check.ts):
+   *
+   *   H|^&|||U-WAM^00-22_Build003^A1494^^^^AU501736||||||||LIS2-A2|20260917161646
+   *   P|1||10032026040311||^ATULBHAI ASHOKBHAI J||19871203|M
+   *   O|1|ZC2609170035||^^^C-URO^^^C-BLD…^^^RBC^^^EC…|R||20260917110245||||N|||20260917110245|*||||||||||F
+   *   R|1|^^^C-GLU^A^1^S^  0009^01|4+^RAW|||H||||^^device||20260917105802|UC-3500
+   *   R|2|^^^C-GLU^A^1^S^  0009^01|4+^MAINFORMAT|||H||||^^device||20260917105802|UC-3500
+   *   R|29|^^^RBC^A^1^S^  0009^01|8.0^RAW|/µl||N||||^^device||20260917110354|UF-4000
+   *   R|30|^^^RBC^A^1^S^  0009^01|1.4^MAINFORMAT|/HPF||N||||^^device||20260917110354|UF-4000
+   *   R|65|^^^SF_DSS_PxSF_FSC_P^A^1^IF^  0009^01|20260917&R&PNG&…_[SF_DSS_PxSF_FSC_P].png^RAW|…|UF-4000
+   *   L|1|N
+   *
+   *   • the barcode is the plain O-record specimen id — no padding, no rack.
+   *   • ONE message carries both instruments' values for the sample; R field
+   *     14 names which (UC-3500 / UF-4000).
+   *   • every parameter comes TWICE: "<value>^RAW" (the instrument's native
+   *     value, /µl for particles) and "<value>^MAINFORMAT" (the U-WAM's
+   *     configured reporting format — /HPF, /LPF, or the strip's "-", "4+",
+   *     "normal"). The parser keeps one of the pair per parameter: a blank
+   *     half is never taken, a strip GRADE ("-", "+-", "1+" …) beats a
+   *     concentration whichever half carries it, and otherwise
+   *     astm.valueFormat decides (see src/config.ts and
+   *     collapseValueFormats in records.ts). C-LEU has its grade in RAW and
+   *     25/75/500 c/µL in MAINFORMAT; C-BIL is the mirror image.
+   *   • the seven "IF"-typed records are scattergram images, not results.
+   *   • demographics arrive on the P record when the U-WAM has them.
+   *
+   * Host query, first seen 2026-09-17 18:32Z (five in the first night):
+   *
+   *   Q|1|LB2609180027||||20260918003709||||||F
+   *
+   * The bare barcode in field 3 — no padding, no rack or tube position — with
+   * the request time in field 7. The reply echoes field 3 verbatim (it IS the
+   * bare barcode here) with report type "Q", and the U-WAM's own order list
+   * uses the same "^^^CODE" shape, so the download is built with it. Whether
+   * the U-WAM shows the downloaded tests on its screen is not yet observed:
+   * every query so far met a barcode HMIS listed no rows for at that moment
+   * (see answerQuery in the orchestrator for what is done about that).
+   */
+  sysmex: {
+    label: 'Sysmex U-WAM (UC-3500 + UF-4000) / UF-4000 / UF-5000 / UC-3500',
+    confirmedBy: 'Result upload captured from the Ahmedabad U-WAM 00-22_Build003, 2026-09-17; the query reply is still the ASTM norm, unconfirmed',
+    // The U-WAM declares LIS2-A2 (the current name of E1394-97); mirror it.
+    header: { 0: 'H', 1: '$delims', 4: '$sender', 12: 'LIS2-A2', 13: '$stamp' },
+    patient: { 0: 'P', 1: '$seq', 3: '$patientId', 5: '$name', 7: '$birth', 8: '$sex' },
+    patientAnonymous: { 0: 'P', 1: '$seq' },
+    order: { 0: 'O', 1: '$seq', 2: '$sample', 4: '$tests', 5: '$priority', 25: 'O' },
+    orderQueryReply: { 0: 'O', 1: '$seq', 2: '$sample', 4: '$tests', 5: '$priority', 25: 'Q' },
+    echoQuerySpecimenId: true,
+    terminator: { 0: 'L', 1: '1', 2: 'N' },
+    orderPerTest: false,
+    timestamp: 'datetime',
+    tests: sysmexCode,
   },
 } as const satisfies Record<string, DialectProfile>;
 

@@ -361,6 +361,14 @@ export function toLisResultRows(
    * not change. Rows listed here are simply never offered to the join.
    */
   excludeParameterIds: number[] = [],
+  /**
+   * Instrument value → the value HMIS is sent, per assay code — the words a
+   * lab reports a qualitative result as. The Sysmex U-WAM's strip pads say
+   * "-" where the report says "Absent" / "Negative" / "Normal" and "+-"
+   * where it says "trace". Code and value both match case-insensitively;
+   * the value match is exact. Applied after unit scaling, at delivery time.
+   */
+  valueMap: Record<string, Record<string, string>> = {},
 ): {
   rows: LisInboundResultRow[];
   unmatched: string[];
@@ -373,6 +381,8 @@ export function toLisResultRows(
   ignored: string[];
   /** Analyte codes whose value was unit-converted, as "WBC 8.89->8890". */
   scaled: string[];
+  /** Values rewritten by `valueMap`, as "CODE from->to", for the log. */
+  translated: string[];
   /** The analyzer's OWN code for every row in `rows`, with the HMIS
    *  identifier and labResultId it was joined to — so a caller that tracks
    *  filing per analyte (the staged result store) can mark exactly the values
@@ -398,6 +408,16 @@ export function toLisResultRows(
 
   const excluded = new Set(excludeIdentifiers.map(key).filter(Boolean));
   const excludedIds = new Set(excludeParameterIds);
+
+  // Per code, the instrument's value (lower-cased) → the word HMIS reports.
+  const valueMapOf = new Map<string, Map<string, string>>();
+  for (const [code, words] of Object.entries(valueMap)) {
+    const k = key(code);
+    if (!k || !words) continue;
+    const m = new Map<string, string>();
+    for (const [from, to] of Object.entries(words)) m.set(from.trim().toLowerCase(), to);
+    if (m.size) valueMapOf.set(k, m);
+  }
   const byCode = new Map<string, MirthAcknowledgeItem>();
   // One identifier → several parameterIds is an HMIS master in flux, not a
   // choice the connector may make: such a key is withheld from byCode.
@@ -432,6 +452,7 @@ export function toLisResultRows(
   // Unit conversions actually applied, so the delivery log can show the lab the
   // number that was filed next to the number the analyzer sent.
   const scaled: string[] = [];
+  const translated: string[] = [];
   const filedCodes: Array<{ testCode: string; identifier: string; labResultId: number | null }> = [];
 
   for (const r of upload.results) {
@@ -460,6 +481,14 @@ export function toLisResultRows(
       value = scaleResultValue(r.value, factor);
       if (value !== r.value) scaled.push(`${r.testCode} ${r.value}->${value}`);
     }
+    // The lab's word for a qualitative value ("-" → "Absent"). Keyed on the
+    // analyzer's OWN code, like the scale, and only for a value listed
+    // exactly — anything else is filed as the instrument sent it.
+    const word = valueMapOf.get(own)?.get(value.trim().toLowerCase());
+    if (word !== undefined && word !== value) {
+      translated.push(`${r.testCode} ${value}->${word}`);
+      value = word;
+    }
     if (!seen.has(ctx)) {
       seen.add(ctx);
       matched.push(ctx);
@@ -486,5 +515,5 @@ export function toLisResultRows(
     });
   }
 
-  return { rows, unmatched, ambiguous, matched, voided, ignored, scaled, filedCodes };
+  return { rows, unmatched, ambiguous, matched, voided, ignored, scaled, translated, filedCodes };
 }

@@ -17,6 +17,11 @@ export interface HostQuery {
   sampleId: string;
   /** Optional specific test codes the analyzer is asking about ("ALL" if empty). */
   testCodes?: string[];
+  /** The Q record's specimen-id field exactly as the instrument sent it,
+   *  components and all ("       SF2609160001^A1^1" on a Sysmex: padded
+   *  sample number, rack, tube position). Dialects that opt in echo it back
+   *  on the reply so the instrument can match on more than the barcode. */
+  specimenIdField?: string;
 }
 
 // ---- Connector → analyzer: the work order to download ----------------------
@@ -32,6 +37,12 @@ export interface OrderDownload {
   /** Specimen descriptor (ASTM O-record field 16), e.g. "Serum". The Atellica
    *  rejects an order with an empty specimen type. */
   specimenType?: string | null;
+  /** This download answers a host query for the sample (as opposed to a
+   *  proactive push). Dialects with a separate query-reply layout use it. */
+  queryReply?: boolean;
+  /** The instrument's own specimen-id field from the query being answered —
+   *  see HostQuery.specimenIdField. Only dialects that echo it read this. */
+  specimenIdField?: string;
 }
 
 export interface PatientDemographics {

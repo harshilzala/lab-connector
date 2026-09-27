@@ -21,6 +21,7 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
         frameMaxData: analyzer.astm.frameMaxData,
         dialect: analyzer.astm.dialect,
         sampleIdFrom: analyzer.astm.sampleIdFrom,
+        valueFormat: analyzer.astm.valueFormat,
         logger: logger.child({ codec: 'astm' }),
       });
     case 'abl9':

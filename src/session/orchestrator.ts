@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { AnalyzerConfig } from '../config.js';
 import type { HmisClient } from '../hmis/client.js';
-import type { HmisResultUpload, MirthAcknowledgeItem, OrderDownload, ParsedMessage, PendingOrders } from '../types.js';
+import type { HmisResultUpload, HostQuery, MirthAcknowledgeItem, OrderDownload, ParsedMessage, PendingOrders } from '../types.js';
 import type { ProtocolLink, WireEvent } from '../codec/types.js';
 import { createTransport } from '../transport/index.js';
 import type { Transport } from '../transport/types.js';
@@ -437,12 +437,11 @@ export class AnalyzerRuntime {
         void this.pollOrders();
         this.pollTimer = setInterval(() => void this.pollOrders(), intervalMs);
       }, FIRST_POLL_DELAY_MS);
-      // Log the site the pending call will really carry: the analyzer's own
-      // siteId if set, else the site-wide hmis.siteId.
+      // Log the sites the pending calls will really carry.
       this.log.info(
         {
           codes: this.equipmentCodes(),
-          siteId: this.cfg.siteId ?? this.hmis.defaultSiteId ?? null,
+          siteIds: this.siteIds().map((s) => s ?? null),
           intervalMs,
           lookbackDays,
           download,
@@ -514,6 +513,16 @@ export class AnalyzerRuntime {
     return [this.cfg.equipmentCode, ...this.cfg.extraEquipmentCodes];
   }
 
+  /** The HMIS sites every pending call is repeated over: the analyzer's own
+   *  `siteIds`, else its `siteId`, else the site-wide list (`hmis.siteIds`
+   *  / `hmis.siteId`), else one unfiltered call. */
+  private siteIds(): (string | undefined)[] {
+    if (this.cfg.siteIds.length) return this.cfg.siteIds;
+    if (this.cfg.siteId) return [this.cfg.siteId];
+    // A client without the list (a test double) means one unfiltered call.
+    return this.hmis.defaultSiteIds ?? [undefined];
+  }
+
   // ---------------------------------------------------------------------------
   // Proactive order download. One tick: ask HMIS for each code × each day in
   // the look-back window, fold every row into the order store, and push to the
@@ -536,105 +545,77 @@ export class AnalyzerRuntime {
       downloadPrefixes.some((p) => barcode.toUpperCase().startsWith(p.toUpperCase()));
     try {
       for (const eqCode of this.equipmentCodes()) {
-        for (let daysAgo = 0; daysAgo <= lookbackDays; daysAgo++) {
-          const body = await this.hmis.getPending({
-            sampleId: '',
-            eqCode,
-            siteId: this.cfg.siteId,
-            showCulture: this.cfg.showCulture,
-            date: formatApiDateDaysAgo(daysAgo),
-          });
-          const groups = groupPendingByBarcode(body, {
-            eqCode,
-            equipmentId: this.cfg.equipmentId ?? null,
-            ipAddress: this.ackIpAddress,
-            portNo: this.ackPortNo,
-          });
-          for (const [, offered] of groups) {
-            samples++;
-            const pending = this.interfacedOnly(offered);
-            if (!pending.found) {
-              // Every row HMIS raised for this tube is for a parameter this
-              // interface does not carry — nothing to store, nothing to wait for.
-              notInterfaced++;
-              continue;
-            }
-            // The poll is where a complete panel is most likely to be seen, so
-            // it is the catalogue's main source.
-            this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
-            const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll', { neverDownload });
-            if (!download || newCodes.length === 0) continue;
-            if (!downloadable(order.sampleId)) {
-              // The gateway lists this barcode under our eqCode, but the
-              // analyzer does not run it (see orderPoll.downloadPrefixes). The
-              // rows stay cached for result-time joins; nothing is programmed.
-              notOurs++;
-              continue;
-            }
-            if (!this.transport.connected) {
-              // Leave it un-downloaded; the next tick after reconnect sends it.
-              this.log.warn({ barcode: order.sampleId, tests: newCodes }, 'order waiting — analyzer link is down');
-              continue;
-            }
-            if (this.downloadsPaused()) {
-              // The instrument is not answering. Keep the order in the store,
-              // un-downloaded, so it goes out as soon as the breaker closes.
-              held++;
-              continue;
-            }
-            // What goes on the wire. An analyzer that keeps ONE program per
-            // sample and lets a later download replace it (VITROS 250, see
-            // KermitLink.downloadReplacesProgram) must be given the whole
-            // panel every time — a delta of the newly seen tests would wipe
-            // the ones it already had. Everything else takes just the delta.
-            const codes = this.link.downloadReplacesProgram ? this.programmable(order.testCodes) : newCodes;
-            try {
-              await this.link.sendOrders([
-                {
-                  sampleId: order.sampleId,
-                  testCodes: codes,
-                  priority: order.priority,
-                  patient: this.cfg.sendDemographics ? order.patient : null,
-                  specimenType: order.specimenType,
-                },
-              ]);
-              this.orders.markDownloaded(order.sampleId, codes);
-              this.downloadedCount++;
-              pushed++;
-              this.resumeDownloads('an order was accepted');
-              this.log.info(
-                { barcode: order.sampleId, tests: codes, ...(codes.length !== newCodes.length ? { added: newCodes } : {}), eqCode },
-                'order downloaded to analyzer',
-              );
-            } catch (err) {
-              if (err instanceof KermitRejectedError && err.busy) {
-                // Not a failure of the link — the analyzer is answering and
-                // has told us why it cannot take the file. Hold the push for
-                // the spec's interval without touching the streak.
-                const wait = err.code === '0000' ? VITROS_BUSY_WAIT_MS : VITROS_DISABLED_WAIT_MS;
-                this.downloadPausedUntil = Date.now() + wait;
-                this.log.warn(
-                  { barcode: order.sampleId, tests: newCodes, code: err.code, pausedForMs: wait },
-                  err.code === '0000'
-                    ? 'VITROS receiver busy (sample program space full?) — will retry in a minute'
-                    : 'VITROS RECEIVE TESTS is OFF at the analyzer console — an operator must turn it on; retrying in 5 minutes',
-                );
-                break;
+        for (const siteId of this.siteIds()) {
+          for (let daysAgo = 0; daysAgo <= lookbackDays; daysAgo++) {
+            const body = await this.hmis.getPending({
+              sampleId: '',
+              eqCode,
+              siteId,
+              showCulture: this.cfg.showCulture,
+              date: formatApiDateDaysAgo(daysAgo),
+            });
+            const groups = groupPendingByBarcode(body, {
+              eqCode,
+              equipmentId: this.cfg.equipmentId ?? null,
+              ipAddress: this.ackIpAddress,
+              portNo: this.ackPortNo,
+            });
+            for (const [, pending] of groups) {
+              samples++;
+              // The poll is where a complete panel is most likely to be seen, so
+              // it is the catalogue's main source.
+              this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
+              const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll');
+              if (!download || newCodes.length === 0) continue;
+              if (!downloadable(order.sampleId)) {
+                // The gateway lists this barcode under our eqCode, but the
+                // analyzer does not run it (see orderPoll.downloadPrefixes). The
+                // rows stay cached for result-time joins; nothing is programmed.
+                notOurs++;
+                continue;
               }
-              // Not marked downloaded, so it is retried once the breaker closes.
-              this.downloadFailStreak++;
-              this.log.error(
-                {
-                  barcode: order.sampleId,
-                  tests: codes,
-                  consecutiveFailures: this.downloadFailStreak,
-                  err: err instanceof Error ? err.message : String(err),
-                },
-                'order download failed — will retry on the next poll',
-              );
-              if (this.downloadFailStreak >= DOWNLOAD_FAIL_THRESHOLD) {
-                this.pauseDownloads();
-                break; // stop hammering the rest of this tick's orders
+              if (!this.transport.connected) {
+                // Leave it un-downloaded; the next tick after reconnect sends it.
+                this.log.warn({ barcode: order.sampleId, tests: newCodes }, 'order waiting — analyzer link is down');
+                continue;
+              }
+              if (this.downloadsPaused()) {
+                // The instrument is not answering. Keep the order in the store,
+                // un-downloaded, so it goes out as soon as the breaker closes.
+                held++;
+                continue;
+              }
+              try {
+                await this.link.sendOrders([
+                  {
+                    sampleId: order.sampleId,
+                    testCodes: newCodes,
+                    priority: order.priority,
+                    patient: this.cfg.sendDemographics ? order.patient : null,
+                    specimenType: order.specimenType,
+                  },
+                ]);
+                this.orders.markDownloaded(order.sampleId, newCodes);
+                this.downloadedCount++;
+                pushed++;
+                this.resumeDownloads('an order was accepted');
+                this.log.info({ barcode: order.sampleId, tests: newCodes, eqCode }, 'order downloaded to analyzer');
+              } catch (err) {
+                // Not marked downloaded, so it is retried once the breaker closes.
+                this.downloadFailStreak++;
+                this.log.error(
+                  {
+                    barcode: order.sampleId,
+                    tests: newCodes,
+                    consecutiveFailures: this.downloadFailStreak,
+                    err: err instanceof Error ? err.message : String(err),
+                  },
+                  'order download failed — will retry on the next poll',
+                );
+                if (this.downloadFailStreak >= DOWNLOAD_FAIL_THRESHOLD) {
+                  this.pauseDownloads();
+                  break; // stop hammering the rest of this tick's orders
+                }
               }
             }
           }
@@ -984,6 +965,7 @@ export class AnalyzerRuntime {
         this.cfg.allowTestCodes,
         this.cfg.excludeIdentifiers,
         this.cfg.excludeParameterIds,
+        this.cfg.testValueMap,
       );
 
     const joined = join(orderRows);
@@ -1055,7 +1037,7 @@ export class AnalyzerRuntime {
       if (!this.cfg.hostQuery) {
         this.log.warn('received host query but hostQuery is disabled — ignoring');
       } else {
-        for (const q of msg.queries) await this.answerQuery(q.sampleId);
+        for (const q of msg.queries) await this.answerQuery(q);
       }
     }
 
@@ -1110,7 +1092,8 @@ export class AnalyzerRuntime {
     }
   }
 
-  private async answerQuery(barcode: string): Promise<void> {
+  private async answerQuery(query: HostQuery): Promise<void> {
+    const barcode = query.sampleId;
     // HMIS matches barcodes case-sensitively; look up with the canonical
     // uppercase form so a lowercase-entered sample still resolves its order.
     const lookup = normalizeBarcode(barcode);
@@ -1119,7 +1102,16 @@ export class AnalyzerRuntime {
     // trip per retry (89772 produced 100 identical pending queries), so answer
     // the instrument locally with no order instead.
     if (isQcSample(lookup, this.cfg.qc)) {
-      this.log.info({ barcode: lookup }, 'QC/control barcode — not queried against HMIS');
+      // The instrument is still waiting for an answer: a query left hanging
+      // holds its sampler until the host timeout. The Maglumi X6's "$lc$"
+      // control query of 2026-09-17 19:52Z got nothing back at all. Send the
+      // empty download, exactly as for a barcode with no order.
+      this.log.info({ barcode: lookup }, 'QC/control barcode — not queried against HMIS, answered with an empty download');
+      try {
+        await this.link.sendOrders([]);
+      } catch (err) {
+        this.log.error({ barcode, err: err instanceof Error ? err.message : String(err) }, 'host-query reply failed');
+      }
       return;
     }
     try {
@@ -1131,8 +1123,17 @@ export class AnalyzerRuntime {
       // their labResultId to be filable.
       if (pending.ackItems.length) this.orders.upsert(lookup, pending, 'query', { neverDownload: this.neverDownload() });
 
-      const codes = this.programmable(pending.testCodes);
-      if (!pending.found || codes.length === 0) {
+      // HMIS drops a sample's rows from the pending list and offers them
+      // again later. LB2609180027, 2026-09-17: 21 rows on the 18:42Z poll,
+      // none on the live lookup at 19:08Z when the U-WAM asked (the reply
+      // was an empty download), 27 values filed from the CACHED rows at
+      // 19:48Z. The order store holds every row this analyzer was ever
+      // offered, so a barcode HMIS cannot see right now is still answered
+      // from there — the rule resolveOrderRows already applies when filing.
+      // Only a barcode neither side knows gets the empty download.
+      const stored = pending.found ? null : this.orders.get(lookup);
+      const source = pending.found ? pending : stored?.rows.length ? stored : null;
+      if (!source) {
         this.log.info({ barcode, lookup }, 'no pending orders — sending empty download');
         await this.link.sendOrders([]); // header + terminator = "no work"
         return;
@@ -1141,15 +1142,20 @@ export class AnalyzerRuntime {
       const order: OrderDownload = {
         // Reply with the barcode the analyzer sent so it matches its own sample.
         sampleId: barcode,
-        testCodes: codes,
-        priority: pending.priority,
-        patient: this.cfg.sendDemographics ? pending.patient : null,
-        specimenType: pending.specimenType,
+        testCodes: source.testCodes,
+        priority: source.priority,
+        patient: this.cfg.sendDemographics ? source.patient : null,
+        specimenType: source.specimenType,
+        queryReply: true,
+        specimenIdField: query.specimenIdField,
       };
       await this.link.sendOrders([order]);
       // A query answer is a full download, so the poller need not repeat it.
-      this.orders.markDownloaded(lookup, codes);
-      this.log.info({ barcode, tests: codes }, 'order download sent to analyzer');
+      this.orders.markDownloaded(lookup, source.testCodes);
+      this.log.info(
+        { barcode, tests: source.testCodes, from: pending.found ? 'hmis' : 'order store' },
+        pending.found ? 'order download sent to analyzer' : 'HMIS lists no pending rows — order download sent from the cached rows',
+      );
 
       // NOT acknowledged here. A downloaded order is not finished work — the
       // row is retired only once its result has been filed, in the spool
@@ -1185,8 +1191,8 @@ export class AnalyzerRuntime {
         }),
       );
     }
-    const merged = this.interfacedOnly(mergePending(parts));
-    this.parameters.learn(merged.ackItems);
+    const merged = mergePending(parts);
+    this.parameters.learn(merged.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
     return merged;
   }
 

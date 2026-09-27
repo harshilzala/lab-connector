@@ -16,6 +16,8 @@ export interface AstmLinkOptions {
   dialect: AstmDialect;
   /** Which inbound record carries the barcode — see `sampleIdFrom` in config.ts. */
   sampleIdFrom?: 'order' | 'patient';
+  /** Which half of a RAW/MAINFORMAT value pair to file — see `valueFormat` in config.ts. */
+  valueFormat?: 'main' | 'raw';
   logger: Logger;
 }
 
@@ -187,7 +189,10 @@ export class AstmLink extends EventEmitter implements ProtocolLink {
     const raw = records.join('\r\n');
     this.emit('wire', { direction: 'IN', text: raw });
     try {
-      const msg = parseMessage(records, raw, this.opts.dialect, { sampleIdFrom: this.opts.sampleIdFrom });
+      const msg = parseMessage(records, raw, this.opts.dialect, {
+        sampleIdFrom: this.opts.sampleIdFrom,
+        valueFormat: this.opts.valueFormat,
+      });
       this.emit('message', msg);
     } catch (err) {
       this.emit('error', err instanceof Error ? err : new Error(String(err)));

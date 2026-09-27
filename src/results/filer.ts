@@ -174,6 +174,9 @@ export class StagedFiler {
         store.markDropped(barcode, joined.voided, 'void');
         log.warn({ barcode, voided: joined.voided }, 'analyzer reported no value for these assays — not filed; the rerun will file');
       }
+      if (joined.translated.length) {
+        log.info({ barcode, translated: joined.translated }, 'qualitative values reported in the lab\'s words before filing');
+      }
       if (joined.scaled.length) {
         log.info({ barcode, scaled: joined.scaled }, 'unit conversion applied before filing');
       }
