@@ -119,6 +119,11 @@ export class TcpTransport extends EventEmitter implements Transport {
     if (this.socket && this.socket !== socket) this.socket.destroy();
     this.socket = socket;
     socket.setNoDelay(true);
+    // A serial-device server (Moxa NPort) that is power-cycled or unplugged
+    // gives no FIN; without probes the socket looks healthy until the next
+    // write fails. Probe every 30 s so the loss is noticed, the reconnect
+    // loop runs, and the dashboard shows the link as down.
+    socket.setKeepAlive(true, 30_000);
     socket.on('data', (chunk) => this.emit('data', chunk));
     socket.on('error', (err) => this.emit('error', err));
     socket.on('close', () => {

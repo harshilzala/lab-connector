@@ -78,7 +78,17 @@ main { flex:1; width:100%; max-width:1240px; margin:0 auto; padding:26px 24px 40
 .kv:first-of-type { border-top:0; }
 .kv .k { color:var(--mut); }
 .kv .v { color:var(--ink); font-weight:600; }
-.kv .v.err { color:var(--bad); font-weight:600; font-size:12px; text-align:right; word-break:break-word; }
+.kv.stack { flex-direction:column; align-items:stretch; gap:6px; }
+.kv.stack .v { font-weight:500; }
+.codes { display:flex; flex-wrap:wrap; gap:4px; }
+.code {
+  display:inline-block; padding:1px 7px; border-radius:5px; font-size:11.5px; font-weight:700;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; border:1px solid transparent;
+}
+.code.ok   { background:var(--ok-soft);   color:var(--ok); }
+.code.warn { background:var(--warn-soft); color:var(--warn); }
+.code.mut  { background:transparent; color:var(--mut); border-color:var(--line); text-decoration:line-through; }
+.codes-note { font-size:12px; color:var(--mut); margin-top:2px; }
 .card-body { padding:14px 18px 18px; }
 
 /* ---- maximize: one machine fills the view, the rest step aside ---- */
@@ -341,21 +351,52 @@ function ordersLine(o) {
   if (o.lastPollError) return '<span class="pill bad">poll failing</span> ' + esc(stored) + ' · ' + esc(o.lastPollError);
   return esc(stored) + ' · polled ' + time(o.lastPollAt);
 }
-
-// The parameters this machine is scoped to send, from its config: the
-// allow-list (with the HMIS name each is filed as, where that differs), the
-// HMIS rows it must never touch, and the instrument channels it ignores.
-function paramsLine(i) {
-  if (!i) return '—';
-  const n = i.syncCodes.length;
-  const alias = i.aliases || {};
-  const codes = i.syncCodes.map(c => alias[c] ? esc(c) + '<span class="p-as">&rarr;' + esc(alias[c]) + '</span>' : esc(c));
-  const head = n ? n + ' sync' : 'all sent (no allow-list)';
-  const more = (i.excluded && i.excluded.length ? ' · never into ' + esc(i.excluded.join(', ')) : '') +
-    (i.ignored && i.ignored.length ? ' · ' + i.ignored.length + ' channel' + (i.ignored.length === 1 ? '' : 's') + ' ignored' : '');
-  return n
-    ? '<details class="plist"><summary>' + head + more + '</summary><div class="plist-body">' + codes.join('<span class="sep">·</span>') + '</div></details>'
-    : head + more;
+// The interfaced-parameter filter (config allowTestCodes) set against the
+// identifiers HMIS has actually offered this analyzer. Green: in the list and
+// HMIS has a parameter for it. Amber: in the list but HMIS has not offered it
+// yet — either a code entered by hand on the instrument (ABL9 FIO2/T) or a
+// spelling HMIS does not know. The struck-through chips are ignoreTestCodes.
+function filterBlock(f) {
+  if (!f) return '';
+  var seen = {};
+  (f.hmis || []).forEach(function (id) { seen[String(id).trim().toUpperCase()] = true; });
+  var hasHmis = (f.hmis || []).length > 0;
+  var html = '';
+  if (f.allow && f.allow.length) {
+    var missing = 0;
+    var chips = f.allow.map(function (c) {
+      var ok = seen[String(c).trim().toUpperCase()];
+      if (hasHmis && !ok) missing++;
+      var cls = !hasHmis ? 'warn' : (ok ? 'ok' : 'warn');
+      var tip = !hasHmis ? 'HMIS has not offered any parameter yet' : (ok ? 'HMIS interfaces this parameter' : 'in the list, but HMIS has not offered a row for it yet');
+      return '<span class="code ' + cls + '" title="' + esc(tip) + '">' + esc(c) + '</span>';
+    }).join('');
+    var extra = hasHmis ? (f.hmis || []).filter(function (id) {
+      var k = String(id).trim().toUpperCase();
+      return !f.allow.some(function (c) { return String(c).trim().toUpperCase() === k; });
+    }) : [];
+    var note;
+    if (!hasHmis) note = 'Waiting for the first HMIS pending rows to confirm against.';
+    else if (missing === 0 && extra.length === 0) note = 'All ' + f.allow.length + ' match what HMIS offers — nothing missing, nothing extra.';
+    else {
+      note = (missing ? missing + ' not yet offered by HMIS' : '') +
+             (missing && extra.length ? ' · ' : '') +
+             (extra.length ? 'HMIS also lists ' + extra.length + ' identifier' + (extra.length === 1 ? '' : 's') + ' not interfaced here' : '');
+    }
+    html += '<div class="kv stack"><span class="k">Interfaced parameters <span class="mut">(' + f.allow.length + ' allowed)</span></span>' +
+            '<span class="v"><span class="codes">' + chips + '</span>' +
+            '<div class="codes-note"' + (extra.length ? ' title="' + esc(extra.join(', ')) + '"' : '') + '>' + esc(note) + '</div></span></div>';
+  } else {
+    html += '<div class="kv"><span class="k">Interfaced parameters</span><span class="v">no allow-list — files whatever matches a pending row' +
+            (hasHmis ? ' (' + f.hmis.length + ' HMIS identifiers seen)' : '') + '</span></div>';
+  }
+  if (f.ignore && f.ignore.length) {
+    html += '<div class="kv stack"><span class="k">Dropped, never filed <span class="mut">(' + f.ignore.length + ')</span></span>' +
+            '<span class="v"><span class="codes">' + f.ignore.map(function (c) {
+              return '<span class="code mut" title="ignoreTestCodes: not a reportable result">' + esc(c) + '</span>';
+            }).join('') + '</span></span></div>';
+  }
+  return html;
 }
 
 function renderStats(analyzers) {
