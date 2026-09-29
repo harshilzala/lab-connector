@@ -20,6 +20,7 @@ import { SHELL_CSS, SHELL_JS, renderSidebar } from './shell.js';
 
 export interface ConnectorToolOptions {
   username: string;
+  autoCertify: boolean;
 }
 
 function esc(s: string): string {
@@ -157,7 +158,7 @@ ${FONT_LINK}
 <style>${BASE_CSS}${SHELL_CSS}${PAGE_CSS}</style>
 </head>
 <body>
-${renderSidebar('connector')}
+${renderSidebar('connector', { autoCertify: o.autoCertify })}
 <div class="brandbar"></div>
 
 <header class="topbar">

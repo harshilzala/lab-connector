@@ -278,6 +278,9 @@ export class AnalyzerRuntime {
     this.orders = new OrderStore(join(spoolRoot, cfg.id, 'orders'), this.log);
     this.parameters = new ParameterCatalogue(ParameterCatalogue.fileFor(join(spoolRoot, cfg.id)), this.log);
     this.wireAudit = wireLogFile ? new WireAudit(wireLogFile, this.log) : null;
+    // Start the console's Wire log from what is already on disk, so a restart
+    // does not blank it while the analyzer's last exchanges are still relevant.
+    if (this.wireAudit) this.wireLog.push(...this.wireAudit.recent(200));
 
     if (cfg.filing.mode === 'staged') {
       this.staged = new ResultStore(join(spoolRoot, cfg.id, 'results'), this.log);
@@ -893,7 +896,57 @@ export class AnalyzerRuntime {
   }
 
   stagedSummaries(): StagedSummary[] | null {
-    return this.staged?.summaries() ?? null;
+    const list = this.staged?.summaries() ?? null;
+    return list ? list.map((s) => this.markWithheld(s)) : null;
+  }
+
+  /**
+   * Re-label the waiting values that are held back on purpose. A code is
+   * WITHHELD when the cached order rows for the sample do name it (directly,
+   * or as its alias target) but every such row is excluded by
+   * excludeParameterIds / excludeIdentifiers — ZHPN001's "PCT" is parameter
+   * 2162, the peripheral-smear platelet line, so plateletcrit is never filed
+   * into it. Such a value is not waiting for an order that may yet arrive; it
+   * waits for the HMIS master to be corrected, and the console says so. Only
+   * the view changes: the filer still retries it, so fixing HMIS files it.
+   */
+  private markWithheld(s: StagedSummary): StagedSummary {
+    if (!s.waiting) return s;
+    const rows = this.orders.get(s.barcode)?.rows ?? [];
+    if (!rows.length) return s;
+    const key = this.assayJoinKey();
+    const exIds = new Set(this.cfg.excludeIdentifiers.map(key));
+    const exParams = new Set(this.cfg.excludeParameterIds.map(Number));
+    const reasonFor = (code: string): string | null => {
+      const names = new Set([key(code)]);
+      const alias = this.aliasFor(code);
+      if (alias) names.add(key(alias));
+      const hits = rows.filter((r) => names.has(key(r.identifier)));
+      if (!hits.length) return null;
+      const blocked = hits.filter((r) => exIds.has(key(r.identifier)) || (r.parameterId != null && exParams.has(Number(r.parameterId))));
+      if (blocked.length !== hits.length) return null;
+      const ids = [...new Set(blocked.map((r) => r.parameterId).filter((p) => p != null))];
+      return `withheld — HMIS row "${blocked[0]!.identifier}"${ids.length ? ' (parameter ' + ids.join(', ') + ')' : ''} is excluded in config; fix the HMIS master to file it`;
+    };
+    const withheldCodes: string[] = [];
+    const values = s.values.map((v) => {
+      if (v.state !== 'waiting') return v;
+      const note = reasonFor(v.testCode);
+      if (!note) return v;
+      withheldCodes.push(v.testCode);
+      return { ...v, state: 'withheld' as const, note };
+    });
+    if (!withheldCodes.length) return s;
+    const waitingCodes = s.waitingCodes.filter((c) => !withheldCodes.includes(c));
+    return {
+      ...s,
+      values,
+      waiting: waitingCodes.length,
+      waitingCodes,
+      withheld: withheldCodes.length,
+      withheldCodes,
+      complete: waitingCodes.length === 0,
+    };
   }
 
   /** Operator "file now": one immediate pass for this barcode, with a live

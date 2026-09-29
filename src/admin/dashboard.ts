@@ -9,6 +9,8 @@ export interface DashboardOptions {
   username: string;
   /** Raises a nudge banner while the commissioning password is still in place. */
   usingDefaultPassword: boolean;
+  /** autoCertify.enabled — hides every link to the Auto Certify page. */
+  autoCertify: boolean;
 }
 
 function esc(s: string): string {
@@ -137,13 +139,19 @@ main { flex:1; width:100%; padding:26px 28px 40px; }
   margin:0; font:12px/1.55 "Cascadia Mono",Consolas,"SF Mono",Menlo,monospace;
   color:var(--ink); white-space:pre-wrap; word-break:break-all;
 }
+/* The link handshake behind a frame (Kermit: →S0 ←Y0 … ←Y4): every ←Y is
+   the analyzer acknowledging a packet, ←N a rejection. */
+.wire .trace { margin-top:4px; font:11px/1.5 "Cascadia Mono",Consolas,monospace; color:var(--mut); word-break:break-all; }
+.wire .trace .nak { color:var(--bad); font-weight:700; }
 
 .q { margin:0; padding:0; list-style:none; }
-.q li { display:flex; align-items:center; gap:12px; padding:10px 12px; border-bottom:1px solid var(--line); }
+/* Wraps: in the narrow side panel the pills and buttons drop below the text
+   instead of squeezing it to one word per line. */
+.q li { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; padding:10px 12px; border-bottom:1px solid var(--line); }
 .q li:last-child { border-bottom:0; }
 .q .barcode { font:700 13px/1.3 "Cascadia Mono",Consolas,monospace; color:var(--ink); }
 .q .err { font-size:11.5px; color:var(--bad); margin-top:3px; word-break:break-word; }
-.q .grow { flex:1; min-width:0; }
+.q .grow { flex:1 1 240px; min-width:0; }
 
 /* ---- per-sample parameter list (staged analyzers) ---- */
 .params { margin-top:6px; }
@@ -205,7 +213,7 @@ ${FONT_LINK}
 <style>${BASE_CSS}${SHELL_CSS}${PAGE_CSS}</style>
 </head>
 <body>
-${renderSidebar('dashboard')}
+${renderSidebar('dashboard', { autoCertify: o.autoCertify })}
 <div class="brandbar"></div>
 
 <header class="topbar">
@@ -302,8 +310,18 @@ function keepScroll(el, id) {
   }
 }
 
+const AUTO_CERTIFY = ${o.autoCertify ? 'true' : 'false'};
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function time(iso) { return iso ? new Date(iso).toLocaleTimeString() : '\u2014'; }
+// A time that may not be today: the date is added when it differs, so
+// "received 6:43 PM" from yesterday no longer reads as later than 9:26 AM today.
+function when(iso) {
+  if (!iso) return '\u2014';
+  const d = new Date(iso);
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString()
+    : d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) + ' ' + d.toLocaleTimeString();
+}
 
 // Any 401 means the session lapsed while the page sat open — bounce to sign-in.
 async function j(url, opts) {
@@ -455,7 +473,7 @@ function renderCards(analyzers) {
       '<h3 style="margin-bottom:6px">No analyzers configured</h3>' +
       '<div class="mut" style="margin-bottom:16px">This connector is running in Auto-Certify-only mode: it certifies interfaced results in HIS and has no analyzer links. ' +
       'Add an entry under <code>analyzers</code> in config.json to connect a machine.</div>' +
-      '<a class="btn btn-primary btn-sm" href="/auto-certify">Open Auto Certify</a></div></div>';
+      (AUTO_CERTIFY ? '<a class="btn btn-primary btn-sm" href="/auto-certify">Open Auto Certify</a>' : '') + '</div></div>';
     return;
   }
 
@@ -575,7 +593,9 @@ async function renderPanel(id) {
     el.innerHTML = rows.length
       ? '<ul class="wire">' + rows.map(w =>
           '<li><div class="head"><span class="dir ' + esc(w.direction) + '">' + esc(w.direction) + '</span>' +
-          '<span>' + time(w.at) + '</span></div><pre>' + esc(w.text) + '</pre></li>').join('') + '</ul>'
+          '<span>' + when(w.at) + '</span></div><pre>' + esc(w.text) + '</pre>' +
+          (w.trace ? '<div class="trace">' + esc(w.trace).replace(/(←N[0-9]+)/g, '<span class="nak">$1</span>') + '</div>' : '') +
+          '</li>').join('') + '</ul>'
       : '<div class="empty">No traffic on the wire yet.</div>';
     keepScroll(el, id);
     return;
@@ -688,15 +708,18 @@ async function renderStaged(id, el) {
   const { samples, force } = await j('/api/analyzers/' + encodeURIComponent(id) + '/staged');
   const rows = (samples || []).map(s => {
     const pill = s.complete
-      ? '<span class="pill ok">filed</span>'
+      ? '<span class="pill ok">filed</span>' + (s.withheld ? '<span class="pill mut">' + s.withheld + ' withheld</span>' : '')
       : (s.filed > 0 ? '<span class="pill mut">partly filed</span>' : '<span class="pill warn">waiting for order</span>');
     const codes = (s.waitingCodes || []);
     const detail = s.filed + ' of ' + s.total + ' filed' +
       (s.waiting ? ' &mdash; ' + s.waiting + ' waiting: ' + esc(codes.slice(0, 8).join(', ')) + (codes.length > 8 ? ' &hellip;' : '') : '') +
+      (s.withheld ? ' &mdash; ' + s.withheld + ' withheld: ' + esc((s.withheldCodes || []).join(', ')) : '') +
       (s.dropped ? ' &mdash; ' + s.dropped + ' not interfaced' : '');
-    const when = 'received ' + time(s.firstReceivedAt) +
-      (s.lastCheckedAt ? ' · HMIS asked ' + time(s.lastCheckedAt) : '') +
-      (s.attempts ? ' · ' + s.attempts + ' pass' + (s.attempts === 1 ? '' : 'es') : '');
+    // Pass count only while something is genuinely waiting for HMIS — a
+    // withheld value is retried too, but counting it only looked like a fault.
+    const seen = 'received ' + when(s.firstReceivedAt) +
+      (s.lastCheckedAt ? ' · HMIS checked ' + when(s.lastCheckedAt) : '') +
+      (s.attempts && s.waiting ? ' · ' + s.attempts + ' pass' + (s.attempts === 1 ? '' : 'es') : '');
     const from = s.rekeyedFrom ? '<div class="err">re-keyed from ' + esc(s.rekeyedFrom) + '</div>' : '';
     const err = (s.lastError && !s.complete && !/^no order row yet/.test(s.lastError))
       ? '<div class="err">' + esc(s.lastError) + '</div>' : '';
@@ -722,11 +745,11 @@ async function renderStaged(id, el) {
           '<tr class="p-' + v.state + '"><td class="p-code">' + esc(v.testCode) + '</td>' +
           '<td class="p-val">' + esc(v.value) + (v.unit ? ' <span class="p-unit">' + esc(v.unit) + '</span>' : '') + '</td>' +
           '<td class="p-flag">' + esc(v.abnormalFlag || '') + '</td>' +
-          '<td class="p-state">' + (v.state === 'filed' ? 'filed' + (v.identifier && v.identifier !== v.testCode ? ' as ' + esc(v.identifier) : '') : v.state === 'void' ? 'no value' : 'waiting') + '</td></tr>'
+          '<td class="p-state">' + (v.state === 'filed' ? 'filed' + (v.identifier && v.identifier !== v.testCode ? ' as ' + esc(v.identifier) : '') : v.state === 'void' ? 'no value' : v.state === 'withheld' ? '<span title="' + esc(v.note || '') + '">withheld &mdash; HMIS row excluded</span>' : 'waiting') + '</td></tr>'
         ).join('') + '</tbody></table></details>'
       : '';
     return '<li><div class="grow"><div class="barcode">' + esc(s.barcode) + '</div>' +
-      '<div class="err">' + detail + '</div><div class="err">' + esc(when) + '</div>' + from + err + params + '</div>' +
+      '<div class="err">' + detail + '</div><div class="err">' + esc(seen) + '</div>' + from + err + params + '</div>' +
       pill + actions + forceBtn +
       '<button class="btn btn-ghost btn-sm btn-danger" type="button" data-s-remove="' + esc(s.barcode) + '">Remove</button></li>';
   }).join('');

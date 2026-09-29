@@ -80,8 +80,14 @@ body { padding-left:var(--rail); }
 `;
 
 /** The rail. Goes straight after <body>. */
-export function renderSidebar(active: NavPage): string {
-  const links = NAV_ITEMS.map(
+export interface SidebarOptions {
+  /** autoCertify.enabled in config.json. When false the Auto Certify page is
+   *  not offered at all — no rail icon, no link — and the server refuses it. */
+  autoCertify: boolean;
+}
+
+export function renderSidebar(active: NavPage, opts: SidebarOptions): string {
+  const links = NAV_ITEMS.filter((n) => n.page !== 'auto-certify' || opts.autoCertify).map(
     (n) =>
       `<a class="nav-item${n.page === active ? ' active' : ''}" href="${n.href}" title="${n.label} — ${n.hint}"${
         n.page === active ? ' aria-current="page"' : ''

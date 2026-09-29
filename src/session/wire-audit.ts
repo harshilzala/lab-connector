@@ -1,3 +1,5 @@
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { basename, dirname, extname, join } from 'node:path';
 import type { Logger } from '../logger.js';
 import { DailyLogFile } from '../maintenance/daily-log.js';
 import type { WireLogEntry } from './orchestrator.js';
@@ -25,13 +27,48 @@ import type { WireLogEntry } from './orchestrator.js';
 export class WireAudit {
   private readonly file: DailyLogFile;
 
-  constructor(base: string, logger: Logger, maxBytes = 10 * 1024 * 1024) {
+  constructor(private readonly base: string, logger: Logger, maxBytes = 10 * 1024 * 1024) {
     this.file = new DailyLogFile(base, logger, maxBytes);
   }
 
   /** The file the next frame lands in — e.g. logs\wire-cancer-abl9-2026-09-07.log */
   currentPath(): string {
     return this.file.currentPath();
+  }
+
+  /**
+   * The last `limit` frames already on disk, oldest first — so the console's
+   * Wire log tab is not empty after every restart. Reads the two most recently
+   * written day files (today and the day before, or today's numbered parts).
+   * Unreadable lines are skipped; a missing log is an empty list.
+   */
+  recent(limit: number): WireLogEntry[] {
+    const base = this.base;
+    const dir = dirname(base);
+    const ext = extname(base);
+    const stem = basename(base, ext);
+    try {
+      const files = readdirSync(dir)
+        .filter((f) => f.startsWith(stem + '-') && f.endsWith(ext) && /-\d{4}-\d{2}-\d{2}/.test(f.slice(stem.length)))
+        .map((f) => ({ f: join(dir, f), t: statSync(join(dir, f)).mtimeMs }))
+        .sort((a, b) => a.t - b.t)
+        .slice(-2);
+      const out: WireLogEntry[] = [];
+      for (const { f } of files) {
+        for (const line of readFileSync(f, 'utf8').split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const e = JSON.parse(line) as WireLogEntry;
+            if (e && e.at && e.direction) out.push(e);
+          } catch {
+            /* a torn last line — skip it */
+          }
+        }
+      }
+      return out.slice(-limit);
+    } catch {
+      return [];
+    }
   }
 
   record(entry: WireLogEntry): void {

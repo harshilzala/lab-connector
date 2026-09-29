@@ -166,7 +166,11 @@ export class AdminServer {
       if (method === 'GET' && p === '/') {
         return this.html(
           res,
-          renderDashboard({ username: session.username, usingDefaultPassword: this.auth.usingDefaultPassword }),
+          renderDashboard({
+            username: session.username,
+            usingDefaultPassword: this.auth.usingDefaultPassword,
+            autoCertify: this.backend.autoCertify().enabled,
+          }),
         );
       }
 
@@ -318,6 +322,13 @@ export class AdminServer {
       }
 
       // ---- Auto Certify ----
+      // Disabled in config.json (autoCertify.enabled = false): the page and its
+      // API do not exist for this install — the sidebar hides the link, and a
+      // typed or bookmarked URL lands back on the dashboard.
+      if ((p === '/auto-certify' || p.startsWith('/api/auto-certify')) && !this.backend.autoCertify().enabled) {
+        if (p.startsWith('/api/')) return this.json(res, { error: 'Auto Certify is disabled in config.json' }, 404);
+        return this.redirect(res, '/');
+      }
       if (method === 'GET' && p === '/auto-certify') {
         return this.html(res, renderAutoCertify({ username: session.username }));
       }
@@ -330,7 +341,7 @@ export class AdminServer {
 
       // ---- Connector Tool: the universal device monitor ----
       if (method === 'GET' && p === '/connector') {
-        return this.html(res, renderConnectorTool({ username: session.username }));
+        return this.html(res, renderConnectorTool({ username: session.username, autoCertify: this.backend.autoCertify().enabled }));
       }
       if (p.startsWith('/api/connector')) {
         // Everything under here either opens sockets or drives a live link, so

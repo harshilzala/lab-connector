@@ -56,7 +56,9 @@
     "autocertify": "tsx test/auto-certify.test.ts",
     "genx": "tsx test/genx-client.test.ts",
     "dist": "node scripts/make-dist.mjs",
-    "dist:seal": "node scripts/make-dist.mjs --seal"
+    "dist:seal": "node scripts/make-dist.mjs --seal",
+    "deploy": "node scripts/deploy.mjs",
+    "rerun-strip": "tsx test/rerun-strip.test.ts"
   },
   "dependencies": {
     "pino": "^9.5.0",

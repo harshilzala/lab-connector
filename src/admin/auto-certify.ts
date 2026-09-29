@@ -101,7 +101,7 @@ ${FONT_LINK}
 <style>${BASE_CSS}${SHELL_CSS}${PAGE_CSS}</style>
 </head>
 <body>
-${renderSidebar('auto-certify')}
+${renderSidebar('auto-certify', { autoCertify: true })}
 <div class="brandbar"></div>
 
 <header class="topbar">

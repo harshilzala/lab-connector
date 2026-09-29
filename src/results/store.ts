@@ -97,6 +97,13 @@ export interface StagedSummary {
   waiting: number;
   dropped: number;
   waitingCodes: string[];
+  /** Waiting values the connector holds back on purpose: HMIS offers a row
+   *  for the code, but every such row is excluded in config (the smear row
+   *  HMIS named "PCT"). They will not file until the HMIS master is fixed, so
+   *  the console shows them as withheld, not as waiting for an order. Filled
+   *  in by the analyzer runtime; the store alone cannot know. */
+  withheld?: number;
+  withheldCodes?: string[];
   complete: boolean;
   /** The interfaced parameters of this sample, in the order received — what
    *  the console lists under the barcode. Values the interface is not scoped
@@ -112,7 +119,9 @@ export interface StagedValueView {
   abnormalFlag: string | null;
   /** "filed" — accepted by HMIS; "waiting" — no order row yet; "void" — the
    *  analyzer sent a placeholder instead of a number. */
-  state: 'filed' | 'waiting' | 'void';
+  state: 'filed' | 'waiting' | 'void' | 'withheld';
+  /** Why a value is withheld — shown beside it. */
+  note?: string;
   filedAt: string | null;
   /** The HMIS identifier it was filed against, once filed. */
   identifier: string | null;
