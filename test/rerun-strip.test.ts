@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AnalyzerRuntime } from '../src/session/orchestrator.js';
-import { strippedRerunBarcode } from '../src/mapping/mapper.js';
+import { strippedRerunBarcode, trimToBarcodeFormat } from '../src/mapping/mapper.js';
 import { parseResultFile } from '../src/codec/kermit/vitros250.js';
 import type { HmisClient } from '../src/hmis/client.js';
 import type { AnalyzerConfig } from '../src/config.js';
@@ -49,7 +49,12 @@ const hmis = {
   },
 } as unknown as HmisClient;
 
-function runtime(dir: string, rerunSuffix: 'report' | 'strip', warned: Array<Record<string, unknown> & { msg: string }>) {
+function runtime(
+  dir: string,
+  rerunSuffix: 'report' | 'strip',
+  warned: Array<Record<string, unknown> & { msg: string }>,
+  sampleIdFormat: string | null = null,
+) {
   const log = {
     child: () => log,
     info() {},
@@ -81,6 +86,7 @@ function runtime(dir: string, rerunSuffix: 'report' | 'strip', warned: Array<Rec
     testValueMap: {},
     fillMissingOrderRows: false,
     rerunSuffix,
+    sampleIdFormat,
     equipmentId: 224895586,
     ipAddress: '10.20.4.52',
     portNo: '4001',
@@ -121,7 +127,7 @@ console.log('\n[2] strip: the rerun is queued under the base barcode, and logged
   assert.equal(payload.results[0].value, '56');
   console.log(`  ${G} queued as ${payload.barcode}, 90=${payload.results[0].value}`);
 
-  const hit = warned.find((w) => w.msg.startsWith('rerun suffix stripped'));
+  const hit = warned.find((w) => w.msg.startsWith('sample id trimmed'));
   assert.ok(hit, 'the strip must be logged');
   assert.equal(hit!.barcode, 'PL2609240011/R');
   assert.equal(hit!.filedAs, 'PL2609240011');
@@ -138,8 +144,53 @@ console.log('\n[3] report (default): unchanged — the id is kept as the analyze
   await rt.onMessage(parseResultFile(record('PL2609240011/R', '1946030924', [['90', '56']]), new Date('2026-09-24T19:46:03')));
   const payload = queued(dir)[0].payload ?? queued(dir)[0];
   assert.equal(payload.barcode, 'PL2609240011/R');
-  assert.ok(!warned.some((w) => w.msg.startsWith('rerun suffix stripped')));
+  assert.ok(!warned.some((w) => w.msg.startsWith('sample id trimmed')));
   console.log(`  ${G} still ${payload.barcode}; nothing stripped`);
+  rmSync(dir, { recursive: true, force: true });
+}
+
+const FORMAT = '[A-Z]{2}[0-9]{10}'; // every one of 1,943 HMIS barcodes on 2026-09-29
+
+console.log('\n[4] sampleIdFormat: extra after a valid barcode is cut off');
+{
+  for (const [id, want] of [
+    ['PL2609280007R', 'PL2609280007'], // BC-5150 rerun, bare R — no order needed
+    ['PL2609240011/R', 'PL2609240011'], // VITROS 250
+    ['PL2609260017-R2', 'PL2609260017'],
+    [' pl2609280007 ', null], // only case/space — normalizeBarcode already handles it
+    ['/PL2609280007X', 'PL2609280007'], // stray leading separator
+  ] as const) {
+    assert.equal(trimToBarcodeFormat(id, FORMAT), want, `${JSON.stringify(id)} -> ${want}`);
+    console.log(`  ${G} ${JSON.stringify(id).padEnd(18)} -> ${want ?? '(unchanged)'}`);
+  }
+  for (const id of ['PL2609280007', '8001', '89772', 'PL26092800', 'BHUSHAN16', '']) {
+    assert.equal(trimToBarcodeFormat(id, FORMAT), null, `${id} must be left alone`);
+  }
+  console.log(`  ${G} an exact barcode, QC ids (8001, 89772), a short id and a name are left alone`);
+}
+
+console.log('\n[5] sampleIdFormat on a machine with rerunSuffix "report": still trimmed, logged with the rule');
+{
+  const dir = mkdtempSync(join(tmpdir(), 'lab-format-'));
+  const warned: Array<Record<string, unknown> & { msg: string }> = [];
+  const rt = runtime(dir, 'report', warned, FORMAT);
+  await rt.onMessage(parseResultFile(record('PL2609280007R', '0937000929', [['90', '41']]), new Date('2026-09-29T09:37:00')));
+  const payload = queued(dir)[0].payload ?? queued(dir)[0];
+  assert.equal(payload.barcode, 'PL2609280007');
+  const hit = warned.find((w) => w.msg.startsWith('sample id trimmed'));
+  assert.equal(hit?.rule, 'sampleIdFormat');
+  console.log(`  ${G} PL2609280007R queued as ${payload.barcode} (rule: ${hit!.rule})`);
+  rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n[6] sampleIdFormat leaves a QC id alone');
+{
+  const dir = mkdtempSync(join(tmpdir(), 'lab-format-qc-'));
+  const warned: Array<Record<string, unknown> & { msg: string }> = [];
+  const rt = runtime(dir, 'report', warned, FORMAT);
+  await rt.onMessage(parseResultFile(record('8001', '0937000929', [['90', '41']]), new Date('2026-09-29T09:37:00')));
+  assert.ok(!warned.some((w) => w.msg.startsWith('sample id trimmed')), 'QC id must not be trimmed');
+  console.log(`  ${G} 8001 untouched`);
   rmSync(dir, { recursive: true, force: true });
 }
 

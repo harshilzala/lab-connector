@@ -19,6 +19,7 @@ import {
   normalizeBarcode,
   rerunBaseBarcode,
   strippedRerunBarcode,
+  trimToBarcodeFormat,
   toLisResultRows,
   toResultUploads,
   willSyncIdentifier,
@@ -1185,7 +1186,7 @@ export class AnalyzerRuntime {
 
     // 2) Results → durable upload.
     if (msg.results.length > 0) {
-      if (this.cfg.rerunSuffix === 'strip') msg = this.stripRerunSuffixes(msg);
+      msg = this.normalizeSampleIds(msg);
       const voids = msg.results.filter((r) => isVoidResult(r.value));
       if (voids.length) {
         this.log.warn(
@@ -1295,6 +1296,58 @@ export class AnalyzerRuntime {
   }
 
   /**
+   * Bring every result's sample id to the barcode HMIS holds, BEFORE anything
+   * else sees it — so the outstanding-assay report, the staged store / spool
+   * and the messageId all work on the real barcode.
+   *
+   *   1. sampleIdFormat (site-wide, e.g. "[A-Z]{2}[0-9]{10}"): an id that
+   *      starts with a barcode of that shape and carries anything more —
+   *      "PL2609280007R" (BC-5150 rerun), "PL2609240011/R" (VITROS 250) — is
+   *      cut back to the barcode. An id of another shape (QC "8001") is kept.
+   *   2. rerunSuffix "strip" (per analyzer): the rerun-mark rule, for sites
+   *      with no fixed barcode format.
+   *
+   * Logged per sample, so a trimmed id can always be traced back to what the
+   * instrument sent.
+   */
+  private normalizeSampleIds(msg: ParsedMessage): ParsedMessage {
+    const format = this.cfg.sampleIdFormat ?? null;
+    const strip = this.cfg.rerunSuffix === 'strip';
+    if (!format && !strip) return msg;
+    const known = (b: string) => this.orders.get(b) !== null;
+    const renamed = new Map<string, { to: string; rule: string }>();
+    const results = msg.results.map((r) => {
+      if (!r.sampleId) return r;
+      let to: string | null = null;
+      let rule = '';
+      if (format) {
+        to = trimToBarcodeFormat(r.sampleId, format);
+        rule = 'sampleIdFormat';
+      }
+      if (!to && strip) {
+        to = strippedRerunBarcode(r.sampleId, known);
+        rule = 'rerunSuffix = strip';
+      }
+      if (!to) return r;
+      renamed.set(r.sampleId, { to, rule });
+      return { ...r, sampleId: to };
+    });
+    if (renamed.size === 0) return msg;
+    for (const [from, { to, rule }] of renamed) {
+      this.log.warn(
+        {
+          barcode: from,
+          filedAs: to,
+          rule,
+          values: msg.results.filter((r) => r.sampleId === from).map((r) => `${r.testCode}=${r.value}`),
+        },
+        'sample id trimmed to the HMIS barcode — these values are filed under the barcode alone',
+      );
+    }
+    return { ...msg, results };
+  }
+
+  /**
    * A repeat the operator keyed with a suffix — "PL2609240011/R" for a rerun of
    * PL2609240011 — put on the record instead of thrown away.
    *
@@ -1312,36 +1365,6 @@ export class AnalyzerRuntime {
    * this repeats, what the instrument now reports, and which of those assays
    * the original order covers. Warn, drop the item, let the lab decide.
    */
-  /**
-   * `rerunSuffix: "strip"`: re-key every result whose sample id carries a rerun
-   * mark onto the base barcode, BEFORE anything else sees it — so the
-   * outstanding-assay report, the staged store / spool and the messageId all
-   * work on the barcode HMIS actually holds. Logged per sample so a filed
-   * rerun can always be traced back to what the instrument sent.
-   */
-  private stripRerunSuffixes(msg: ParsedMessage): ParsedMessage {
-    const known = (b: string) => this.orders.get(b) !== null;
-    const renamed = new Map<string, string>();
-    const results = msg.results.map((r) => {
-      const base = r.sampleId ? strippedRerunBarcode(r.sampleId, known) : null;
-      if (!base) return r;
-      renamed.set(r.sampleId, base);
-      return { ...r, sampleId: base };
-    });
-    if (renamed.size === 0) return msg;
-    for (const [from, to] of renamed) {
-      this.log.warn(
-        {
-          barcode: from,
-          filedAs: to,
-          values: msg.results.filter((r) => r.sampleId === from).map((r) => `${r.testCode}=${r.value}`),
-        },
-        'rerun suffix stripped (rerunSuffix = strip) — these values are filed under the base barcode',
-      );
-    }
-    return { ...msg, results };
-  }
-
   private reportRerun(payload: HmisResultUpload, base: string): void {
     const key = this.assayJoinKey();
     const ordered = new Set((this.orders.get(base)?.downloaded ?? []).map(key));

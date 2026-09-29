@@ -159,6 +159,17 @@ const Gh900Options = z.object({
   fileOnSamplingError: z.boolean().default(false),
 });
 
+/** True for null/undefined or a string that compiles as a RegExp. */
+function validRegex(v: string | null | undefined): boolean {
+  if (v === null || v === undefined) return true;
+  try {
+    new RegExp(v);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const AnalyzerSchema = z.object({
   id: z.string().regex(/^[a-z0-9-]+$/, 'analyzer id must be kebab-case'),
   /** Instrument MODEL this block is an instance of — see src/profiles. The
@@ -436,6 +447,10 @@ const AnalyzerSchema = z.object({
    *            one already filed changes nothing; a different value replaces it
    *            (while HMIS still accepts updates). Every strip is logged. */
   rerunSuffix: z.enum(['report', 'strip']).default('report'),
+  /** This analyzer's own HMIS barcode format, overriding the site-wide
+   *  `sampleIdFormat`; null switches trimming off for this machine. See the
+   *  top-level setting. */
+  sampleIdFormat: z.string().nullable().optional().refine(validRegex, 'not a valid regular expression'),
   /** How this analyzer's results reach HMIS.
    *
    *  "queue"  — one spool item per message, delivered in order, retried up to
@@ -591,6 +606,15 @@ const AutoCertifySchema = z
 
 const ConfigSchema = z.object({
   logLevel: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info'),
+  /** The shape of an HMIS barcode, as a regular expression (no anchors) —
+   *  e.g. "[A-Z]{2}[0-9]{10}" for PL2609280007. When set, a sample id an
+   *  analyzer reports that STARTS with a barcode of this shape but carries
+   *  something extra after it ("PL2609280007R", "PL2609240011/R") is filed
+   *  under the barcode alone, and the trim is logged. An id that does not
+   *  start with this shape (a QC material "8001", a typed name) is left
+   *  exactly as it came. null = no trimming. Applies to every analyzer; an
+   *  analyzer's own `sampleIdFormat` overrides it. */
+  sampleIdFormat: z.string().nullable().default(null).refine(validRegex, 'not a valid regular expression'),
   spoolDir: z.string().default('./spool'),
   hmis: z.object({
     /** The HMIS lab gateway the analyzers file into. Required when any
@@ -898,6 +922,10 @@ export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.
       }
       seen.set(code, a.id);
     }
+  }
+  // Site-wide barcode format → every analyzer that does not name its own.
+  for (const a of parsed.data.analyzers) {
+    if (a.sampleIdFormat === undefined) a.sampleIdFormat = parsed.data.sampleIdFormat;
   }
   return parsed.data;
 }

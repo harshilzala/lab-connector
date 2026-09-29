@@ -46,10 +46,16 @@ console.log(`  into : ${OUT}\n`);
 // A rebuild must not leave last build's files behind — a renamed module would
 // otherwise linger and a stale config could be picked up over the new one.
 // logs\ and spool\ are the site's own runtime state and are never touched.
+// dist\app.key is the exception: it is this machine's DPAPI-wrapped key, and
+// .env.enc can only be read with it. seal.mjs reuses it on a re-seal, so it
+// must survive the rebuild — losing it would strand the sealed secrets.
+const KEY_FILE = join(OUT, 'dist', 'app.key');
+const savedKey = existsSync(KEY_FILE) ? readFileSync(KEY_FILE) : null;
 for (const stale of ['dist', 'magic', 'package.json', 'ecosystem.config.cjs', 'README-DEPLOY.md', 'seal.mjs']) {
   rmSync(join(OUT, stale), { recursive: true, force: true });
 }
 mkdirSync(join(OUT, 'dist'), { recursive: true });
+if (savedKey) writeFileSync(KEY_FILE, savedKey);
 
 // ---- 1. the connector itself -------------------------------------------------
 // CommonJS, not ESM, and that is the load-bearing decision here.
@@ -146,6 +152,12 @@ console.log('  [3/5] ecosystem.config.cjs + magic\\ copied verbatim');
 const carried = [];
 for (const f of ['config.json', '.env', 'admin-auth.json']) {
   if (!existsSync(join(ROOT, f))) continue;
+  // A sealed folder keeps its secrets in .env.enc and has deleted .env on
+  // purpose; copying the source checkout's plaintext back in would undo that.
+  if (f === '.env' && existsSync(join(OUT, '.env.enc'))) {
+    carried.push('.env (not copied — this folder has .env.enc)');
+    continue;
+  }
   if (existsSync(join(OUT, f))) {
     carried.push(`${f} (kept the one already there)`);
     continue;

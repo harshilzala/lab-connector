@@ -83,7 +83,49 @@ function dpapiProtect(secret) {
   return wrapped;
 }
 
-const key = randomBytes(32);
+/** Open a DPAPI blob this machine wrapped earlier (the inverse of dpapiProtect). */
+function dpapiUnprotect(blobBase64) {
+  const ps = [
+    "$ErrorActionPreference='Stop';",
+    'Add-Type -AssemblyName System.Security;',
+    `$b=[Convert]::FromBase64String('${blobBase64}');`,
+    "[Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($b,$null,'LocalMachine'))",
+  ].join(' ');
+  const out = execFileSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+    { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  const key = Buffer.from(out.trim(), 'base64');
+  if (key.length !== 32) throw new Error('DPAPI returned a key of the wrong length');
+  return key;
+}
+
+// RE-SEALING KEEPS THE KEY. A folder sealed before already holds .env.enc, and
+// once its plaintext .env has been deleted (as it must be) that file can only
+// be read with the key it was written under. A fresh key here would leave
+// .env.enc unreadable and the connector unable to start on the next deploy.
+// So an existing dist\app.key is unwrapped and reused; only a first seal, or a
+// key that cannot be opened on this machine, makes a new one.
+const KEY_FILE = join(DIST, 'app.key');
+let key = null;
+if (existsSync(KEY_FILE)) {
+  try {
+    key = dpapiUnprotect(readFileSync(KEY_FILE, 'utf8').trim());
+    console.log('\n  re-sealing with this machine\'s existing key');
+  } catch {
+    key = null;
+  }
+}
+if (!key) {
+  if (existsSync(join(HERE, '.env.enc')) && !existsSync(join(HERE, '.env'))) {
+    console.error('\n  REFUSING TO SEAL: .env.enc is here but its key cannot be opened, and there is');
+    console.error('  no plaintext .env to re-encrypt. A new key would make the secrets unreadable.');
+    console.error('  Put the site\'s .env back in this folder and run seal.mjs again.\n');
+    process.exit(1);
+  }
+  key = randomBytes(32);
+}
 
 /** iv | tag | ciphertext — GCM, so a tampered file fails to open rather than
  *  running as something else. */

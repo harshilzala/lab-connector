@@ -46,6 +46,24 @@ export function rerunBaseBarcode(sampleId: string, known: (barcode: string) => b
 }
 
 /**
+ * The HMIS barcode inside an analyzer's sample id, for `sampleIdFormat`.
+ *
+ * Returns the leading run of `pattern` when the id starts with one AND has
+ * something more after it — "PL2609280007R" → "PL2609280007",
+ * "PL2609240011/R" → "PL2609240011", " PL2609280007 " → "PL2609280007".
+ * Stray separators or spaces before the barcode are skipped. Returns null when
+ * the id is already exactly a barcode, or does not start with one (QC "8001",
+ * a typed name): those are left alone.
+ */
+export function trimToBarcodeFormat(sampleId: string, pattern: string): string | null {
+  const id = normalizeBarcode(sampleId);
+  const body = id.replace(/^[^A-Z0-9]+/, '');
+  const m = new RegExp(`^(?:${pattern})`).exec(body);
+  if (!m || !m[0]) return null;
+  return m[0] === id ? null : m[0];
+}
+
+/**
  * The base barcode to FILE a rerun under, for an analyzer set to
  * `rerunSuffix: "strip"` — the lab's decision (2026-09-29) for the VITROS 250
  * and ECiQ, where operators key repeats as "PL2609240011/R".
