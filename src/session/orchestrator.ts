@@ -18,6 +18,7 @@ import {
   keepInterfacedResults,
   normalizeBarcode,
   rerunBaseBarcode,
+  strippedRerunBarcode,
   toLisResultRows,
   toResultUploads,
   willSyncIdentifier,
@@ -1131,6 +1132,7 @@ export class AnalyzerRuntime {
 
     // 2) Results → durable upload.
     if (msg.results.length > 0) {
+      if (this.cfg.rerunSuffix === 'strip') msg = this.stripRerunSuffixes(msg);
       const voids = msg.results.filter((r) => isVoidResult(r.value));
       if (voids.length) {
         this.log.warn(
@@ -1257,6 +1259,36 @@ export class AnalyzerRuntime {
    * this repeats, what the instrument now reports, and which of those assays
    * the original order covers. Warn, drop the item, let the lab decide.
    */
+  /**
+   * `rerunSuffix: "strip"`: re-key every result whose sample id carries a rerun
+   * mark onto the base barcode, BEFORE anything else sees it — so the
+   * outstanding-assay report, the staged store / spool and the messageId all
+   * work on the barcode HMIS actually holds. Logged per sample so a filed
+   * rerun can always be traced back to what the instrument sent.
+   */
+  private stripRerunSuffixes(msg: ParsedMessage): ParsedMessage {
+    const known = (b: string) => this.orders.get(b) !== null;
+    const renamed = new Map<string, string>();
+    const results = msg.results.map((r) => {
+      const base = r.sampleId ? strippedRerunBarcode(r.sampleId, known) : null;
+      if (!base) return r;
+      renamed.set(r.sampleId, base);
+      return { ...r, sampleId: base };
+    });
+    if (renamed.size === 0) return msg;
+    for (const [from, to] of renamed) {
+      this.log.warn(
+        {
+          barcode: from,
+          filedAs: to,
+          values: msg.results.filter((r) => r.sampleId === from).map((r) => `${r.testCode}=${r.value}`),
+        },
+        'rerun suffix stripped (rerunSuffix = strip) — these values are filed under the base barcode',
+      );
+    }
+    return { ...msg, results };
+  }
+
   private reportRerun(payload: HmisResultUpload, base: string): void {
     const key = this.assayJoinKey();
     const ordered = new Set((this.orders.get(base)?.downloaded ?? []).map(key));

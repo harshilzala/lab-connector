@@ -45,6 +45,24 @@ export function rerunBaseBarcode(sampleId: string, known: (barcode: string) => b
   return base && base !== id && known(base) ? base : null;
 }
 
+/**
+ * The base barcode to FILE a rerun under, for an analyzer set to
+ * `rerunSuffix: "strip"` — the lab's decision (2026-09-29) for the VITROS 250
+ * and ECiQ, where operators key repeats as "PL2609240011/R".
+ *
+ * A suffix written with a separator ("/R", "-R2", "_R", " R") is stripped
+ * whether or not the base is a known order: nothing else is spelled that way.
+ * A bare trailing R ("PL2609190003R") is stripped only when the base is a
+ * barcode this analyzer holds an order for, as in rerunBaseBarcode, so a real
+ * barcode that ends in R is never cut short. Null = leave the id alone.
+ */
+export function strippedRerunBarcode(sampleId: string, known: (barcode: string) => boolean): string | null {
+  const id = normalizeBarcode(sampleId);
+  const separated = /^(.{4,}?)[/\\\-_ ]R\d*$/.exec(id);
+  if (separated?.[1]) return separated[1];
+  return rerunBaseBarcode(id, known);
+}
+
 export function isQcSample(sampleId: string, cfg: AnalyzerConfig['qc']): boolean {
   const id = (sampleId || '').trim();
   if (!id) return false;

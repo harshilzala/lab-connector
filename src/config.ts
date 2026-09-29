@@ -425,6 +425,17 @@ const AnalyzerSchema = z.object({
    *  which analyte, because a wrong guess files a value against the wrong
    *  analyte on a patient's CBC. */
   fillMissingOrderRows: z.boolean().default(false),
+  /** What to do with a result whose sample id carries an operator's rerun
+   *  mark — "PL2609240011/R", "PL2609260017-R2".
+   *
+   *  "report" (default) — log it as a rerun of the base barcode and do NOT
+   *            file it: HMIS has no such sample, and overwriting an accepted
+   *            value is the lab's call.
+   *  "strip"   — the lab has made that call: file the values under the base
+   *            barcode, like any other result for it. A value identical to the
+   *            one already filed changes nothing; a different value replaces it
+   *            (while HMIS still accepts updates). Every strip is logged. */
+  rerunSuffix: z.enum(['report', 'strip']).default('report'),
   /** How this analyzer's results reach HMIS.
    *
    *  "queue"  — one spool item per message, delivered in order, retried up to
