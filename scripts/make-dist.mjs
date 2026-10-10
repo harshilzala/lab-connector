@@ -165,6 +165,13 @@ for (const f of ['config.json', '.env', 'admin-auth.json']) {
   cpSync(join(ROOT, f), join(OUT, f));
   carried.push(f);
 }
+// The config library holds no secrets and no site state — it is regenerated
+// from every config file seen (npm run config:sample), so it is always
+// replaced, never kept: an engineer at the site copies machine blocks from it.
+if (existsSync(join(ROOT, 'config.sample.json'))) {
+  cpSync(join(ROOT, 'config.sample.json'), join(OUT, 'config.sample.json'));
+  carried.push('config.sample.json');
+}
 console.log(`  [4/5] ${carried.join(', ') || 'no config files found to carry'}`);
 
 // ---- 5. runtime state directories -------------------------------------------
@@ -225,6 +232,8 @@ Requires Node 22+ and PM2 on PATH (\`npm install -g pm2\`). Nothing else.
     dist\\index.js          entry point (a shim, or the loader once sealed)
     dist\\index.cjs         the connector, bundled and minified
     config.json            this site's analyzer wiring — the file to edit
+    config.sample.json     every machine block / setting seen anywhere, secrets
+                           blanked — copy from it, never run from it
     .env                   secrets and overrides; wins over config.json
     admin-auth.json        dashboard credential (created on first start)
     ecosystem.config.cjs   PM2 process definition

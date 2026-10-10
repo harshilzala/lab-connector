@@ -691,7 +691,10 @@ const ConfigSchema = z.object({
      *  above (baseUrl + the three paths); "genx" = GenX LIMS Lab Equipment API
      *  (the `genx` block). Flip this one word to move between them — both
      *  blocks can stay configured side by side. */
-    api: z.enum(['mirth', 'genx']).default('mirth'),
+    // "hinai" is the name the config file uses for the Zydus /mirth/* gateway
+    // (its settings live in the `hinai` block, lifted up by liftHmisBlocks);
+    // "mirth" is the same gateway under its older name. Only "genx" differs.
+    api: z.enum(['mirth', 'hinai', 'genx']).default('mirth'),
     /** GenX LIMS Lab Equipment External API — used only when api = "genx".
      *  See src/hmis/genx.ts. */
     genx: z
@@ -945,6 +948,22 @@ function applyEnvOverrides(raw: any): any {
   return cfg;
 }
 
+/**
+ * `hmis` holds each gateway in its own named block — `hinai` (Zydus HIMS, the
+ * /mirth/* gateway) and `genx` (GenX LIMS) — and `api` names the one that
+ * receives results. The rest of the connector reads the HIMS settings from the
+ * top of `hmis` (baseUrl, siteIds, the three paths), so the `hinai` block's keys
+ * are lifted there; a key inside `hinai` wins over the same key at the top. A
+ * config written before the blocks existed has no `hinai` key and is read
+ * exactly as before.
+ */
+function liftHmisBlocks(raw: unknown): unknown {
+  const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (!isObj(raw) || !isObj(raw.hmis) || !isObj(raw.hmis.hinai)) return raw;
+  const { hinai, ...rest } = raw.hmis;
+  return { ...raw, hmis: { ...rest, ...hinai } };
+}
+
 export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.json'): AppConfig {
   loadEnvFile(); // populate process.env from .env before applying overrides
   const abs = resolve(path);
@@ -958,7 +977,7 @@ export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.
   }
   // Model-level defaults from the analyzer's profile go under the block first,
   // so the schema validates the RESULT — a profile cannot bypass validation.
-  const withEnv = applyEnvOverrides(applyProfiles(raw));
+  const withEnv = applyEnvOverrides(applyProfiles(liftHmisBlocks(raw)));
   const parsed = ConfigSchema.safeParse(withEnv);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `  • ${i.path.join('.')}: ${i.message}`).join('\n');

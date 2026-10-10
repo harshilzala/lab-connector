@@ -298,7 +298,9 @@ function keepScroll(el, id) {
   const key = scrollKey(id);
   const prev = state.scroll[key];
   if (prev && prev.top > 0) {
-    el.scrollTop = prev.top + (el.scrollHeight - prev.height);
+    // Only the wire log grows at the TOP (newest first), so only there is the
+    // offset corrected by the growth; Results and Orders keep the exact place.
+    el.scrollTop = state.tab === 'wire' ? prev.top + (el.scrollHeight - prev.height) : prev.top;
   }
   const save = () => { state.scroll[key] = { top: el.scrollTop, height: el.scrollHeight }; };
   save();
@@ -308,6 +310,49 @@ function keepScroll(el, id) {
     el.dataset.scrollBound = '1';
     el.addEventListener('scroll', save, { passive: true });
   }
+}
+
+// ---- keep the operator's view across the 5-second refresh -----------------
+// Every refresh rebuilds the analyzer cards. Three things used to move the view
+// while someone was reading: (1) the drop-downs in Results / Orders snapped
+// back to their default open/closed state, so the panel changed height under
+// the reader; (2) the page's own scroll position was not carried over; (3) a
+// long wire frame lost its own scroll. Auto-refresh stays; only the jump goes.
+// (Emitted into a template literal: no backticks or dollar-braces in here.)
+state.details = {};
+let userScrollAt = 0;
+// On document, like the dashboard's other listeners — these events reach it.
+['wheel', 'touchmove', 'keydown', 'mousedown'].forEach(function (ev) {
+  document.addEventListener(ev, function () { userScrollAt = Date.now(); }, { passive: true });
+});
+// Remember each drop-down the operator opens or closes, per panel and row.
+document.addEventListener('toggle', function (e) {
+  const d = e.target;
+  if (!d || d.tagName !== 'DETAILS' || !d.dataset || !d.dataset.key || !state.open) return;
+  state.details[scrollKey(state.open) + '|' + d.dataset.key] = d.open;
+}, true);
+function applyDetails(el, id) {
+  const prefix = scrollKey(id) + '|';
+  el.querySelectorAll('details[data-key]').forEach(function (d) {
+    const want = state.details[prefix + d.dataset.key];
+    if (want !== undefined && d.open !== want) d.open = want;
+  });
+}
+// Scroll position of each long frame box, keyed by its row.
+function snapInner(el) {
+  const out = {};
+  if (!el) return out;
+  el.querySelectorAll('[data-key] pre').forEach(function (p) {
+    if (p.scrollTop || p.scrollLeft) out[p.closest('[data-key]').dataset.key] = [p.scrollTop, p.scrollLeft];
+  });
+  return out;
+}
+function restoreInner(el, snap) {
+  if (!el || !snap) return;
+  el.querySelectorAll('[data-key] pre').forEach(function (p) {
+    const s = snap[p.closest('[data-key]').dataset.key];
+    if (s) { p.scrollTop = s[0]; p.scrollLeft = s[1]; }
+  });
 }
 
 const AUTO_CERTIFY = ${o.autoCertify ? 'true' : 'false'};
@@ -506,6 +551,7 @@ function renderCards(analyzers) {
   // contents across so the panel is never empty in between.
   const openPanel = state.open ? document.getElementById('panel-' + state.open) : null;
   const carried = openPanel ? openPanel.innerHTML : null;
+  const carriedInner = snapInner(openPanel);
 
   grid.innerHTML = analyzers.map(a => \`
     <article class="card \${state.max === a.id ? 'is-max' : ''}">
@@ -555,6 +601,7 @@ function renderCards(analyzers) {
     const fresh = document.getElementById('panel-' + state.open);
     if (fresh) {
       fresh.innerHTML = carried;
+      restoreInner(fresh, carriedInner);
       keepScroll(fresh, state.open);
     }
   }
@@ -612,13 +659,15 @@ async function renderPanel(id) {
       const c = tools.querySelector('[data-wire-clear]');
       if (c) c.onclick = () => clearWire(id);
     }
+    const wireSnap = snapInner(el);
     el.innerHTML = rows.length
       ? '<ul class="wire">' + rows.map(w =>
-          '<li><div class="head"><span class="dir ' + esc(w.direction) + '">' + esc(w.direction) + '</span>' +
+          '<li data-key="' + esc(w.at + '|' + w.direction) + '"><div class="head"><span class="dir ' + esc(w.direction) + '">' + esc(w.direction) + '</span>' +
           '<span>' + when(w.at) + '</span></div><pre>' + esc(w.text) + '</pre>' +
           (w.trace ? '<div class="trace">' + esc(w.trace).replace(/(←N[0-9]+)/g, '<span class="nak">$1</span>') + '</div>' : '') +
           '</li>').join('') + '</ul>'
       : '<div class="empty">No traffic on the wire yet.</div>';
+    restoreInner(el, wireSnap);
     keepScroll(el, id);
     return;
   }
@@ -680,7 +729,7 @@ async function renderOrders(id, el) {
     const pill = o.noSyncCount === 0
       ? '<span class="pill ok">' + o.syncCount + ' sync</span>'
       : '<span class="pill mut">' + o.syncCount + ' sync</span> <span class="pill warn">' + o.noSyncCount + ' no sync</span>';
-    const list = '<details class="params"><summary>' + o.rows.length + ' HMIS row' + (o.rows.length === 1 ? '' : 's') + '</summary>' +
+    const list = '<details class="params" data-key="' + esc(o.barcode) + '"><summary>' + o.rows.length + ' HMIS row' + (o.rows.length === 1 ? '' : 's') + '</summary>' +
       '<table class="params-t"><tbody>' +
       o.rows.map(r =>
         '<tr class="' + (r.sync ? 'o-sync' : 'o-nosync') + '"><td class="p-code">' + esc(r.identifier) + '</td>' +
@@ -700,6 +749,7 @@ async function renderOrders(id, el) {
     ? '<ul class="q">' + rows + '</ul>'
     : '<div class="empty">No orders in the store &mdash; nothing pending in the HMIS for this machine (or polling is off).</div>';
   el.querySelectorAll('[data-o-resend]').forEach(b => { b.onclick = () => resendOrder(id, b.dataset.oResend, b); });
+  applyDetails(el, id);
   keepScroll(el, id);
 }
 
@@ -761,7 +811,7 @@ async function renderStaged(id, el) {
     // the lab expects to see on the report.
     const vals = (s.values || []);
     const params = vals.length
-      ? '<details class="params"' + (s.complete ? '' : ' open') + '><summary>' + vals.length + ' parameter' + (vals.length === 1 ? '' : 's') + '</summary>' +
+      ? '<details class="params" data-key="' + esc(s.barcode) + '"' + (s.complete ? '' : ' open') + '><summary>' + vals.length + ' parameter' + (vals.length === 1 ? '' : 's') + '</summary>' +
         '<table class="params-t"><tbody>' +
         vals.map(v =>
           '<tr class="p-' + v.state + '"><td class="p-code">' + esc(v.testCode) + '</td>' +
@@ -782,6 +832,7 @@ async function renderStaged(id, el) {
   el.querySelectorAll('[data-s-file]').forEach(b => { b.onclick = () => stagedFile(id, b.dataset.sFile); });
   el.querySelectorAll('[data-s-rekey]').forEach(b => { b.onclick = () => stagedRekey(id, b.dataset.sRekey); });
   el.querySelectorAll('[data-s-remove]').forEach(b => { b.onclick = () => stagedRemove(id, b.dataset.sRemove); });
+  applyDetails(el, id);
   keepScroll(el, id);
 }
 
@@ -851,9 +902,17 @@ async function clearWire(id) {
 async function refresh() {
   try {
     const { analyzers } = await j('/api/status');
+    // Keep the page where the operator left it: rebuilding the cards can
+    // shorten the page for a moment and the browser then pulls the view up.
+    const pageY = window.scrollY || 0;
+    const touched = userScrollAt;
     renderStats(analyzers);
     renderCards(analyzers);
-    if (state.open) renderPanel(state.open);
+    window.scrollTo(0, pageY);
+    if (state.open) await renderPanel(state.open);
+    // Restore again after the panel's fetch — unless the operator scrolled
+    // in the meantime, in which case their new position wins.
+    if (userScrollAt === touched && (window.scrollY || 0) !== pageY) window.scrollTo(0, pageY);
     document.getElementById('alert').innerHTML = '';
     document.getElementById('refreshed').textContent = 'refreshed ' + new Date().toLocaleTimeString();
   } catch (err) {

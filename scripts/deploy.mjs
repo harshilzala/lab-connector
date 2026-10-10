@@ -41,6 +41,13 @@ if (!existsSync(join(TARGET, 'config.json'))) die(`${TARGET} has no config.json 
 step(1, 'typecheck');
 if (run('npx', ['tsc', '-p', 'tsconfig.json', '--noEmit'], { cwd: ROOT }).status !== 0) die('the sources do not typecheck');
 
+// Fold this folder's live config.json into the config library before it ships
+// with the build. A failure here never stops a deploy — the library is a copy.
+console.log('        refreshing config.sample.json');
+if (run('npx', ['tsx', join('scripts', 'make-config-sample.ts'), TARGET], { cwd: ROOT, stdio: 'ignore' }).status !== 0) {
+  console.log('        (config.sample.json not refreshed — run npm run config:sample to see why)');
+}
+
 step(2, 'waiting for the analyzer links to be quiet');
 const logDir = join(TARGET, 'logs');
 const lastWire = () => {

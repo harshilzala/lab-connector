@@ -186,7 +186,7 @@ check('after restart the accession is read from the cache, no worklist call', se
 // --- the live config parses with the genx block present ------------------------------
 const cfgText = readFileSync(new URL('../config.json', import.meta.url), 'utf8');
 const cfg = parseJsonc(cfgText) as { hmis: { api: string; genx: { serviceTests: Record<string, string[]> } } };
-check('config.json: api switch present', cfg.hmis.api === 'mirth' || cfg.hmis.api === 'genx', cfg.hmis.api);
+check('config.json: api switch present', cfg.hmis.api === 'hinai' || cfg.hmis.api === 'mirth' || cfg.hmis.api === 'genx', cfg.hmis.api);
 check('config.json: genx block present', Array.isArray(cfg.hmis.genx.serviceTests.CBC));
 
 server.close();
