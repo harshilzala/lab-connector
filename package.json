@@ -53,7 +53,9 @@
     "prefixes": "tsx test/download-prefixes.test.ts",
     "params": "tsx test/parameter-catalogue.test.ts",
     "replay:0028": "tsx test/ch2609080028-replay.ts",
-    "autocertify": "tsx test/auto-certify.test.ts"
+    "autocertify": "tsx test/auto-certify.test.ts",
+    "im:orders": "tsx test/im-order-push.test.ts",
+    "im:channels": "tsx test/im-channels.test.ts"
   },
   "dependencies": {
     "pino": "^9.5.0",

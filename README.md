@@ -360,6 +360,99 @@ vendor trace) and analyse that instead of running a probe. `npm run
 connector-tool` exercises the whole tool against a fake analyzer, with no
 hardware and no HMIS.
 
+## IM: orders out, results in
+
+Every machine above is reached directly. **IM** is not a machine: it is the
+instrument middleware in front of the chemistry / immunoassay line, and it runs
+the tubes on the analyzers itself. It never asks the LIS for work — it listens
+on a TCP port and takes every order sent to it. That feed came from a Mirth
+channel. With `hl7.orderPush` the connector reads those orders from HMIS itself
+and sends them to IM, and takes the results back on a second connection:
+
+```
+                       ORDER channel  — the connector dials IM (transport)
+HMIS  GET /mirth/pending?eqCode=EQ0022&siteId=…   (the ordinary order poll)
+        │  one row per pending test, grouped per tube
+        ▼
+  order store ──► ORM^O01 over MLLP ──► IM ──► the analyzers
+        ▲                                │
+        └──── marked downloaded ◄─────────┘ only when IM answers MSA|AA
+
+                       RESULT channel — IM dials the connector (resultTransport)
+  IM ──► ORU^R01 over MLLP ──► result store ──► joined to the order rows
+                                                  │
+HMIS  POST /mirth/labresult  ◄────────────────────┘ then POST /mirth/acknowledge
+```
+
+Both channels belong to **one** analyzer block — one equipment code, one order
+store — which is what lets a result that arrives on one connection be filed
+against the order that left on the other.
+
+- **One message per tube**, each test its own ORC/OBR pair, the barcode in both
+  the placer and the filler order number, the specimen type in OBR-15 and the
+  priority in OBR-5 and OBR-27. Demographics ride along when
+  `sendDemographics` is on, so IM's worklist shows a name.
+- **Acknowledged or not sent.** The order is written and then the link waits for
+  IM's `MSA`. `AA`/`CA` marks the tube downloaded in the order store, so it is
+  never sent twice. `AE`/`AR` is a **refusal**: the tube is *not* marked, the
+  reason IM gave is logged, the tubes behind it still go, and it is offered
+  again after ten minutes rather than on every poll. No answer inside
+  `ackTimeoutMs`, or a socket that drops, is a **link failure** and counts
+  toward the ordinary download breaker (three in a row suspends pushing for a
+  doubling interval while polling continues).
+- **Orders go one at a time.** The next is not written until the one before it
+  has been answered, so two tubes never share the line.
+- **Nothing is acknowledged to HMIS at download.** As everywhere else, a pending
+  row is retired only once a result has been filed against it.
+- **Results come back on their own connection.** `resultTransport` is a
+  listener: IM dials it and delivers `ORU^R01`, each acknowledged with
+  `MSA|AA`. The barcode is read from OBR-3 (OBR-2 as the fallback) and the test
+  code from OBX-3, and every OBX value type is accepted — this line reports
+  screening assays as words ("Non Reactive"), which a numbers-only filter would
+  drop. A value files only against a pending row HMIS raised for that barcode
+  and that identifier; anything else waits as unmatched. Nothing but
+  acknowledgements is ever sent on this channel. The listening port is this
+  PC's choice (10012 by default): IM's result connection has to be pointed at
+  it, or the block given the port IM already uses.
+- **Both channels are on the console.** The Auto Certify page opens with an
+  *Order channel* and a *Result channel* card: where each connects, whether the
+  link is up, how many tubes IM accepted, refused or left unanswered, how many
+  are still waiting to go, how many result messages and values came back, and
+  the last tube in each direction. That page does not show where the certify
+  job connects — the portal URL and the HIS database are neither rendered nor
+  sent to the browser.
+
+The whole machine is one profile: `"profile": "im"` supplies HL7 over MLLP,
+`transport` client mode on port 10011, the result listener on 10012, the poll,
+and the push. A site block is the address and the equipment code:
+
+```jsonc
+{
+  "id": "im",
+  "profile": "im",
+  "equipmentCode": "EQ0022",
+  "siteIds": ["2", "13873256", "5866265", "14", "2567859"],
+  "transport": { "host": "10.11.4.231" },                // ORDER channel: dial IM
+  "resultTransport": { "type": "tcp", "mode": "server",  // RESULT channel: IM dials in
+                       "host": "0.0.0.0", "port": 10012 }
+}
+```
+
+**Before turning it on, stop the Mirth channel that feeds IM** — two systems
+sending the same orders puts every tube on IM's worklist twice.
+
+**Commissioning.** The message layout is the HL7 v2 standard one; it has not
+been read off a capture of the Mirth feed, so IM's own acknowledgement is what
+confirms it. Send one tube, watch the wire log on the dashboard, and read the
+`MSA`. If IM refuses it, the reason is in the log and everything that might
+differ is a setting rather than an edit: `messageType` (`ORM^O01` or `OML^O21`,
+which adds an SPM specimen segment), `version` (MSH-12), `receivingApp` /
+`receivingFacility` (MSH-5/6), `processingId` (MSH-11), and `sendingApp` /
+`sendingFacility` (MSH-3/4). `npm run im:orders` pins the message, the
+acknowledgement handling and the poll behaviour; `npm run im:channels` runs
+the whole connector against a stand-in HMIS and a stand-in IM, both channels
+and the console page included.
+
 ## Result filing: queue or staged
 
 Each analyzer chooses how its results reach HMIS with `filing.mode`:

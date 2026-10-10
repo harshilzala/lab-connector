@@ -340,13 +340,17 @@ function queuePill(a) {
 // it means new orders are not reaching this analyzer.
 function ordersLine(o) {
   if (!o) return '—';
-  // Every pending call carries both the machine's eqCode and this site's id;
-  // an empty answer for that pair is "no work here", never widened.
-  var keyed = (o.eqCodes && o.eqCodes.length ? esc(o.eqCodes.join('+')) : '') + (o.siteId ? ' @ site ' + esc(o.siteId) : ' @ <span class="err">no siteId</span>');
-  var stored = o.stored + ' stored · ' + keyed;
-  if (!o.pollEnabled) return esc(stored) + ' · poll off';
-  if (o.lastPollError) return '<span class="pill bad">poll failing</span> ' + esc(stored) + ' · ' + esc(o.lastPollError);
-  return esc(stored) + ' · polled ' + time(o.lastPollAt);
+  // Every pending call carries the machine's eqCode and is repeated over each
+  // site in siteIds (a referral analyzer lists several); an empty answer for
+  // that pair is "no work here", never widened. The warning span is appended
+  // AFTER escaping — built into the escaped text it showed as literal markup.
+  var sites = o.siteIds && o.siteIds.length ? o.siteIds : (o.siteId ? [o.siteId] : []);
+  var codes = o.eqCodes && o.eqCodes.length ? o.eqCodes.join('+') : '';
+  var stored = esc(o.stored + ' stored · ' + codes) +
+    (sites.length ? esc(' @ site' + (sites.length > 1 ? 's ' : ' ') + sites.join('+')) : ' @ <span class="err">no siteId — every site</span>');
+  if (!o.pollEnabled) return stored + ' · poll off';
+  if (o.lastPollError) return '<span class="pill bad">poll failing</span> ' + stored + ' · ' + esc(o.lastPollError);
+  return stored + ' · polled ' + time(o.lastPollAt);
 }
 // The interfaced-parameter filter (config allowTestCodes) set against the
 // identifiers HMIS has actually offered this analyzer. Green: in the list and
@@ -392,8 +396,26 @@ function filterBlock(f, scope) {
             '<span class="v"><span class="codes">' + chips + '</span>' +
             '<div class="codes-note"' + (extra.length ? ' title="' + esc(extra.join(', ')) + '"' : '') + '>' + esc(note) + '</div></span></div>';
   } else {
-    html += '<div class="kv"><span class="k">Interfaced parameters</span><span class="v">no allow-list — files whatever matches a pending row' +
-            (hasHmis ? ' (' + f.hmis.length + ' HMIS identifiers seen)' : '') + '</span></div>';
+    // No allow-list (the Maglumi, the U-WAM): the scope is whatever HMIS
+    // registers under the machine's equipment code, so SHOW that list — a
+    // bare sentence told the operator nothing about what is interfaced.
+    if (hasHmis) {
+      var dedup = {};
+      var ids = (f.hmis || []).filter(function (id) {
+        var k = String(id).trim().toUpperCase();
+        if (!k || dedup[k]) return false;
+        dedup[k] = true;
+        return true;
+      }).sort(function (a, b) { return String(a).localeCompare(String(b)); });
+      var idChips = ids.map(function (id) {
+        return '<span class="code ok" title="registered in HMIS for this machine - a result with this code is filed">' + esc(id) + '</span>';
+      }).join('');
+      html += '<div class="kv stack"><span class="k">Interfaced parameters <span class="mut">(' + ids.length + ' in HMIS)</span></span>' +
+              '<span class="v"><span class="codes">' + idChips + '</span>' +
+              '<div class="codes-note">No allow-list: every parameter HMIS registers for this machine is filed. A code the machine sends that is not in this list waits as unmatched until HMIS maps it.</div></span></div>';
+    } else {
+      html += '<div class="kv"><span class="k">Interfaced parameters</span><span class="v">No allow-list: files whatever HMIS registers for this machine. No HMIS order rows seen yet, so the list is not known.</span></div>';
+    }
   }
   if (f.ignore && f.ignore.length) {
     html += '<div class="kv stack"><span class="k">Dropped, never filed <span class="mut">(' + f.ignore.length + ')</span></span>' +

@@ -523,7 +523,20 @@ export class AdminServer {
     const svc = this.backend.autoCertify();
     try {
       if (method === 'GET' && p === '/api/auto-certify') {
-        return this.json(res, { status: svc.snapshot(), history: svc.history() });
+        // The page does not show WHERE the job connects — the portal URL and
+        // the HIS database — so neither is sent to the browser at all. Both
+        // stay in config.json and in the start-up log.
+        const snap = svc.snapshot();
+        const { certifyUrl: _url, oracle: _db, ...config } = snap.config;
+        return this.json(res, {
+          status: { ...snap, config },
+          history: svc.history(),
+          // The IM order and result channels, shown on the same page.
+          channels: this.backend
+            .statuses()
+            .filter((a) => a.channels)
+            .map((a) => ({ id: a.id, equipmentCode: a.equipmentCode, ...a.channels })),
+        });
       }
       if (method === 'POST' && p === '/api/auto-certify/run') {
         this.logger.warn('auto certify run requested from the admin console');

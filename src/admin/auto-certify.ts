@@ -8,6 +8,14 @@ import { SHELL_CSS, SHELL_JS, renderSidebar } from './shell.js';
 // what the last run found and certified, the settings it runs with, and every
 // recent certify call with the portal's answer. Run now / Pause act on the
 // running service. Preview reads what is ready without certifying anything.
+//
+// Above it, the two IM channels: the ORDER channel the connector dials to send
+// IM its work, and the RESULT channel it listens on for IM to hand the same
+// tubes back with their values. Both come from the analyzer status.
+//
+// What the page does NOT show is where the certify job connects — the portal
+// URL and the HIS database. Neither is rendered, and the API behind the page
+// does not send them to the browser (src/admin/server.ts).
 // =============================================================================
 
 export interface AutoCertifyPageOptions {
@@ -58,6 +66,16 @@ main { flex:1; width:100%; padding:26px 28px 40px; }
 .kv .v { color:var(--ink); font-weight:600; text-align:right; word-break:break-all; }
 .mono { font-family:"Cascadia Mono",Consolas,"SF Mono",Menlo,monospace; font-size:12.5px; }
 .chip { display:inline-block; padding:1px 7px; margin:1px 0 1px 4px; border-radius:5px; background:var(--plum-soft); color:var(--plum-600); font:700 11.5px/1.5 "Cascadia Mono",Consolas,monospace; }
+
+.section-head { display:flex; align-items:baseline; gap:10px; margin:0 0 12px; }
+.section-head h2 { font-size:16px; }
+.section-head .note { font-size:12.5px; color:var(--mut); }
+.card-head .dir { font-weight:800; font-size:10.5px; letter-spacing:.5px; padding:2px 7px; border-radius:5px; text-transform:uppercase; }
+.card-head .dir.out { background:var(--teal-soft); color:var(--teal-700); }
+.card-head .dir.in { background:var(--plum-soft); color:var(--plum-600); }
+.card-head .pill { margin-left:auto; }
+.chan-note { padding:10px 18px 14px; font-size:12.5px; color:var(--mut); border-top:1px solid var(--line); background:#fbfbfc; }
+.chan-err { color:var(--bad); font-weight:600; text-align:right; word-break:break-word; }
 
 .actions { display:flex; flex-wrap:wrap; gap:10px; padding:14px 18px; border-top:1px solid var(--line); background:#fbfbfc; }
 .btn-warn { color:var(--warn); }
@@ -124,6 +142,11 @@ ${renderSidebar('auto-certify')}
 
 <main>
   <div id="alert"></div>
+
+  <div class="section-head"><h2>IM channels</h2><span class="note">orders out to IM &middot; results back in</span></div>
+  <section class="cols" id="channels"></section>
+
+  <div class="section-head"><h2>Auto Certify</h2><span class="note">results certified in HIS once the analyzer has finished them</span></div>
   <section class="stats" id="stats"></section>
 
   <section class="cols">
@@ -228,8 +251,9 @@ function renderLastRun(s) {
 
 function renderSettings(s) {
   const c = s.config;
+  // Where the job connects — the portal URL and the HIS database — is not
+  // shown here and is not sent to the browser; it lives in config.json.
   document.getElementById('settings').innerHTML =
-    kv('Certify endpoint', '<span class="mono">' + esc(c.certifyUrl || 'not set') + '</span>') +
     kv('Interval', esc(s.intervalSeconds) + ' s') +
     kv('Site id', esc(c.siteId || 'not set')) +
     kv('Equipment ids', chips(c.equipmentIds)) +
@@ -237,9 +261,75 @@ function renderSettings(s) {
     kv('Parameter result status', chips(c.parameterResultStatus)) +
     kv('Accepted within', 'today + ' + esc(c.lookbackDays) + ' previous day' + (c.lookbackDays === 1 ? '' : 's')) +
     kv('Department must have HOD', c.requireHod ? 'yes' : 'no') +
-    kv('Oracle', '<span class="mono">' + esc((c.oracle.user || '?') + '@' + (c.oracle.connectString || 'not set')) + '</span>' +
-       (c.oracle.passwordSet ? '' : ' <span class="pill bad">no password</span>')) +
     kv('Log file', '<span class="mono">' + esc(c.logFile || 'off') + '</span>');
+}
+
+// ---- IM channels ------------------------------------------------------------
+// Two links to the same middleware. ORDERS: the connector dials IM and sends it
+// every order HMIS raises. RESULTS: the connector listens and IM dials in with
+// the same tubes and their values.
+function linkPill(ch) {
+  if (!ch) return '<span class="pill mut">not configured</span>';
+  if (ch.link === 'connected') return '<span class="pill ok">connected</span>';
+  if (ch.link === 'listening') return '<span class="pill warn">listening &middot; IM not connected</span>';
+  return '<span class="pill bad">offline</span>';
+}
+function ago(iso) {
+  if (!iso) return '\\u2014';
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  const rel = s < 60 ? s + ' s ago' : s < 3600 ? Math.round(s / 60) + ' min ago' : Math.round(s / 3600) + ' h ago';
+  return esc(time(iso)) + ' <span class="mut">(' + rel + ')</span>';
+}
+function orderCard(m) {
+  const o = m && m.orders;
+  let body, note;
+  if (!o) {
+    body = '<div class="empty">No order channel is configured.</div>';
+    note = 'Add the <code>im</code> block to config.json (<code>"profile": "im"</code>) and restart the connector.';
+  } else {
+    body =
+      kv('Sends to', '<span class="mono">' + esc(o.endpoint) + '</span>') +
+      kv('Machine', '<span class="mono">' + esc(m.id) + '</span> <span class="chip">' + esc(m.equipmentCode) + '</span>') +
+      kv('Message', '<span class="mono">' + esc(o.messageType) + '</span> <span class="mut">HL7 over MLLP</span>') +
+      kv('Sending', o.sending ? (o.pausedUntil ? '<span class="pill warn">paused until ' + esc(time(o.pausedUntil)) + '</span>' : 'on') : '<span class="pill warn">off &mdash; orders are collected, not sent</span>') +
+      kv('Orders accepted by IM', '<span style="color:var(--ok)">' + esc(o.sent) + '</span>') +
+      kv('Waiting to be sent', o.waiting ? '<span style="color:var(--warn)">' + esc(o.waiting) + '</span>' : '0') +
+      kv('Refused by IM', o.refused ? '<span style="color:var(--bad)">' + esc(o.refused) + '</span>' : '0') +
+      kv('No answer / link lost', o.failed ? '<span style="color:var(--bad)">' + esc(o.failed) + '</span>' : '0') +
+      kv('Last order sent', o.lastSentAt ? ago(o.lastSentAt) + ' <span class="mono">' + esc(o.lastSentBarcode) + '</span>' : '<span class="mut">none since start</span>') +
+      (o.linkError ? kv('Link error', '<span class="chan-err">' + esc(o.linkError) + '</span>') : '') +
+      (o.lastError ? kv('Last problem', '<span class="chan-err">' + esc(o.lastError) + '</span> <span class="mut">' + esc(time(o.lastErrorAt)) + '</span>') : '');
+    note = 'The connector dials IM. An order counts as sent only when IM answers <code>MSA|AA</code>.';
+  }
+  return '<div class="card"><div class="card-head"><span class="dir out">out</span><h2>Order channel</h2><span class="note">orders sent to IM</span>' + linkPill(o) + '</div>' +
+    '<div class="card-body">' + body + '</div><div class="chan-note">' + note + '</div></div>';
+}
+function resultCard(m) {
+  const r = m && m.results;
+  let body, note;
+  if (!r) {
+    body = '<div class="empty">No result channel is configured.</div>';
+    note = m ? 'Add <code>resultTransport</code> to the <code>' + esc(m.id) + '</code> block in config.json and restart the connector.'
+             : 'It comes with the <code>im</code> block: the connector listens and IM dials in with the results.';
+  } else {
+    body =
+      kv('Listens on', '<span class="mono">' + esc(r.endpoint) + '</span>') +
+      kv('Machine', '<span class="mono">' + esc(m.id) + '</span> <span class="chip">' + esc(m.equipmentCode) + '</span>') +
+      kv('Message', '<span class="mono">ORU^R01</span> <span class="mut">HL7 over MLLP</span>') +
+      kv('Result messages received', esc(r.messages)) +
+      kv('Values inside them', esc(r.values)) +
+      kv('Last result received', r.lastReceivedAt ? ago(r.lastReceivedAt) + ' <span class="mono">' + esc(r.lastReceivedBarcode) + '</span>' : '<span class="mut">none since start</span>') +
+      (r.linkError ? kv('Link error', '<span class="chan-err">' + esc(r.linkError) + '</span>') : '');
+    note = 'IM dials the connector. Each result is joined to the order that went out and filed in HMIS.';
+  }
+  return '<div class="card"><div class="card-head"><span class="dir in">in</span><h2>Result channel</h2><span class="note">orders received back with results</span>' + linkPill(r) + '</div>' +
+    '<div class="card-body">' + body + '</div><div class="chan-note">' + note + '</div></div>';
+}
+function renderChannels(list) {
+  // One pair of cards per two-channel machine; a pair of empty ones when the
+  // block is not in config.json yet, so the page says what is missing.
+  const machines = (list || []).length ? list : [null];
+  document.getElementById('channels').innerHTML = machines.map(m => orderCard(m) + resultCard(m)).join('');
 }
 
 function renderHistory(list) {
@@ -265,6 +355,7 @@ async function refresh() {
   try {
     const data = await j('/api/auto-certify');
     state.data = data;
+    renderChannels(data.channels);
     renderStats(data.status);
     renderLastRun(data.status);
     renderSettings(data.status);
