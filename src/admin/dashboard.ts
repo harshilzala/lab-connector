@@ -332,6 +332,7 @@ document.addEventListener('toggle', function (e) {
   state.details[scrollKey(state.open) + '|' + d.dataset.key] = d.open;
 }, true);
 function applyDetails(el, id) {
+  if (!el || !el.querySelectorAll) return;
   const prefix = scrollKey(id) + '|';
   el.querySelectorAll('details[data-key]').forEach(function (d) {
     const want = state.details[prefix + d.dataset.key];
@@ -341,14 +342,14 @@ function applyDetails(el, id) {
 // Scroll position of each long frame box, keyed by its row.
 function snapInner(el) {
   const out = {};
-  if (!el) return out;
+  if (!el || !el.querySelectorAll) return out;
   el.querySelectorAll('[data-key] pre').forEach(function (p) {
     if (p.scrollTop || p.scrollLeft) out[p.closest('[data-key]').dataset.key] = [p.scrollTop, p.scrollLeft];
   });
   return out;
 }
 function restoreInner(el, snap) {
-  if (!el || !snap) return;
+  if (!el || !snap || !el.querySelectorAll) return;
   el.querySelectorAll('[data-key] pre').forEach(function (p) {
     const s = snap[p.closest('[data-key]').dataset.key];
     if (s) { p.scrollTop = s[0]; p.scrollLeft = s[1]; }
