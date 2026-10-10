@@ -67,6 +67,21 @@ const DOWNLOAD_BACKOFF_MAX_MS = 30 * 60_000; // ceiling on the doubling
 // RECEIVE TESTS off at the console, which no amount of retrying fixes. Neither
 // is evidence of a dead link, so neither counts toward the breaker — the push
 // simply waits.
+/** An order the receiver REFUSED (HL7 MSA AE/AR) is offered again after this
+ *  long, not on every poll: a refusal is a verdict on the order, usually a
+ *  test code the receiver does not know, and repeating it each minute only
+ *  fills both logs. */
+const REFUSED_RETRY_MS = 10 * 60_000;
+
+/** How long the console's "tubes waiting" figure is reused before the order
+ *  store is read again. */
+const WAITING_COUNT_TTL_MS = 15_000;
+
+/** True for a send the receiver answered with a refusal — see Hl7OrderRejected. */
+function isRefusal(err: unknown): err is Error & { linkAlive: true } {
+  return err instanceof Error && (err as { linkAlive?: unknown }).linkAlive === true;
+}
+
 const VITROS_BUSY_WAIT_MS = 60_000;
 const VITROS_DISABLED_WAIT_MS = 5 * 60_000;
 
@@ -106,6 +121,54 @@ export interface AnalyzerStatus {
   /** The same scope checked against what HMIS has actually offered, which is
    *  what the console's parameter chips are coloured from. */
   filter: FilterScope;
+  /** Set on a machine reached over two channels (IM): one the connector
+   *  dials to SEND orders, one it listens on to RECEIVE results. Null on
+   *  every machine that does both on a single connection. */
+  channels: ChannelStatus | null;
+}
+
+/** The two links of a two-channel machine, as the console shows them. */
+export interface ChannelStatus {
+  /** Orders out. Null when the block does not push orders. */
+  orders: {
+    /** Where the connector dials: "tcp://10.11.4.231:10011 (client)". */
+    endpoint: string;
+    link: 'connected' | 'listening' | 'offline';
+    /** Why the last dial failed, while the link is down. */
+    linkError: string | null;
+    /** False while the block collects orders without sending them
+     *  (orderPoll off, or orderPoll.download false). */
+    sending: boolean;
+    /** "ORM^O01" or "OML^O21". */
+    messageType: string;
+    /** Tubes the receiver accepted (MSA AA/CA) since start. */
+    sent: number;
+    /** Tubes the receiver answered with a refusal (MSA AE/AR). */
+    refused: number;
+    /** Sends that got no answer, or lost the socket. */
+    failed: number;
+    /** Tubes HMIS lists whose tests have not all been accepted yet. */
+    waiting: number;
+    lastSentAt: string | null;
+    lastSentBarcode: string | null;
+    lastError: string | null;
+    lastErrorAt: string | null;
+    /** Set while the download breaker holds the push back. */
+    pausedUntil: string | null;
+  } | null;
+  /** Results in. Null when the block has no resultTransport. */
+  results: {
+    /** Where the connector listens: "tcp://0.0.0.0:10012 (server)". */
+    endpoint: string;
+    link: 'connected' | 'listening' | 'offline';
+    linkError: string | null;
+    /** Result messages received since start. */
+    messages: number;
+    /** Values inside them. */
+    values: number;
+    lastReceivedAt: string | null;
+    lastReceivedBarcode: string | null;
+  } | null;
 }
 
 export interface FilterScope {
@@ -182,7 +245,16 @@ export interface OrderPollStatus {
   /** What the pending calls are keyed on — BOTH are sent, and a reply that
    *  is empty for this pair is taken as "no work here", never widened. */
   eqCodes: string[];
+  /** The analyzer's own siteId, else the site-wide one — kept for readers of
+   *  the old shape; `siteIds` is what the calls actually carry. */
   siteId: string | null;
+  /** EVERY site the pending calls are repeated over — the analyzer's own
+   *  `siteIds`, else its `siteId`, else the site-wide list — exactly what
+   *  `siteIds()` resolves for the poll and the per-sample lookups. Empty means
+   *  one unfiltered call (every site). The Maglumi runs referred tubes from
+   *  Vadodara and Anand and lists four sites; showing "no siteId" for it
+   *  (2026-09-27) was this field's absence. */
+  siteIds: string[];
   /** Barcodes held in the order store. */
   stored: number;
   pollEnabled: boolean;
@@ -259,6 +331,34 @@ export class AnalyzerRuntime {
   /** Circuit breaker for order download — see `pauseDownloads`. */
   private downloadFailStreak = 0;
   private downloadPausedUntil = 0;
+  /** Orders the receiver refused, by canonical barcode, and when each may be
+   *  offered again. Memory only: a restart simply offers them once more. */
+  private readonly refusedUntil = new Map<string, number>();
+  /** The RESULT channel of a two-channel machine — see config resultTransport.
+   *  Null on every machine that receives on the link it sends on. */
+  private readonly resultTransport: Transport | null;
+  private readonly resultLink: ProtocolLink | null;
+  /** What the order channel has done since start, for the console. */
+  private readonly pushStats = {
+    sent: 0,
+    refused: 0,
+    failed: 0,
+    lastSentAt: null as string | null,
+    lastSentBarcode: null as string | null,
+    lastError: null as string | null,
+    lastErrorAt: null as string | null,
+  };
+  /** channelStatus() counts the tubes still waiting by reading the order
+   *  store, and the console asks every few seconds: counted at most this
+   *  often. */
+  private waitingCount = { at: 0, value: 0 };
+  /** What the result channel has received since start. */
+  private readonly resultStats = {
+    messages: 0,
+    values: 0,
+    lastReceivedAt: null as string | null,
+    lastReceivedBarcode: null as string | null,
+  };
 
   constructor(
     private readonly cfg: AnalyzerConfig,
@@ -325,6 +425,34 @@ export class AnalyzerRuntime {
     this.link.on('message', (m: ParsedMessage) => void this.onMessage(m));
     this.link.on('wire', (w: WireEvent) => this.recordWire(w));
     this.link.on('error', (e: Error) => this.log.error({ err: e.message }, 'protocol link error'));
+
+    // Two-channel machine: a second link that only ever receives. It shares
+    // everything behind the link — the order store, the result store, the
+    // wire log — so a result arriving here is joined to the order that went
+    // out on the other channel.
+    if (cfg.resultTransport) {
+      const log = this.log.child({ channel: 'results' });
+      this.resultTransport = createTransport(cfg.resultTransport, log);
+      this.resultLink = createProtocolLink(
+        {
+          ...cfg,
+          transport: cfg.resultTransport,
+          // Nothing is ever sent on this channel but acknowledgements.
+          hostQuery: false,
+          hl7: { ...cfg.hl7, orderPush: { ...cfg.hl7.orderPush, enabled: false } },
+        },
+        this.resultTransport,
+        log,
+      );
+      // Counted inside onMessage, after the sample id is trimmed to the HMIS
+      // barcode, so the console names the tube as it was filed.
+      this.resultLink.on('message', (m: ParsedMessage) => void this.onMessage(m, { resultChannel: true }));
+      this.resultLink.on('wire', (w: WireEvent) => this.recordWire(w));
+      this.resultLink.on('error', (e: Error) => log.error({ err: e.message }, 'result channel link error'));
+    } else {
+      this.resultTransport = null;
+      this.resultLink = null;
+    }
     // VITROS 250 NAK ZERO: the analyzer says, once a minute while idle, that
     // it can accept sample programs. That is the strongest possible evidence
     // it is receptive, so anything the breaker is holding goes now.
@@ -455,6 +583,10 @@ export class AnalyzerRuntime {
       }
     });
     await this.link.start();
+    if (this.resultLink && this.resultTransport) {
+      await this.resultLink.start();
+      this.log.info({ endpoint: this.resultTransport.describe }, 'result channel started');
+    }
 
     const sweep = () => {
       this.orders.sweep(ORDER_RETENTION_DAYS);
@@ -503,6 +635,7 @@ export class AnalyzerRuntime {
     this.fileTimer = null;
     this.spool.stop();
     await this.link.stop();
+    await this.resultLink?.stop();
   }
 
   status(): AnalyzerStatus {
@@ -517,6 +650,7 @@ export class AnalyzerRuntime {
       linkError: this.transport.connected ? null : (this.transport.lastDialError ?? null),
       lastMessageAt: this.lastMessageAt,
       lastSolicitAt: this.lastSolicitAt,
+      channels: this.channelStatus(),
       // On a staged analyzer "pending" is the samples still waiting for an
       // order row, so the console tiles keep meaning "not yet in HMIS".
       spool: stagedCounts ? { pending: stagedCounts.waiting, failed: this.spool.counts().failed } : this.spool.counts(),
@@ -531,6 +665,7 @@ export class AnalyzerRuntime {
       orders: {
         eqCodes: this.equipmentCodes(),
         siteId: this.cfg.siteId ?? this.hmis.siteId ?? null,
+        siteIds: this.siteIds().filter((s): s is string => !!s),
         stored: this.orders.count(),
         pollEnabled: this.cfg.orderPoll.enabled,
         lastPollAt: this.lastPollAt,
@@ -545,6 +680,54 @@ export class AnalyzerRuntime {
         ignore: [...this.cfg.ignoreTestCodes],
         hmis: this.parameters.identifiers(),
       },
+    };
+  }
+
+  /** The two links of a two-channel machine; null on any other. */
+  private channelStatus(): ChannelStatus | null {
+    // Optional-chained: a hand-built test config may carry no orderPush.
+    const push = this.cfg.protocol === 'hl7' && this.cfg.hl7.orderPush?.enabled ? this.cfg.hl7.orderPush : null;
+    const rt = this.resultTransport;
+    if (!push && !rt) return null;
+    const linkOf = (t: Transport): 'connected' | 'listening' | 'offline' =>
+      t.connected ? 'connected' : t.listening ? 'listening' : 'offline';
+    if (push && Date.now() - this.waitingCount.at > WAITING_COUNT_TTL_MS) {
+      const never = this.neverDownload();
+      // The same prefix rule the poll applies: a tube outside
+      // orderPoll.downloadPrefixes is cached but never sent, so it is not
+      // "waiting to be sent" either.
+      const { downloadPrefixes } = this.cfg.orderPoll;
+      const ours = (b: string) =>
+        downloadPrefixes.length === 0 || downloadPrefixes.some((p) => b.toUpperCase().startsWith(p.toUpperCase()));
+      const value = this.orders.list().filter((o) => {
+        if (!ours(o.sampleId)) return false;
+        const given = new Set(o.downloaded.map(codeKey));
+        return o.testCodes.some((c) => !given.has(codeKey(c)) && !never.has(codeKey(c)));
+      }).length;
+      this.waitingCount = { at: Date.now(), value };
+    }
+    const waiting = this.waitingCount.value;
+    return {
+      orders: push
+        ? {
+            endpoint: describeTransport(this.cfg),
+            link: linkOf(this.transport),
+            linkError: this.transport.connected ? null : (this.transport.lastDialError ?? null),
+            sending: this.cfg.orderPoll.enabled && this.cfg.orderPoll.download,
+            messageType: push.messageType,
+            ...this.pushStats,
+            waiting,
+            pausedUntil: this.downloadPausedUntil ? new Date(this.downloadPausedUntil).toISOString() : null,
+          }
+        : null,
+      results: rt
+        ? {
+            endpoint: rt.describe,
+            link: linkOf(rt),
+            linkError: rt.connected ? null : (rt.lastDialError ?? null),
+            ...this.resultStats,
+          }
+        : null,
     };
   }
 
@@ -580,6 +763,7 @@ export class AnalyzerRuntime {
     let held = 0; // ready to send, but the download breaker is open
     let notOurs = 0; // cached but outside downloadPrefixes — never sent
     let notInterfaced = 0; // every offered row was for a parameter outside allowTestCodes
+    let refused = 0; // the receiver read the order and answered no
     const downloadable = (barcode: string): boolean =>
       downloadPrefixes.length === 0 ||
       downloadPrefixes.some((p) => barcode.toUpperCase().startsWith(p.toUpperCase()));
@@ -644,6 +828,8 @@ export class AnalyzerRuntime {
               // panel every time — a delta of the newly seen tests would wipe
               // the ones it already had. Everything else takes just the delta.
               const codes = this.link.downloadReplacesProgram ? this.programmable(order.testCodes) : newCodes;
+              if ((this.refusedUntil.get(order.barcode) ?? 0) > Date.now()) continue; // refused a moment ago
+              this.refusedUntil.delete(order.barcode);
               try {
                 await this.link.sendOrders([
                   {
@@ -660,14 +846,36 @@ export class AnalyzerRuntime {
                 this.orders.markDownloaded(order.sampleId, codes);
                 this.downloadedCount++;
                 pushed++;
+                this.pushStats.sent++;
+                this.pushStats.lastSentAt = new Date().toISOString();
+                this.pushStats.lastSentBarcode = order.sampleId;
                 this.resumeDownloads('an order was accepted');
                 this.log.info(
                   { barcode: order.sampleId, tests: codes, ...(codes.length !== newCodes.length ? { added: newCodes } : {}), eqCode },
                   'order downloaded to analyzer',
                 );
               } catch (err) {
+                if (isRefusal(err)) {
+                  // The receiver read the order and said no. The line is
+                  // fine, so this is not the breaker's business and the
+                  // tubes behind this one still go. The order stays
+                  // un-downloaded and is offered again after a wait.
+                  this.refusedUntil.set(order.barcode, Date.now() + REFUSED_RETRY_MS);
+                  refused++;
+                  this.pushStats.refused++;
+                  this.pushStats.lastError = order.sampleId + ': ' + err.message;
+                  this.pushStats.lastErrorAt = new Date().toISOString();
+                  this.log.error(
+                    { barcode: order.sampleId, tests: newCodes, err: err.message, retryInMs: REFUSED_RETRY_MS },
+                    'order refused by the receiver — the other orders continue, this one is tried again later',
+                  );
+                  continue;
+                }
                 // Not marked downloaded, so it is retried once the breaker closes.
                 this.downloadFailStreak++;
+                this.pushStats.failed++;
+                this.pushStats.lastError = order.sampleId + ': ' + (err instanceof Error ? err.message : String(err));
+                this.pushStats.lastErrorAt = new Date().toISOString();
                 this.log.error(
                   {
                     barcode: order.sampleId,
@@ -691,8 +899,8 @@ export class AnalyzerRuntime {
       this.lastPollError = null;
       // New rows may have arrived for a staged sample that was waiting.
       if (this.filer) void this.filer.run('poll');
-      if (samples || pushed || held || notOurs || notInterfaced) {
-        this.log.debug({ samples, pushed, held, notOurs, notInterfaced }, 'order poll complete');
+      if (samples || pushed || held || notOurs || notInterfaced || refused) {
+        this.log.debug({ samples, pushed, held, notOurs, notInterfaced, refused }, 'order poll complete');
       }
     } catch (err) {
       this.lastPollError = err instanceof Error ? err.message : String(err);
@@ -847,9 +1055,10 @@ export class AnalyzerRuntime {
    */
   async resendOrder(barcode: string): Promise<ResendReport | null> {
     const lookup = normalizeBarcode(barcode);
-    if (this.cfg.protocol === 'hl7') {
-      // The HL7 link can only answer a query the instrument opened — there is
-      // no unsolicited worklist message it will accept.
+    if (this.cfg.protocol === 'hl7' && !this.cfg.hl7.orderPush?.enabled) {
+      // Without order push the HL7 link can only answer a query the
+      // instrument opened — there is no unsolicited worklist message it will
+      // accept.
       throw new Error('this analyzer only takes a worklist in reply to its own host query — it cannot be pushed from here');
     }
     if (!this.transport.connected) throw new Error('the analyzer link is down');
@@ -886,11 +1095,18 @@ export class AnalyzerRuntime {
       await this.link.sendOrders([order]);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (isRefusal(err)) this.pushStats.refused++;
+      else this.pushStats.failed++;
+      this.pushStats.lastError = order.sampleId + ': ' + message;
+      this.pushStats.lastErrorAt = new Date().toISOString();
       this.log.error({ barcode: lookup, tests: order.testCodes, err: message }, 're-send failed — the analyzer did not take the order');
       throw new Error(`the analyzer did not accept the order: ${message}`);
     }
     this.orders.markDownloaded(lookup, order.testCodes);
     this.downloadedCount++;
+    this.pushStats.sent++;
+    this.pushStats.lastSentAt = new Date().toISOString();
+    this.pushStats.lastSentBarcode = order.sampleId;
     this.resumeDownloads('an operator re-sent an order');
     this.log.info({ barcode: lookup, tests: order.testCodes, source }, 'order re-sent to analyzer');
     return { barcode: order.sampleId, tests: order.testCodes, source };
@@ -1169,11 +1385,17 @@ export class AnalyzerRuntime {
   }
 
   // ---------------------------------------------------------------------------
-  private async onMessage(msg: ParsedMessage): Promise<void> {
+  private async onMessage(msg: ParsedMessage, opts: { resultChannel?: boolean } = {}): Promise<void> {
     this.lastMessageAt = new Date().toISOString();
     // The instrument just spoke to us, so it is plainly alive — the strongest
     // signal there is that a suspended download should be tried again.
-    this.resumeDownloads('the analyzer sent us a message');
+    //
+    // Not on a two-channel machine's RESULT channel, though. That is a
+    // different socket: IM delivering results says nothing about whether its
+    // ORDER port answers, and resetting the breaker on every result would
+    // keep it from ever staying open while the order side hangs — each poll
+    // spending its full ACK timeout on tube after tube.
+    if (!opts.resultChannel) this.resumeDownloads('the analyzer sent us a message');
 
     // 1) Host-query → answer with the ordered tests.
     if (msg.queries.length > 0) {
@@ -1187,6 +1409,12 @@ export class AnalyzerRuntime {
     // 2) Results → durable upload.
     if (msg.results.length > 0) {
       msg = this.normalizeSampleIds(msg);
+      if (opts.resultChannel) {
+        this.resultStats.messages++;
+        this.resultStats.values += msg.results.length;
+        this.resultStats.lastReceivedAt = new Date().toISOString();
+        this.resultStats.lastReceivedBarcode = msg.results[0]!.sampleId;
+      }
       const voids = msg.results.filter((r) => isVoidResult(r.value));
       if (voids.length) {
         this.log.warn(
@@ -1200,7 +1428,13 @@ export class AnalyzerRuntime {
           'analyzer reported no value for these assays — not filed; the rerun will file',
         );
       }
-      this.reportOutstandingProgrammedAssays(msg);
+      // Not for a machine we PUSH orders to (IM). That report exists for an
+      // analyzer that runs one programme per tube and answers it in one
+      // message (VITROS 250, ECiQ). IM fronts a whole line: one tube's tests
+      // come back from different analyzers in separate messages, and under
+      // OBX-3's text name rather than the code the order carried, so every
+      // message would name the rest of the panel as "did not run".
+      if (!(this.cfg.protocol === 'hl7' && this.cfg.hl7.orderPush?.enabled)) this.reportOutstandingProgrammedAssays(msg);
       const uploads = toResultUploads(this.cfg, msg);
       for (const full of uploads) {
         // A control run has no order row in HMIS. Filing it would query pending

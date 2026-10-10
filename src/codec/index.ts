@@ -54,6 +54,9 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
         encoding: analyzer.hl7.encoding,
         idleFlushMs: analyzer.hl7.idleFlushMs,
         hostQuery: analyzer.hostQuery,
+        // Optional-chained: the schema always fills this in, but the test
+        // harnesses build an analyzer config by hand.
+        orderPush: analyzer.hl7.orderPush?.enabled ? analyzer.hl7.orderPush : undefined,
         logger: logger.child({ codec: 'hl7' }),
       });
     case 'gh900':

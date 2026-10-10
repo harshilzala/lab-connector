@@ -58,7 +58,9 @@
     "dist": "node scripts/make-dist.mjs",
     "dist:seal": "node scripts/make-dist.mjs --seal",
     "deploy": "node scripts/deploy.mjs",
-    "rerun-strip": "tsx test/rerun-strip.test.ts"
+    "rerun-strip": "tsx test/rerun-strip.test.ts",
+    "im:orders": "tsx test/im-order-push.test.ts",
+    "im:channels": "tsx test/im-channels.test.ts"
   },
   "dependencies": {
     "pino": "^9.5.0",

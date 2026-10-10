@@ -301,5 +301,65 @@
         "idleFlushMs": 0
       }
     }
+
+    // -----------------------------------------------------------------------
+    // IM — an instrument MIDDLEWARE, not an analyzer: it runs the tubes on the
+    // machines behind it and never asks the LIS for work. It LISTENS on a TCP
+    // port and takes every order that is sent to it, which is what a Mirth
+    // channel used to feed it. With this block the connector reads the orders
+    // from HMIS itself, on the same pending poll every other machine uses, and
+    // sends them to IM as HL7 ORM^O01 over MLLP.
+    //
+    // Everything below the first four lines comes from the "im" profile:
+    // protocol hl7, transport tcp/client on 10011, a result listener on
+    // 10012, orderPoll on, hostQuery off, demographics sent, staged filing,
+    // and hl7.orderPush enabled. So a site block is the address and the
+    // equipment code, nothing more.
+    //
+    // TWO CHANNELS. "transport" is the ORDER channel: the connector dials IM
+    // and sends it work. "resultTransport" is the RESULT channel: the
+    // connector listens and IM dials in with the same tubes and their values
+    // (ORU^R01), which are joined to the orders that went out and filed. The
+    // listening port is this PC's to choose — point IM's result connection at
+    // <this PC>:10012, or write the port IM already uses. Both channels are
+    // shown on the console's Auto Certify page.
+    //
+    // STOP THE MIRTH CHANNEL THAT FEEDS IM FIRST. Two systems sending the same
+    // orders puts every tube on IM's worklist twice.
+    //
+    // The message layout is the HL7 v2 standard one and is confirmed by
+    // reading IM's acknowledgement, not by a capture: an order counts as
+    // delivered only when IM answers MSA|AA, and an AE/AR names what it did
+    // not like in the log and on the console. Everything that might differ is
+    // a setting — see "orderPush" below.
+    //
+    // A machine whose orders come from several HMIS sites lists them all in
+    // siteIds: at Ahmedabad EQ0022 carries tubes from five (2, Chandkheda
+    // 13873256, Vadodara 5866265, Anand 14, Ramanbhai 2567859), and polling
+    // with one site alone hides the others' rows.
+    // -----------------------------------------------------------------------
+    // ,
+    // {
+    //   "id": "im",
+    //   "profile": "im",
+    //   "equipmentCode": "EQ0022",
+    //   "equipmentId": 46150218,
+    //   "siteIds": ["2", "13873256", "5866265", "14", "2567859"],
+    //   "transport": { "host": "10.11.4.231" },
+    //   "resultTransport": { "type": "tcp", "mode": "server", "host": "0.0.0.0", "port": 10012 },
+    //
+    //   // Only if IM asks for something other than the defaults:
+    //   "hl7": {
+    //     "orderPush": {
+    //       "enabled": true,
+    //       "messageType": "ORM^O01",   // or "OML^O21" for the v2.5 lab order
+    //       "version": "2.3.1",         // MSH-12
+    //       "receivingApp": "IM",       // MSH-5
+    //       "receivingFacility": "",    // MSH-6
+    //       "processingId": "P",        // MSH-11 — P production, T training
+    //       "ackTimeoutMs": 15000       // no MSA in this long = not delivered
+    //     }
+    //   }
+    // }
   ]
 }

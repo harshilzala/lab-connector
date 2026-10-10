@@ -149,6 +149,30 @@ const Hl7Options = z.object({
   /** Safety net for a peer that omits the MLLP end block: parse whatever has
    *  buffered after this idle gap. 0 disables (strict MLLP only). */
   idleFlushMs: z.number().int().nonnegative().default(0),
+  /** Send orders UNSOLICITED, for a receiver that listens for them instead of
+   *  asking — IM, the instrument middleware. The orders come from the same
+   *  HMIS poll as every other analyzer's (`orderPoll`), go out one ORM^O01
+   *  per tube, and a tube counts as delivered only when the receiver answers
+   *  MSA|AA. Needs `transport.mode: "client"` (the connector dials the
+   *  receiver) and `orderPoll.enabled`. `sendingApp` / `sendingFacility`
+   *  above fill MSH-3 / MSH-4. See src/codec/hl7/orders.ts. */
+  orderPush: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** ORM^O01, or OML^O21 for a receiver set up for the v2.5 laboratory
+       *  order (adds an SPM specimen segment). */
+      messageType: z.enum(['ORM^O01', 'OML^O21']).default('ORM^O01'),
+      /** MSH-12. */
+      version: z.string().min(1).default('2.3.1'),
+      /** MSH-5 / MSH-6. */
+      receivingApp: z.string().default('IM'),
+      receivingFacility: z.string().default(''),
+      /** MSH-11: P production, T training, D debugging. */
+      processingId: z.enum(['P', 'T', 'D']).default('P'),
+      /** No MSA within this long = the order did not go; it is retried. */
+      ackTimeoutMs: z.number().int().min(1000).default(15000),
+    })
+    .default({}),
 });
 
 /** Lifotronic GH900 Plus HbA1c analyzer — see src/codec/gh900. */
@@ -219,6 +243,19 @@ const AnalyzerSchema = z.object({
   portNo: z.string().optional(),
   protocol: z.enum(['astm', 'abl9', 'hl7', 'kermit', 'advia2120i', 'clinitek-advantus', 'gh900']).default('astm'),
   transport: TransportSchema,
+  /** A SECOND link for the same machine, results only.
+   *
+   *  IM is reached over two channels: `transport` is the ORDER channel, on
+   *  which the connector dials IM and sends it work, and this is the RESULT
+   *  channel, on which the connector listens and IM dials in to deliver the
+   *  same tubes back with their values. Both belong to one analyzer block —
+   *  one equipment code, one order store — so a result that arrives here is
+   *  joined to the order that went out there.
+   *
+   *  The link speaks the block's `protocol` and never sends an order or
+   *  answers a query. Leave it out for a machine that does everything on one
+   *  connection, which is every other machine here. */
+  resultTransport: TransportSchema.optional(),
   sendDemographics: z.boolean().default(false),
   hostQuery: z.boolean().default(true),
   /** Proactive order download — what makes the interface real-time.
@@ -748,6 +785,27 @@ const ConfigSchema = z.object({
     if (!c.hmis.genx.baseUrl) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'genx', 'baseUrl'], message: 'required when hmis.api is "genx"' });
     }
+    // An analyzer that PUSHES orders (IM) must be told which GenX services
+    // are its own. The Mirth gateway filtered the worklist by equipment code
+    // on the server; GenX does not, and an equipment code with no
+    // equipmentServices entry is given every service on every tube
+    // (src/hmis/genx.ts toRows). For a machine that only answers host queries
+    // that costs nothing, but a push would send IM an order for every tube in
+    // the lab — under codes IM does not know, refused and retried for ever.
+    const listed = new Set(Object.keys(c.hmis.genx.equipmentServices).map((k) => k.trim().toUpperCase()));
+    c.analyzers.forEach((a, i) => {
+      const pushes = a.protocol === 'hl7' && a.hl7.orderPush.enabled && a.orderPoll.enabled && a.orderPoll.download;
+      if (!pushes) return;
+      const codes = [a.equipmentCode, ...a.extraEquipmentCodes];
+      if (codes.some((code) => listed.has(code.trim().toUpperCase()))) return;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['analyzers', i, 'equipmentCode'],
+        message:
+          `analyzer "${a.id}" pushes orders (hl7.orderPush) but hmis.genx.equipmentServices has no entry for ` +
+          `${codes.join(' / ')} — GenX would hand it every service on every tube. List the serviceCodes this machine runs there.`,
+      });
+    });
   } else if (c.analyzers.length && !c.hmis.baseUrl) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'baseUrl'], message: 'required when analyzers are configured' });
   }

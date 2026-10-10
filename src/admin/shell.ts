@@ -81,8 +81,10 @@ body { padding-left:var(--rail); }
 
 /** The rail. Goes straight after <body>. */
 export interface SidebarOptions {
-  /** autoCertify.enabled in config.json. When false the Auto Certify page is
-   *  not offered at all — no rail icon, no link — and the server refuses it. */
+  /** Whether the Auto Certify page exists for this install: autoCertify.enabled
+   *  in config.json, OR a two-channel machine (IM) whose order and result
+   *  channels the page shows. When false the page is not offered at all — no
+   *  rail icon, no link — and the server refuses it. */
   autoCertify: boolean;
 }
 

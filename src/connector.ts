@@ -174,6 +174,15 @@ export class Connector implements AdminBackend {
     return this.autoCertifyService;
   }
 
+  /** A machine reached over two channels — the IM order push and/or a
+   *  separate result listener. Decided from config, exactly as
+   *  AnalyzerRuntime.channelStatus() decides it, without touching disk. */
+  hasChannels(): boolean {
+    return this.cfg.analyzers.some(
+      (a) => !!a.resultTransport || (a.protocol === 'hl7' && !!a.hl7.orderPush?.enabled),
+    );
+  }
+
   statuses() {
     return [...this.runtimes.values()].map((r) => r.status());
   }

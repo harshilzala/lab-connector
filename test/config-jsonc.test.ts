@@ -56,7 +56,14 @@ console.log(`✓ config.json loads: ${cfg.analyzers.map((a) => `${a.id}(${a.prot
 // when someone moves a machine back onto its COM port.
 const text = readFileSync('./config.json', 'utf8');
 const lines = text.split(/\r?\n/);
-const parked: string[] = [];
+/** A parked sample: the transport as written, and the machine profile of the
+ *  block it sits in — which is what completes a transport that names only an
+ *  address (the IM block's `{ "host": … }`). */
+interface Parked {
+  transport: string;
+  profile: string | null;
+}
+const parked: Parked[] = [];
 let run: string[] = [];
 
 // A run of commented lines may open with prose explaining the sample, and a
@@ -65,6 +72,9 @@ let run: string[] = [];
 // to the matching closing one, and nothing after it.
 const collect = (r: string[]) => {
   const text = r.join('\n');
+  // A parked analyzer block may lean on a machine profile for everything the
+  // site does not have to say — its transport type and port included.
+  const profile = /"profile"\s*:\s*"([^"]+)"/.exec(text)?.[1] ?? null;
   const re = /"transport"\s*:\s*\{/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
@@ -77,7 +87,7 @@ const collect = (r: string[]) => {
         break;
       }
     }
-    if (end !== -1) parked.push(text.slice(m.index, end));
+    if (end !== -1) parked.push({ transport: text.slice(m.index, end), profile });
   }
 };
 
@@ -97,12 +107,16 @@ if (run.length) collect(run);
 if (parked.length === 0) console.log('– no parked transport sample in config.json (nothing to verify)');
 
 const dir = mkdtempSync(join(tmpdir(), 'lab-connector-cfg-'));
-for (const [i, block] of parked.entries()) {
+for (const [i, sample] of parked.entries()) {
   // The block is `"transport": { … },` — wrap it into an object to parse it.
-  const { transport } = parseJsonc(`{${block.replace(/,\s*$/, '')}}`) as { transport: unknown };
+  const { transport } = parseJsonc(`{${sample.transport.replace(/,\s*$/, '')}}`) as { transport: unknown };
   const probe = {
     ...cfg,
-    analyzers: [{ id: 'parked-sample', equipmentCode: 'PROBE', protocol: 'astm', transport }],
+    analyzers: [
+      sample.profile
+        ? { id: 'parked-sample', profile: sample.profile, equipmentCode: 'PROBE', transport }
+        : { id: 'parked-sample', equipmentCode: 'PROBE', protocol: 'astm', transport },
+    ],
   };
   const file = join(dir, `parked-${i}.json`);
   writeFileSync(file, JSON.stringify(probe, null, 2));
@@ -117,7 +131,10 @@ for (const [i, block] of parked.entries()) {
         `${t.dataBits}-${t.parity[0]!.toUpperCase()}-${t.stopBits} dtr=${t.dtr} rts=${t.rts}`,
     );
   } else {
-    console.log(`✓ parked sample ${i + 1} valid: tcp/${t.mode} ${t.host}:${t.port}`);
+    console.log(
+      `✓ parked sample ${i + 1} valid: tcp/${t.mode} ${t.host}:${t.port}` +
+        (sample.profile ? ` (profile ${sample.profile})` : ''),
+    );
   }
 }
 
@@ -130,7 +147,7 @@ for (const [i, block] of parked.entries()) {
 //
 // Both sites are listed because the parked block is the bench engineer's record
 // of the known-good cabling for whichever site this checkout is deployed to.
-const ports = parked.map((b) => /"path"\s*:\s*"([^"]+)"/.exec(b)?.[1]).filter(Boolean);
+const ports = parked.map((s) => /"path"\s*:\s*"([^"]+)"/.exec(s.transport)?.[1]).filter(Boolean);
 for (const port of ports) {
   assert.ok(['COM1', 'COM2', 'COM3'].includes(port!), `${port} is not a COM port the reference config used`);
 }

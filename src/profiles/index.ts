@@ -723,6 +723,74 @@ const SYSMEX_UWAM: AnalyzerProfile = {
   },
 };
 
+// ---- IM — instrument middleware, orders pushed to it over HL7/MLLP --------
+//
+// Not an analyzer: IM is the middleware in front of the chemistry /
+// immunoassay line, and it runs the tubes on the machines itself. It never
+// asks for work — it LISTENS on a TCP port and takes every order the LIS
+// sends it. That is the feed Mirth used to carry; with this profile the
+// connector reads the orders from HMIS directly and sends them to IM.
+//
+// Confirmed at Ahmedabad on 2026-09-27: 10.11.4.231:10011 accepts a
+// connection from the interface PC and does not answer an ASTM ENQ, so the
+// framing is not ASTM E1381. HMIS registers the machine as equipment code
+// EQ0022 and itself records the destination as 10.11.111.129:10011 on every
+// pending row — the port agrees, the address is IM's other NIC or its
+// published address, so the site block is what names the address to dial.
+//
+// The MESSAGE LAYOUT is the HL7 v2 standard one and is NOT yet confirmed
+// against IM (no capture of the Mirth feed was available). Everything that
+// might differ is a setting: hl7.orderPush.messageType / version /
+// receivingApp / receivingFacility / processingId. Commission it by sending
+// one tube and reading IM's MSA — an AE or AR names what it did not like,
+// and the reason is logged and shown on the console.
+//
+// TWO CHANNELS. Orders go out on `transport` (the connector dials IM).
+// Results come back on `resultTransport`: the connector LISTENS and IM
+// dials in with the same tubes and their values, as ORU^R01. The listening
+// port is this PC's to choose and IM's to be pointed at — 10012 here, the
+// port after the order port, picked because nothing on the interface PC
+// held it on 2026-09-27. It is NOT a port IM was found sending to; whoever
+// configures IM's result connection sets it to <this PC>:10012, or the site
+// block names the port IM already uses.
+//
+// Every OBX value type is accepted (valueTypes []), not only NM: this line
+// reports screening assays as words — HIVC / HBSAG / AHCV and their _INT
+// interpretation rows — and with the H360's ["NM"] those would be dropped
+// on arrival. A value still files only against a pending row HMIS raised
+// for that barcode and that identifier.
+const IM_MIDDLEWARE: AnalyzerProfile = {
+  description: 'IM instrument middleware (chemistry / immunoassay line), HL7 over MLLP on two channels — orders PUSHED to it as ORM^O01 (IM listens on 10011, the connector dials), results RECEIVED from it as ORU^R01 (the connector listens on 10012, IM dials)',
+  defaults: {
+    protocol: 'hl7',
+    // IM listens, so the connector is the client. The site block gives `host`.
+    transport: { type: 'tcp', mode: 'client', port: 10011 },
+    // And IM dials this PC to hand the results back.
+    resultTransport: { type: 'tcp', mode: 'server', host: '0.0.0.0', port: 10012 },
+    // Every order HMIS raises for this equipment code is sent as it appears.
+    orderPoll: { enabled: true, download: true, intervalMs: 60000, lookbackDays: 1 },
+    // IM matches the tube by barcode; the demographics ride along so its
+    // worklist shows a name rather than a number.
+    sendDemographics: true,
+    // IM never queries — it is sent orders. Nothing inbound to answer.
+    hostQuery: false,
+    filing: { mode: 'staged' },
+    hl7: {
+      sendingApp: 'HMIS-LIS',
+      sendingFacility: '',
+      // MSH-18 is left empty: the H360's UNICODE is that analyzer's
+      // declaration, and an unexpected charset is a reason for a receiver to
+      // refuse a message. Set it if IM asks for one.
+      charset: '',
+      ack: true,
+      valueTypes: [],
+      encoding: 'utf8',
+      idleFlushMs: 0,
+      orderPush: { enabled: true, messageType: 'ORM^O01', version: '2.3.1', receivingApp: 'IM', processingId: 'P', ackTimeoutMs: 15000 },
+    },
+  },
+};
+
 export const PROFILE_LIBRARY = {
   'mindray-bc5150': MINDRAY_BC5150,
   /** Same protocol document and defaults as the BC-5150. */
@@ -740,6 +808,7 @@ export const PROFILE_LIBRARY = {
   'sysmex-uf5000': SYSMEX_UF4000,
   'sysmex-uc3500': SYSMEX_UC3500,
   'sysmex-uwam': SYSMEX_UWAM,
+  im: IM_MIDDLEWARE,
 } as const satisfies Record<string, AnalyzerProfile>;
 
 export type ProfileName = keyof typeof PROFILE_LIBRARY;

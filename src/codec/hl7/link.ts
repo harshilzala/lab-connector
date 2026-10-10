@@ -13,6 +13,7 @@ import {
   type Hl7Encoding,
   type Hl7Message,
 } from './parser.js';
+import { Hl7OrderRejected, buildOrderPush, hl7Stamp, readAck, type Hl7Ack, type Hl7OrderMessageType } from './orders.js';
 
 // =============================================================================
 // Hl7Link — HL7 v2 over MLLP, the interface the Erba H360 hematology analyzer
@@ -42,6 +43,13 @@ import {
 // of its query or the reply shape it expects. The reply is therefore built to
 // the HL7 v2 standard (QRY^Q02 → ORM^O01) and the raw inbound query is logged
 // verbatim, so the first real query confirms — or corrects — the exact layout.
+//
+// ORDER PUSH (orderPush.enabled). The opposite arrangement, for a receiver
+// that never asks: IM, the instrument middleware, listens on a port and is
+// SENT every order. The connector dials it (transport mode "client") and
+// each order goes as its own ORM^O01, one at a time, each waiting for the
+// receiver's MSA before the next is written. See ./orders.ts for the layout.
+// A query still takes the reply path above, so one link can do both.
 // =============================================================================
 
 export interface Hl7LinkOptions {
@@ -63,6 +71,25 @@ export interface Hl7LinkOptions {
   /** Answer inbound host queries with a worklist. When false, a query is only
    *  acknowledged and the link stays results-only. */
   hostQuery?: boolean;
+  /** Send orders unsolicited, each confirmed by the receiver's MSA. */
+  orderPush?: {
+    enabled: boolean;
+    messageType: Hl7OrderMessageType;
+    version: string;
+    receivingApp: string;
+    receivingFacility: string;
+    processingId: string;
+    /** How long to wait for the MSA before the send counts as failed. */
+    ackTimeoutMs: number;
+  };
+}
+
+/** An order on the wire, waiting for the receiver's MSA. */
+interface PendingAck {
+  controlId: string;
+  resolve(ack: Hl7Ack): void;
+  reject(err: Error): void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 /** Correlation context captured from an inbound query, used to address and
@@ -88,10 +115,20 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly onDataBound = (c: Buffer) => this.onData(c);
-  private readonly onCloseBound = () => this.decoder.reset();
+  private readonly onCloseBound = () => {
+    this.decoder.reset();
+    // The answer to whatever was on the wire is never coming on this socket.
+    this.failPendingAck(new Error('the connection closed before the receiver acknowledged the order'));
+  };
 
   /** Set when a host query arrives; consumed by the next sendOrders reply. */
   private queryCtx: QueryContext | null = null;
+
+  /** Order push: the one message currently waiting for its MSA. */
+  private pendingAck: PendingAck | null = null;
+  /** Order push: serialises sends, so two orders never share the line. */
+  private pushQueue: Promise<unknown> = Promise.resolve();
+  private pushSeq = 0;
 
   /** Bare control-byte chunks seen outside any frame (the BC-5150's 0x02 every
    *  3 s). Counted, not logged: they carry nothing and were 75% of the wire log. */
@@ -116,6 +153,7 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
     this.transport.off('close', this.onCloseBound);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = null;
+    this.failPendingAck(new Error('the link was stopped before the receiver acknowledged the order'));
     await this.transport.stop();
   }
 
@@ -127,6 +165,17 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
   async sendOrders(orders: OrderDownload[]): Promise<void> {
     const ctx = this.queryCtx;
     this.queryCtx = null;
+    if (!ctx && this.opts.orderPush?.enabled) {
+      // One order per message, in turn. The first failure stops the batch and
+      // is thrown, so the caller knows exactly which orders did not go.
+      for (const order of orders) {
+        const run = () => this.pushOrder(order);
+        const p = this.pushQueue.then(run, run);
+        this.pushQueue = p.catch(() => {});
+        await p;
+      }
+      return;
+    }
     if (!ctx) {
       if (orders.length > 0) {
         this.opts.logger.warn(
@@ -219,6 +268,15 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       return;
     }
 
+    // An acknowledgement is the answer to something WE sent. It is never
+    // acknowledged in turn — two ends answering each other's ACKs never stop —
+    // and it carries no result, so it goes no further than this.
+    const ack = readAck(msg);
+    if (ack && !msg.segments.some((s) => s.name === 'OBX')) {
+      this.handleAck(ack, msg);
+      return;
+    }
+
     // A host query is answered by the worklist reply, not by a generic ACK, so
     // it is handled on its own path before the results branch.
     if (isQueryMessage(msg)) {
@@ -243,6 +301,94 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       'HL7 results parsed',
     );
     this.emit('message', parsed);
+  }
+
+  // ---- order push -----------------------------------------------------------
+
+  /** Send one order and wait for the receiver to accept it. Rejects on a
+   *  refusal (Hl7OrderRejected), a timeout, or a socket that went away. */
+  private async pushOrder(order: OrderDownload): Promise<void> {
+    const push = this.opts.orderPush!;
+    const controlId = this.nextControlId();
+    const text = buildOrderPush(
+      order,
+      {
+        messageType: push.messageType,
+        version: push.version,
+        sendingApp: this.opts.sendingApp ?? 'LIS',
+        sendingFacility: this.opts.sendingFacility ?? '',
+        receivingApp: push.receivingApp,
+        receivingFacility: push.receivingFacility,
+        processingId: push.processingId,
+        charset: this.opts.charset ?? '',
+      },
+      controlId,
+    );
+
+    const answered = new Promise<Hl7Ack>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingAck?.controlId !== controlId) return;
+        this.pendingAck = null;
+        reject(new Error(`no acknowledgement from the receiver within ${push.ackTimeoutMs} ms`));
+      }, push.ackTimeoutMs);
+      this.pendingAck = { controlId, resolve, reject, timer };
+    });
+    // The write may fail first; the waiter is then rejected by failPendingAck
+    // and must not surface as an unhandled rejection.
+    answered.catch(() => {});
+
+    this.emit('wire', { direction: 'OUT', text: printable(text) });
+    try {
+      await this.transport.write(wrapMllp(text, this.encoding));
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      this.failPendingAck(err);
+      throw err;
+    }
+
+    const ack = await answered;
+    if (!ack.accepted) {
+      this.opts.logger.warn(
+        { barcode: order.sampleId, tests: order.testCodes, controlId, code: ack.code, detail: ack.text },
+        'HL7 order refused by the receiver',
+      );
+      throw new Hl7OrderRejected(ack.code, ack.text);
+    }
+    this.opts.logger.info(
+      { barcode: order.sampleId, tests: order.testCodes, controlId, code: ack.code },
+      'HL7 order sent and acknowledged',
+    );
+  }
+
+  /** MSH-10: the send time plus a counter — unique across a restart, and 18
+   *  characters, inside the 20 that HL7 v2.3 allows. */
+  private nextControlId(): string {
+    this.pushSeq = (this.pushSeq + 1) % 10000;
+    return `${hl7Stamp()}${String(this.pushSeq).padStart(4, '0')}`;
+  }
+
+  private handleAck(ack: Hl7Ack, msg: Hl7Message): void {
+    const waiting = this.pendingAck;
+    // Orders go one at a time, so an acknowledgement that names no message
+    // (some receivers leave MSA-2 empty) can only be for the one in flight.
+    if (waiting && (ack.controlId === waiting.controlId || ack.controlId === '')) {
+      clearTimeout(waiting.timer);
+      this.pendingAck = null;
+      waiting.resolve(ack);
+      return;
+    }
+    this.opts.logger.warn(
+      { type: msg.messageType, code: ack.code, answers: ack.controlId, waitingFor: waiting?.controlId ?? null },
+      'HL7 acknowledgement matched no order in flight — ignored',
+    );
+  }
+
+  private failPendingAck(err: Error): void {
+    const waiting = this.pendingAck;
+    if (!waiting) return;
+    clearTimeout(waiting.timer);
+    this.pendingAck = null;
+    waiting.reject(err);
   }
 
   // ---- host query -----------------------------------------------------------

@@ -48,6 +48,10 @@ export interface AdminBackend {
   force(id: string, barcode: string): Promise<ForceReport | null>;
   /** The Auto Certify job behind the /auto-certify page. */
   autoCertify(): AutoCertifyService;
+  /** True when a two-channel machine (IM) is configured, read from config —
+   *  cheaper than statuses(), which reads every staged result file. Optional:
+   *  a backend without it is asked through statuses() instead. */
+  hasChannels?(): boolean;
 }
 import type { StagedSummary } from '../results/store.js';
 import type { OrderView, ResendReport } from '../session/orchestrator.js';
@@ -169,7 +173,7 @@ export class AdminServer {
           renderDashboard({
             username: session.username,
             usingDefaultPassword: this.auth.usingDefaultPassword,
-            autoCertify: this.backend.autoCertify().enabled,
+            autoCertify: this.autoCertifyPage(),
           }),
         );
       }
@@ -322,10 +326,11 @@ export class AdminServer {
       }
 
       // ---- Auto Certify ----
-      // Disabled in config.json (autoCertify.enabled = false): the page and its
-      // API do not exist for this install — the sidebar hides the link, and a
-      // typed or bookmarked URL lands back on the dashboard.
-      if ((p === '/auto-certify' || p.startsWith('/api/auto-certify')) && !this.backend.autoCertify().enabled) {
+      // Nothing for the page to show (autoCertify.enabled = false AND no
+      // two-channel machine such as IM): the page and its API do not exist for
+      // this install — the sidebar hides the link, and a typed or bookmarked
+      // URL lands back on the dashboard. See autoCertifyPage().
+      if ((p === '/auto-certify' || p.startsWith('/api/auto-certify')) && !this.autoCertifyPage()) {
         if (p.startsWith('/api/')) return this.json(res, { error: 'Auto Certify is disabled in config.json' }, 404);
         return this.redirect(res, '/');
       }
@@ -341,7 +346,7 @@ export class AdminServer {
 
       // ---- Connector Tool: the universal device monitor ----
       if (method === 'GET' && p === '/connector') {
-        return this.html(res, renderConnectorTool({ username: session.username, autoCertify: this.backend.autoCertify().enabled }));
+        return this.html(res, renderConnectorTool({ username: session.username, autoCertify: this.autoCertifyPage() }));
       }
       if (p.startsWith('/api/connector')) {
         // Everything under here either opens sockets or drives a live link, so
@@ -519,6 +524,18 @@ export class AdminServer {
     }
   }
 
+  /**
+   * Is the Auto Certify page offered at all? It carries two things: the
+   * certify job, and the IM order / result channel cards. So it exists while
+   * EITHER is configured — a site that runs IM with the certify job switched
+   * off still needs the page for its channels. With neither, the rail hides
+   * the link and the URL redirects (see handle()).
+   */
+  private autoCertifyPage(): boolean {
+    if (this.backend.autoCertify().enabled) return true;
+    return this.backend.hasChannels ? this.backend.hasChannels() : this.backend.statuses().some((a) => a.channels !== null);
+  }
+
   // ---------------------------------------------------------------------------
   // Auto Certify
   //
@@ -534,7 +551,20 @@ export class AdminServer {
     const svc = this.backend.autoCertify();
     try {
       if (method === 'GET' && p === '/api/auto-certify') {
-        return this.json(res, { status: svc.snapshot(), history: svc.history() });
+        // The page does not show WHERE the job connects — the portal URL and
+        // the HIS database — so neither is sent to the browser at all. Both
+        // stay in config.json and in the start-up log.
+        const snap = svc.snapshot();
+        const { certifyUrl: _url, oracle: _db, ...config } = snap.config;
+        return this.json(res, {
+          status: { ...snap, config },
+          history: svc.history(),
+          // The IM order and result channels, shown on the same page.
+          channels: this.backend
+            .statuses()
+            .filter((a) => a.channels)
+            .map((a) => ({ id: a.id, equipmentCode: a.equipmentCode, ...a.channels })),
+        });
       }
       if (method === 'POST' && p === '/api/auto-certify/run') {
         this.logger.warn('auto certify run requested from the admin console');
