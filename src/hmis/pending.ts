@@ -4,6 +4,7 @@ import type {
   PatientDemographics,
   PendingOrders,
 } from '../types.js';
+import type { Lane } from './lanes.js';
 
 // =============================================================================
 // Normalizer for GET {pendingPath}.
@@ -61,6 +62,10 @@ export interface NormalizeOptions {
    *  the labResultId for an incoming RESULT — by then the row has been
    *  acknowledged, and dropping it would leave the result unfilable. */
   includeTransmitted?: boolean;
+  /** The HMIS lane these rows came from. Set on every row, connector-side
+   *  only: no gateway ever sends it (hinai projects nine columns, GenX builds
+   *  its own bodies). Left unset when the caller does not name one. */
+  source?: Lane;
 }
 
 /** Pull the row array out of whatever envelope the server wrapped it in. */
@@ -124,6 +129,9 @@ export function normalizePending(body: unknown, opts: NormalizeOptions): Pending
       portNo: String(row.portNo ?? opts.portNo ?? ''),
       parameterId: toNumber(row.parameterId),
       resultType: pickString(row, RESULT_TYPE_KEYS),
+      ...(opts.source ? { source: opts.source } : {}),
+      // GenX rows carry their result line's full code list (auto-certify).
+      ...(Array.isArray(row.lineCodes) ? { lineCodes: (row.lineCodes as unknown[]).map(String) } : {}),
     });
 
     // Sample-level attributes repeat on every row; take the first non-empty.
@@ -140,6 +148,8 @@ export function normalizePending(body: unknown, opts: NormalizeOptions): Pending
     sampleId: opts.sampleId,
     testCodes,
     patient,
+    // Only a lane that actually offered rows says anything about the patient.
+    ...(opts.source && testCodes.length ? { patients: { [opts.source]: patient } } : {}),
     priority,
     specimenType,
     ackItems,
@@ -314,17 +324,24 @@ export function mergePending(parts: PendingOrders[]): PendingOrders {
   };
   // The same row can come back twice when the parts were fetched per site
   // and the gateway did not narrow (no siteId, or a code mapped at both):
-  // keep one copy per (sample, labResultId, parameterId, identifier).
+  // keep one copy per (sample, labResultId, parameterId, identifier). The
+  // lane is part of it: in both mode HINAI and GenX may hand back rows whose
+  // ids coincide, and each lane's row is needed to file into that lane.
   const seen = new Set<string>();
   for (const p of parts) {
     for (const code of p.testCodes) if (!merged.testCodes.includes(code)) merged.testCodes.push(code);
     for (const item of p.ackItems) {
-      const key = [item.sampleID, item.labResultId ?? '', item.parameterId ?? '', item.identifier].join('|');
+      const key = [item.source ?? '', item.sampleID, item.labResultId ?? '', item.parameterId ?? '', item.identifier].join('|');
       if (seen.has(key)) continue;
       seen.add(key);
       merged.ackItems.push(item);
     }
     if (!merged.patient && p.patient) merged.patient = p.patient;
+    // Per lane: the first part of that lane that names a patient.
+    for (const [lane, pt] of Object.entries(p.patients ?? {}) as Array<['hinai' | 'genx', PatientDemographics | null]>) {
+      merged.patients ??= {};
+      if (!merged.patients[lane]) merged.patients[lane] = pt;
+    }
     if (merged.specimenType === null && p.specimenType !== null) merged.specimenType = p.specimenType;
     if (p.priority === 'S') merged.priority = 'S';
     if (p.found) merged.found = true;

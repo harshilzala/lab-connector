@@ -26,10 +26,16 @@
     "includeSpoolPending": true
   },
 
-  // The three /mirth/* endpoints. UNAUTHENTICATED — the analyzer is identified
-  // only by the `eqCode` query parameter, so keep the connector on the lab VLAN.
-  // resultsPath differs per deployment ("/mirth/results" vs "/mirth/labresult");
-  // confirm it against the gateway before going live.
+  // HMIS — the system(s) orders come from and results are filed into. Two
+  // exist, called LANES: "hinai" (the Zydus HIMS /mirth/* gateway, the keys at
+  // the top of this block) and "genx" (GenX LIMS, the "genx" block below).
+  //
+  // HINAI: the three /mirth/* endpoints. UNAUTHENTICATED — the analyzer is
+  // identified only by the `eqCode` query parameter, so keep the connector on
+  // the lab VLAN. resultsPath differs per deployment ("/mirth/results" vs
+  // "/mirth/labresult"); confirm it against the gateway before going live.
+  // These keys may also be written inside "hinai": { ... } in this block; a
+  // key there wins over the same key here.
   "hmis": {
     "baseUrl": "https://hmis.example-hospital.local/live/portal",
     "pendingPath": "/mirth/pending",
@@ -37,8 +43,86 @@
     "resultsPath": "/mirth/labresult",
     "timeoutMs": 15000,
     "tlsRejectUnauthorized": true,
-    "auditLog": "./logs/hmis.log"
+    // HINAI's transaction log, always (one file per day: hmis-YYYY-MM-DD.log).
+    // GenX writes here too while it is the ONLY lane any analyzer uses.
+    "auditLog": "./logs/hmis.log",
+
+    // WHICH HMIS the analyzers use. Leave "mode" out and the legacy "api"
+    // decides ("mirth"/"hinai" = single on HINAI, "genx" = single on GenX), so
+    // a config written before these keys reads exactly as before. "mode" and
+    // "use" win over "api" when both are written.
+    //   "mode": "single", "use": "hinai"   one system: HINAI (the keys above)
+    //   "mode": "single", "use": "genx"    one system: GenX (the "genx" block)
+    //   "mode": "both"                     HINAI AND GenX ("use" is ignored)
+    // An analyzer block (or the "im" block) may carry its own
+    // "hmis": { "mode": ..., "use": ... }, which wins for that machine alone.
+    // Each lane any analyzer uses needs its base URL (baseUrl above,
+    // genx.baseUrl below). Both mode always files through the staged store and
+    // HOLDS a tube that only one system lists — see "HMIS: single or both" in
+    // the README. UPGRADING: start the new version in the mode the site already
+    // runs, and change mode only after that first start (README, "Upgrading").
+    // "mode": "single",
+    // "use": "hinai",
+
+    // Both mode only: before filing, compare the patient id HINAI and GenX give
+    // for the barcode, and HOLD the sample (nothing filed, File now and Force
+    // refused) when they differ. Set false ONLY after checking real tubes in
+    // both transaction logs: if HINAI gives an MRN where GenX gives a UHID with
+    // different numbering, every sample would be held. Off = a warning at start.
+    "patientCheck": true,
+
+    // GenX LIMS Lab Equipment API. Needed when any analyzer's lanes include
+    // genx. The token / worklist / acknowledge / results paths default to
+    // GenX's documented ones and are left out here.
+    // "genx": {
+    //   "baseUrl": "https://genx.example-hospital.local",
+    //   "clientId": "",                    // better via env GENX_CLIENT_ID
+    //   "clientSecret": "",                // better via env GENX_CLIENT_SECRET
+    //   "apiKey": "",                      // PROD only; better via env GENX_API_KEY
+    //   "barcodeField": "sampleNumber",    // or "accessionNumber": the field printed on the tube
+    //   // GenX serviceCode -> the analyzer assay codes reported under it.
+    //   "serviceTests": { "SVC01": ["TEST1", "TEST2"] },
+    //   // equipmentCode -> the serviceCodes that machine runs. REQUIRED for a
+    //   // machine that pushes orders (IM): GenX does not filter its worklist by
+    //   // equipment, so an unlisted code would be handed every service on
+    //   // every tube. The config is refused without it.
+    //   "equipmentServices": { "EQCODE04": ["SVC01"] },
+    //   // GenX's own transaction log while HINAI is ALSO in use by any
+    //   // analyzer (hmis-genx-YYYY-MM-DD.log). With GenX alone it writes to
+    //   // hmis.auditLog above, as before. null = off.
+    //   "auditLog": "./logs/hmis-genx.log",
+    //   // GenX auto-certify (an analyzer's genxAutoCertify / im.autoCertify.genx).
+    //   // One call per GenX result line, once every test of the line is filed.
+    //   "autoCertifyPath": "/integration-service/external/v1/lab/equipment/autocertify",
+    //   "autoCertifyMethod": "GET",        // "GET" = ?<param>=<lineId>; "POST" = JSON body { "<param>": <lineId> }
+    //   "autoCertifyParam": "labresultid"  // the parameter that carries the GenX result line id
+    // },
   },
+
+  // IM, the instrument middleware, as ONE block — instead of an analyzer entry
+  // with "profile": "im" at the end of "analyzers" (use one or the other: the
+  // same equipment code twice is refused). The loader turns it into that
+  // analyzer entry, so everything else the "im" profile sets still applies.
+  // "enabled": false (or no block) = no IM from here; the block stays parked.
+  // "im": {
+  //   "enabled": true,
+  //   "id": "im",                          // analyzer id (spool/<id>, console); default "im"
+  //   "equipmentCode": "EQCODE04",         // REQUIRED: the eqCode HMIS raises IM's orders under
+  //   "equipmentId": 100000004,            // HMIS equipment id; needed for autoCertify.hinai
+  //   "siteIds": ["1", "2"],               // HINAI sites to poll; GenX ignores them
+  //   "hmis": { "mode": "single", "use": "hinai" },  // or { "mode": "both" }; absent = top-level hmis
+  //   "orders":  { "host": "10.0.0.20", "port": 10011 },  // ORDER channel: the connector dials IM (host REQUIRED)
+  //   "results": { "host": "0.0.0.0", "port": 10012 },    // RESULT channel: IM dials this PC
+  //   // hinai: add equipmentId to the Oracle certify job below ("autoCertify",
+  //   //        which must then be enabled) — only when IM uses the HINAI lane.
+  //   // genx:  certify each GenX result line through GenX once all its tests
+  //   //        are filed in GenX — only when IM uses the GenX lane.
+  //   "autoCertify": { "hinai": false, "genx": false },
+  //   // Any other analyzer key, merged DEEPLY over the above and the profile:
+  //   // { "hl7": { "orderPush": { "version": "2.5" } } } changes the version
+  //   // and leaves the push switched on.
+  //   "analyzer": {}
+  // },
 
   "admin": {
     "host": "127.0.0.1",
@@ -86,6 +170,8 @@
     "parameterResultStatus": ["0000"],    // LRP.parameterresultstatus that HOLDS a result back until the analyzer finishes it (old ParameterResultStatus)
     "lookbackDays": 2,                    // accepted today or in the previous N days
     "requireHod": true,                   // department must have an HOD
+    "concurrency": 1,                     // results certified at once (1-8); 1 = the old service's order
+    "skipRecertifyHours": 24,             // a row the portal confirmed is not called again for this long; 0 = every run
     "oracle": {
       "user": "",
       "password": "",
@@ -334,18 +420,17 @@
     // a setting — see "orderPush" below.
     //
     // A machine whose orders come from several HMIS sites lists them all in
-    // siteIds: at Ahmedabad EQ0022 carries tubes from five (2, Chandkheda
-    // 13873256, Vadodara 5866265, Anand 14, Ramanbhai 2567859), and polling
-    // with one site alone hides the others' rows.
+    // siteIds — a middleware that runs referred tubes carries orders from
+    // several sites, and polling with one site alone hides the others' rows.
     // -----------------------------------------------------------------------
     // ,
     // {
     //   "id": "im",
     //   "profile": "im",
-    //   "equipmentCode": "EQ0022",
-    //   "equipmentId": 46150218,
-    //   "siteIds": ["2", "13873256", "5866265", "14", "2567859"],
-    //   "transport": { "host": "10.11.4.231" },
+    //   "equipmentCode": "EQCODE04",
+    //   "equipmentId": 100000004,
+    //   "siteIds": ["2", "1000001"],
+    //   "transport": { "host": "10.0.0.20" },
     //   "resultTransport": { "type": "tcp", "mode": "server", "host": "0.0.0.0", "port": 10012 },
     //
     //   // Only if IM asks for something other than the defaults:

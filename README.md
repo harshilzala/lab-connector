@@ -132,6 +132,10 @@ Edit `config.json`:
 - `hmis.baseUrl` — your HMIS server (better via env `HMIS_BASE_URL`).
 - `hmis.pendingPath` / `acknowledgePath` / `resultsPath` — default to
   `/mirth/pending`, `/mirth/acknowledge`, `/mirth/results`.
+- `hmis.mode` / `hmis.use` — which HMIS the analyzers use: HINAI, GenX
+  (`hmis.genx`), or both side by side. Leave them out and the legacy
+  `hmis.api` decides, as before. See [HMIS: single or both](#hmis-single-or-both),
+  and read [Upgrading](#upgrading) before changing the mode on a running site.
 - One entry per analyzer under `analyzers[]`:
   - `profile` — the instrument **model**, from the machine profile library in
     `src/profiles/index.ts` (`mindray-bc5150`, `mindray-bc6000`, `erba-h360`,
@@ -453,6 +457,338 @@ acknowledgement handling and the poll behaviour; `npm run im:channels` runs
 the whole connector against a stand-in HMIS and a stand-in IM, both channels
 and the console page included.
 
+### The `im` block
+
+IM can be written as one top-level `im` block instead of an analyzer entry.
+Use one or the other: the same equipment code twice is refused. The loader
+turns the block into an ordinary `"profile": "im"` analyzer before profiles
+are applied, so the order push, refusal retry, result channel and console
+cards are the ones described above. The block only holds what differs per
+site.
+
+| Key | Meaning |
+|---|---|
+| `enabled` | `false` (or no `im` block) means no IM from this block. Lets the block stay parked in the file. |
+| `id` | Analyzer id, which names `spool/<id>/` and the console card. Default `im`. |
+| `equipmentCode` | **Required.** The `eqCode` HMIS raises IM's orders under. |
+| `equipmentId` | HMIS equipment id. Fallback in the acknowledge and upload bodies. Required when `autoCertify.hinai` is on. |
+| `siteIds` | HINAI sites polled for IM's orders. GenX ignores them because its worklist comes as one batch. |
+| `hmis` | IM's own lanes: `{ "mode": "single", "use": "hinai" }`, `{ "mode": "single", "use": "genx" }` or `{ "mode": "both" }`. Absent means the top-level `hmis` setting. |
+| `orders.host` / `orders.port` | ORDER channel (`transport`): the address the connector dials to send IM its work. The host is required; the port defaults to 10011. |
+| `results.host` / `results.port` | RESULT channel (`resultTransport`): where the connector listens for IM's results. Defaults to `0.0.0.0`, port 10012. |
+| `autoCertify.hinai` | Adds `equipmentId` to the existing Oracle certify job (see below). Default `false`. |
+| `autoCertify.genx` | Certifies IM's GenX result lines through GenX (sets the analyzer key `genxAutoCertify`). Default `false`. |
+| `analyzer` | Any other analyzer key, merged **deeply** over everything above and the profile. This is the escape hatch. |
+
+**Single HINAI** (IM as it runs today):
+
+```jsonc
+"im": {
+  "enabled": true,
+  "equipmentCode": "EQ0022",
+  "equipmentId": 46150218,
+  "siteIds": ["2", "13873256", "5866265", "14", "2567859"],
+  "hmis": { "mode": "single", "use": "hinai" },
+  "orders":  { "host": "10.11.4.231", "port": 10011 },
+  "results": { "host": "0.0.0.0", "port": 10012 },
+  "autoCertify": { "hinai": false, "genx": false }  // hinai: true also needs "autoCertify": { "enabled": true, ... }
+}
+```
+
+**Single GenX.** `siteIds` is not needed. `hmis.genx` must name IM's services:
+
+```jsonc
+"hmis": {
+  "genx": {
+    "baseUrl": "https://genx.example-hospital.local",
+    "serviceTests":      { "SVC01": ["TEST1", "TEST2"] },
+    "equipmentServices": { "EQ0022": ["SVC01"] }
+  }
+},
+"im": {
+  "enabled": true,
+  "equipmentCode": "EQ0022",
+  "hmis": { "mode": "single", "use": "genx" },
+  "orders":  { "host": "10.11.4.231" },
+  "autoCertify": { "hinai": false, "genx": true }
+}
+```
+
+**Both**, meaning orders from HINAI and GenX and results into each (see
+[HMIS: single or both](#hmis-single-or-both)). The `hmis.genx` block above is
+needed here too:
+
+```jsonc
+"im": {
+  "enabled": true,
+  "equipmentCode": "EQ0022",
+  "equipmentId": 46150218,
+  "siteIds": ["2", "13873256", "5866265", "14", "2567859"],  // HINAI only
+  "hmis": { "mode": "both" },
+  "orders":  { "host": "10.11.4.231", "port": 10011 },
+  "results": { "host": "0.0.0.0", "port": 10012 },
+  "autoCertify": { "hinai": false, "genx": true },
+  "analyzer": { "hl7": { "orderPush": { "version": "2.5" } } }
+}
+```
+
+**`analyzer` is merged deeply.** `{ "hl7": { "orderPush": { "version": "2.5" } } }`
+changes only the version and leaves `orderPush.enabled` from the profile
+switched on. Objects merge at every depth; arrays and scalars replace. An
+ordinary analyzer block still merges with its profile one level deep, as
+described under *Install & configure*. Only the `im` block's `analyzer` key
+merges deeply.
+
+**GenX needs `hmis.genx.equipmentServices` for IM.** HINAI filters its pending
+list by equipment code on the server. GenX does not: an equipment code with no
+`equipmentServices` entry gets every service on every tube. For a machine that
+only answers host queries that costs nothing. For IM, which is sent every
+order, it would put the whole lab's work on IM's worklist under codes IM does
+not know, refused and retried forever. So when IM's lanes include GenX, the
+config is refused until `hmis.genx.equipmentServices` lists IM's equipment
+code with the serviceCodes it runs.
+
+**Auto-certify.** Certification signs a result off with nobody reviewing it,
+and it cannot be undone. Both switches are therefore off by default, and each
+one acts only on its own system:
+
+- **`autoCertify.hinai`** does not certify anything in the connector. It adds
+  IM's `equipmentId` (as a string, once) to `autoCertify.equipmentIds`. The
+  existing Oracle certify job then certifies IM's results exactly as it
+  certifies the other equipment, and nothing else about that job changes. That
+  job must be enabled. `im.autoCertify.hinai: true` with `autoCertify.enabled`
+  not `true` is a config error that names both keys. If IM does not use the
+  HINAI lane, the switch is ignored and logged once at start
+  (`im.autoCertify.hinai ignored: IM does not use the HINAI lane`).
+
+  The Oracle job is the old `Certify_Results` service (`Auto_Certify.exe`)
+  ported clause for clause, with four changes taken from its own logs
+  (22 Jun – 12 Oct 2026):
+  - **The portal's answer is read, not just its HTTP status.** The portal
+    answers HTTP 200 even when it did not certify:
+    `{"Statue":"Fail","Error":"… optimistic locking failed …"}` — 155 times in
+    the 35 days studied, all logged by the old service as successes. A call
+    now counts as certified only when the body says `"Statue":"Success"`
+    ("Status" and any case accepted; a body that is not JSON is judged by
+    the HTTP status, as before). A failed one is found again and retried on
+    the next run.
+  - **`skipRecertifyHours`** (default 24): a row the portal confirmed is not
+    called again for that long, even if the database still lists it as ready.
+    The old service re-certified some every 30 s for hours — 2,794 extra calls
+    for 30 results in 3–12 Oct. Logged once per row; 0 restores the old
+    behaviour.
+  - **Batched parameter lookups.** "Still pending?" and "which parameters?"
+    are asked for every result of a run at once (two queries per 900
+    results) instead of twice per result — 2 round trips to the HIS database
+    instead of ~124 on the busiest run (62 results, 2026-10-05 12:00).
+  - **`concurrency`** (default 1, max 8): results certified at the same time.
+    1 keeps the old order exactly; the busiest run used about 7% of what one
+    at a time can do, so raise it only if volume grows a lot. More parallel
+    calls make the "optimistic locking" clash likelier. A result's own
+    parameters always go one after another.
+  - Keep `autoCertify.enabled` false while the old `Certify_Results` service
+    runs: both together certify every result twice.
+- **`autoCertify.genx`** runs inside the filer, after GenX has confirmed a
+  results post. A GenX result line is one test line on GenX's side, and its id
+  is the `labResultId` on the GenX order rows. A line is certified only when
+  **every** test of that line has been filed in GenX against that line, and
+  GenX placed every one of them. The list of tests is the line's full list
+  from the GenX worklist, taken before the interface drops any code it does not
+  carry. So a line with a test the interface never files, or with a test that
+  was filed under another line, is never auto-certified. It is left for staff,
+  and the connector logs it once. A line with a test that is still waiting, or
+  that the operator skipped, is not certified either. When GenX answers a post
+  with some codes `unmatched`, only the codes it placed count as filed in GenX.
+  The unmatched codes stay pending and are retried like "no order row yet", and
+  their line is not certified until they are placed. Certification is one call per line,
+  `<autoCertifyMethod> <genx.baseUrl><autoCertifyPath>`, with the line id in
+  `<autoCertifyParam>`. GET sends it as a query string and POST sends it as a
+  JSON body. The defaults are `GET`,
+  `/integration-service/external/v1/lab/equipment/autocertify` and
+  `labresultid`. Only GET and POST are accepted. The call uses the same token,
+  API key and 401 retry as the other GenX calls, and it is written to the GenX
+  transaction log as kind `certify`. Certified line ids are recorded on the
+  staged sample, so a line is never certified twice. A failed call never
+  un-files anything. It is retried on a later pass (no more often than
+  `passIntervalMs`) without re-posting the results. The same revisit covers a
+  sample that was filed before the switch was turned on. The connector
+  **never** certifies a line whose GenX rows came from the upgrade migration
+  ([Upgrading](#upgrading)) rather than from a GenX response. Such a line is
+  left for HMIS staff, and the connector logs it once.
+
+  **A corrected value on a line that is already certified** (a rerun or
+  correction after GenX certified the line) is **not** posted to GenX
+  automatically. The connector cannot un-certify the line, so a person has to
+  decide. The value stays pending in GenX with `GenX result line <id> is already
+  certified — the corrected value needs staff; 'File now' sends it`, and a
+  warning is logged. **File now** posts it to GenX and does **not** certify the
+  line again. HINAI files the correction as it always has.
+
+The Auto Certify page's IM cards show IM's HMIS mode and lanes, values filed
+per system, held samples, and the GenX certified and failed counts with the
+last certify error. As before, they show nothing about where the certify job
+connects.
+
+## HMIS: single or both
+
+The connector can talk to two HMIS systems. Each one is called a **lane**.
+`hinai` is the Zydus HIMS `/mirth/*` gateway (the keys at the top of `hmis`, or
+inside `hmis.hinai`). `genx` is GenX LIMS (`hmis.genx`). JSON (status, API and
+spool files) uses the names `hinai` and `genx`. The pages show them as HINAI
+and GenX.
+
+- **single** means one lane. Every analyzer behaves exactly as before,
+  including its choice of `filing.mode`.
+- **both** means HINAI and GenX side by side. It was added for IM, which the
+  lab runs against both while GenX is brought in.
+
+`hmis.mode` (`"single"` | `"both"`) and `hmis.use` (`"hinai"` | `"genx"`,
+single mode only) set this for every analyzer. Any analyzer block, or
+`im.hmis`, may carry its own `{ "mode", "use" }` that wins for that machine
+alone. Without `mode`, the legacy `hmis.api` decides: `"genx"` means single on
+GenX, and anything else means single on HINAI. So a config written before
+these keys is read unchanged. `mode`/`use` win over `api` when both are
+written. Each lane that any analyzer uses needs its base URL (`hmis.baseUrl`,
+`hmis.genx.baseUrl`).
+
+**What both mode does with orders.** Every poll reads both systems. HINAI is
+read per site and per day as before. GenX is read once per tick, because its
+batch ignores site and date. Each row is stored with the lane it came from. On
+the first tick both systems are read before anything is pushed. The machine
+gets **one order per tube** carrying the union of the tests both systems list,
+and after that only new tests go out as a delta, as always. A tube that only
+one system lists is still sent, because the tube has to run either way, and
+the hold rule below applies to filing only. A host query and the console's
+**Re-send** ask both systems and merge the answers.
+
+**What both mode does with results.** Both mode always files through the
+staged store, even when the analyzer says `filing.mode: "queue"`. In that case
+the log says `both HMIS mode files through the staged store` once at start. The
+reason is that a value has to be remembered per system, and only the staged
+store can do that. For each sample, each system is handled on its own. The
+values not yet filed in that system are joined against **that system's own
+order rows**, posted with that system's own ids (identifier, `labResultId`),
+and acknowledged to that system. A value is done once it is filed (or skipped
+by the operator) in every lane. A rerun or correction replaces the value and
+files it to both again.
+
+**The hold rule.** A tube that only one system lists is **held**. Nothing is
+posted anywhere. The Results tab shows `held: only in HINAI` (or GenX), and the
+sample's error reads `order only in HINAI — waiting for GenX; "File now" sends
+it to HINAI only`. There is no timer. If the connector quietly filed to one
+system after a timeout, it would be deciding on its own that the other system
+never gets the result, and that decision belongs to a person. The hold is
+checked on every pass, and the tube files to both by itself the moment the
+other system lists it. **File now** on a held sample sends it to the system
+that has the tube. Each value is marked skipped in the other system, a warning
+names the barcode, the system and the values, and the sample is complete. A
+tube that **neither** system lists stays held, and File now cannot send it
+anywhere.
+
+**A test ordered in only one system.** The tube is in both systems but one of
+its tests is listed by only one of them. That value files to the system that
+lists it and waits for the other as "no order row yet", like any value whose
+order is not raised yet. File now closes it: for each system that has the tube
+but still no row for that test, the value is marked skipped there and logged.
+File now skips a value only when that system has **no row at all** for the
+test. A value that is withheld (its row is excluded) or ambiguous (two rows
+could take it) is never skipped. It keeps waiting exactly as it would in single
+mode, because skipping it would hide a problem someone has to look at. Apart
+from those values and a tube in neither system, File now leaves the sample
+complete.
+
+**Patient mismatch.** Before filing a sample to either system, the connector
+compares the patient id (UHID/MRN) each system gives for the barcode, trimmed
+and ignoring case. If both give one and they differ, the sample is held and
+**nothing is filed anywhere**. The sample's error reads `patient differs
+between HINAI (<id>) and GenX (<id>) for this barcode — not filed; correct it
+in HMIS`. **File now and Force both refuse it** with that message, because
+sending a result past this check would put it on the wrong patient in at least
+one system. File now answers HTTP 409 with the message, and the console shows
+`File now refused: patient differs …`. Force refuses with the same message. Fix the registration in HMIS. The
+check runs on every pass, and again just before each post if the rows were
+refreshed mid-pass. The sample files normally once the ids agree. If either
+system gives no id, there is nothing to compare and no check is made. The
+machine order still goes out, so the tube still runs.
+
+**`hmis.patientCheck`** (default `true`) switches this check on or off. The
+two systems may number patients differently: HINAI may give an MRN where GenX
+gives a UHID. If they do, every both-mode sample would be held as a mismatch.
+Before going live in both mode, compare the ids on a few real tubes in the two
+transaction logs. Set `"patientCheck": false` only if the numbering really
+differs. While the check is off, the connector logs a warning at every start:
+`hmis.patientCheck is off — in both HMIS mode a sample is filed even when
+HINAI and GenX name different patients for its barcode`.
+
+**When one system fails.** A system that is down or refuses a post does not
+stop the other one. Its error is recorded per lane and shown on the dashboard,
+whose HMIS line reads `HINAI + GenX (both)` with each lane's state. That
+system is retried on the next pass. Whatever the other system already took is
+not undone and is never posted to it again. A GenX outage never slows or
+stops HINAI filing. While a system is marked down, the connector skips only
+its network calls: lookups, posts, acknowledges and certifies. The order rows
+already cached for it still count for the hold rule and the join. So a tube
+that the cache shows in both systems files to HINAI and stays pending for GenX.
+It is not held and does not turn into an error.
+
+**Force** (password as always) works per system, each from its own cached
+rows, and reports one entry per system. It refuses a patient mismatch.
+
+**Logs, one per HMIS.** HINAI always writes `hmis.auditLog`
+(`logs/hmis-YYYY-MM-DD.log`). When HINAI is also in use by any analyzer, GenX
+writes its own `hmis.genx.auditLog` (`logs/hmis-genx-YYYY-MM-DD.log`), so the
+two systems' evidence trails stay apart. When GenX is the only lane any
+analyzer uses, it keeps writing to `hmis.auditLog` as before. This is decided
+by the lanes the analyzers actually use, not by which blocks are filled in. To
+trace a tube in both mode, search both families:
+
+```
+findstr <barcode> logs\hmis-2*.log logs\hmis-genx-*.log
+```
+
+### Upgrading
+
+Order rows that older versions stored carry no lane, because there was only
+ever one. The new version labels them **once**, on its first start, and never
+guesses again. When it has done this, it writes `spool/<id>/orders/.lanes.json`.
+
+1. **Start the new version in the HMIS mode the site already runs.** For a
+   HINAI site, that means single mode on HINAI, which is what an unchanged
+   config gives. Every old row is then labelled with that lane and marked
+   `migrated`, and everything carries on as before.
+2. **Change the mode only after that first start**: edit the config and
+   restart.
+
+If the first start is already in **both** mode, the connector cannot tell
+which system an old row came from. Those rows are **quarantined**. They stay
+on disk but are never used to file, acknowledge, certify, Force, or rebuild
+another row. The log warns once per analyzer with the count: `cannot tell which
+HMIS these old order rows came from — start the new version in the mode the
+site ran before, then switch`. Tubes that HMIS still lists come back on the
+next poll with their lane. A tube whose rows were already acknowledged (a
+rerun of an old sample) cannot be filed by the connector and has to be
+entered in HMIS.
+
+GenX auto-certify never certifies a line from `migrated` rows. A wrongly
+labelled row must not certify an unrelated line, and certification cannot be
+undone.
+
+**Results filed before a switch.**
+
+- **Single to both**: values that were complete before the switch stay
+  complete and are **not** sent to the newly added system. This avoids a flood
+  of old results into it. Only values received or rerun after the switch file
+  to both systems.
+- **Both to single**: values that were waiting only for the system no longer
+  in use stop waiting and count as complete. A sample held for that system is
+  released and files normally to the remaining one.
+
+**One system down in both mode.** The poll and a host query answer with the
+systems that answered. The machine gets the tube with those tests. The down
+system's tests go out later as a delta, once it answers again. A tube known so
+far only to the system that is up is held for filing until the other one lists
+it (see the hold rule).
+
 ## Result filing: queue or staged
 
 Each analyzer chooses how its results reach HMIS with `filing.mode`:
@@ -511,6 +847,7 @@ Four things grow on disk. Each is bounded, but by a different mechanism.
 | What | Where | Bounded by |
 |---|---|---|
 | HMIS transaction log | `logs/hmis-YYYY-MM-DD.log` | one file per day, deleted after `retention.logDays` (30) |
+| GenX transaction log (only while HINAI is also in use) | `logs/hmis-genx-YYYY-MM-DD.log` | the same |
 | Analyzer wire logs | `logs/wire-<analyzer>-YYYY-MM-DD.log` | one file per analyzer per day, deleted after `retention.logDays` (30) |
 | PM2 stdout/stderr | `logs/lab-interface.{out,err}.log` | `pm2-logrotate` — see below |
 | Unfiled results | `spool/<analyzer>/{pending,failed}` | deleted after `retention.days` (7) |

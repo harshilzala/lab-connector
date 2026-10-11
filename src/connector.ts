@@ -1,82 +1,106 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { AppConfig } from './config.js';
+import { lanesFor, type AppConfig } from './config.js';
 import type { Logger } from './logger.js';
-import { HmisClient, type HmisGateway } from './hmis/client.js';
+import { HmisClient } from './hmis/client.js';
 import { GenxHmisClient } from './hmis/genx.js';
 import { HmisAudit } from './hmis/audit.js';
 import { RetentionSweeper } from './maintenance/retention.js';
-import { AnalyzerRuntime } from './session/orchestrator.js';
+import { AnalyzerRuntime, type LaneGateways } from './session/orchestrator.js';
+import { LANES, describeLanes, type Lane } from './hmis/lanes.js';
 import { AdminServer, type AdminBackend } from './admin/server.js';
 import { AuthStore } from './admin/auth.js';
 import { AutoCertifyService } from './autocertify/service.js';
 
-// Top-level app: one HMIS client, one AnalyzerRuntime per configured analyzer,
+// Top-level app: one HMIS client per lane in use (HINAI and/or GenX), one
+// AnalyzerRuntime per configured analyzer,
 // and the local admin server. Implements AdminBackend so the dashboard can read
 // live state.
 export class Connector implements AdminBackend {
   private readonly runtimes = new Map<string, AnalyzerRuntime>();
-  private readonly hmis: HmisGateway;
+  /** GenX's audit file when GenX is in use (for the start-up line). */
+  private readonly genxAuditFile: string | null;
   private readonly admin: AdminServer;
   private readonly auth: AuthStore;
   /** Absent when retention.days is 0 — the sweep is then switched off. */
   private readonly retention?: RetentionSweeper;
   private readonly autoCertifyService: AutoCertifyService;
 
-  /** The gateway actually in use — mirth's baseUrl or genx's. */
-  private get hmisUrl(): string {
-    return this.cfg.hmis.api === 'genx' ? this.cfg.hmis.genx.baseUrl : this.cfg.hmis.baseUrl;
+  /** Every lane any configured analyzer uses, HINAI first. */
+  private readonly lanesInUse: Lane[];
+
+  /** The gateway URLs actually in use — HINAI's and/or GenX's. */
+  private get hmisUrls(): string[] {
+    return this.lanesInUse.map((l) => (l === 'genx' ? this.cfg.hmis.genx.baseUrl : this.cfg.hmis.baseUrl));
   }
 
   constructor(private readonly cfg: AppConfig, private readonly logger: Logger) {
+    // Which HMIS lanes this process needs: decided by what the configured
+    // analyzers use, not by which hmis blocks happen to be filled in.
+    const perAnalyzer = new Map(cfg.analyzers.map((a) => [a.id, lanesFor(a, cfg)]));
+    this.lanesInUse = LANES.filter((l) => [...perAnalyzer.values()].some((ls) => ls.includes(l)));
+    const usesHinai = this.lanesInUse.includes('hinai');
+    const usesGenx = this.lanesInUse.includes('genx');
+
     // Separate from the application log on purpose: this one is the evidence
     // trail for "did HMIS actually take it?", and stays greppable by barcode.
     // Not opened in Auto-Certify-only mode (no analyzers): nothing would ever
-    // be written to it.
-    const audit = cfg.hmis.auditLog && cfg.analyzers.length
-      ? new HmisAudit(resolve(cfg.hmis.auditLog), logger.child({ mod: 'hmis-audit' }), cfg.hmis.auditMaxBytes)
-      : undefined;
-
-    // hmis.api picks the gateway; everything downstream sees the same shape.
+    // be written to it. HINAI always writes hmis.auditLog; GenX writes there
+    // too while it is the only lane in the process (as before), and its own
+    // hmis.genx.auditLog once HINAI is in use as well, so the two trails stay
+    // apart.
+    const openAudit = (file: string | null, mod: string) =>
+      file && cfg.analyzers.length ? new HmisAudit(resolve(file), logger.child({ mod }), cfg.hmis.auditMaxBytes) : undefined;
     const g = cfg.hmis.genx;
-    this.hmis = cfg.hmis.api === 'genx'
-      ? new GenxHmisClient({
-          baseUrl: g.baseUrl,
-          tokenPath: g.tokenPath,
-          revokePath: g.revokePath,
-          worklistPath: g.worklistPath,
-          acknowledgePath: g.acknowledgePath,
-          resultsPath: g.resultsPath,
-          clientId: g.clientId,
-          clientSecret: g.clientSecret,
-          scope: g.scope,
-          clientAuth: g.clientAuth,
-          apiKey: g.apiKey || undefined,
-          apiKeyHeader: g.apiKeyHeader,
-          barcodeField: g.barcodeField,
-          serviceTests: g.serviceTests,
-          equipmentServices: g.equipmentServices,
-          pendingLineStatuses: g.pendingLineStatuses,
-          batchDays: g.batchDays,
-          batchPageSize: g.batchPageSize,
-          accessionCacheFile: g.accessionCacheFile ? resolve(g.accessionCacheFile) : undefined,
-          timeoutMs: cfg.hmis.timeoutMs,
-          tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
-          logger: logger.child({ mod: 'hmis-genx' }),
-          audit,
-        })
-      : new HmisClient({
-          baseUrl: cfg.hmis.baseUrl,
-          siteId: cfg.hmis.siteId,
-          siteIds: cfg.hmis.siteIds,
-          pendingPath: cfg.hmis.pendingPath,
-          acknowledgePath: cfg.hmis.acknowledgePath,
-          resultsPath: cfg.hmis.resultsPath,
-          timeoutMs: cfg.hmis.timeoutMs,
-          tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
-          logger: logger.child({ mod: 'hmis' }),
-          audit,
-        });
+    const genxLog = usesHinai ? (g.auditLog ?? null) : cfg.hmis.auditLog;
+    this.genxAuditFile = usesGenx ? genxLog : null;
+
+    // One client per lane, built once and shared by every analyzer on it.
+    const gateways: LaneGateways = {};
+    if (usesHinai) {
+      gateways.hinai = new HmisClient({
+        baseUrl: cfg.hmis.baseUrl,
+        siteId: cfg.hmis.siteId,
+        siteIds: cfg.hmis.siteIds,
+        pendingPath: cfg.hmis.pendingPath,
+        acknowledgePath: cfg.hmis.acknowledgePath,
+        resultsPath: cfg.hmis.resultsPath,
+        timeoutMs: cfg.hmis.timeoutMs,
+        tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
+        logger: logger.child({ mod: 'hmis' }),
+        audit: openAudit(cfg.hmis.auditLog, 'hmis-audit'),
+      });
+    }
+    if (usesGenx) {
+      gateways.genx = new GenxHmisClient({
+        baseUrl: g.baseUrl,
+        tokenPath: g.tokenPath,
+        revokePath: g.revokePath,
+        worklistPath: g.worklistPath,
+        acknowledgePath: g.acknowledgePath,
+        resultsPath: g.resultsPath,
+        clientId: g.clientId,
+        clientSecret: g.clientSecret,
+        scope: g.scope,
+        clientAuth: g.clientAuth,
+        apiKey: g.apiKey || undefined,
+        apiKeyHeader: g.apiKeyHeader,
+        barcodeField: g.barcodeField,
+        serviceTests: g.serviceTests,
+        equipmentServices: g.equipmentServices,
+        pendingLineStatuses: g.pendingLineStatuses,
+        batchDays: g.batchDays,
+        batchPageSize: g.batchPageSize,
+        accessionCacheFile: g.accessionCacheFile ? resolve(g.accessionCacheFile) : undefined,
+        timeoutMs: cfg.hmis.timeoutMs,
+        tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized,
+        logger: logger.child({ mod: 'hmis-genx' }),
+        audit: openAudit(genxLog, usesHinai ? 'hmis-genx-audit' : 'hmis-audit'),
+        autoCertifyPath: g.autoCertifyPath,
+        autoCertifyMethod: g.autoCertifyMethod,
+        autoCertifyParam: g.autoCertifyParam,
+      });
+    }
 
     const spoolRoot = resolve(cfg.spoolDir);
     for (const a of cfg.analyzers) {
@@ -85,7 +109,10 @@ export class Connector implements AdminBackend {
       // answerable after a restart — for retention.logDays, after which the
       // sweeper removes the day file.
       const wireLogFile = resolve(cfg.retention.logDir, `wire-${a.id}.log`);
-      this.runtimes.set(a.id, new AnalyzerRuntime(a, this.hmis, spoolRoot, logger, wireLogFile, cfg.retention.days || 7));
+      // Each runtime gets the gateways of ITS lanes only.
+      const own: LaneGateways = {};
+      for (const l of perAnalyzer.get(a.id) ?? []) own[l] = gateways[l];
+      this.runtimes.set(a.id, new AnalyzerRuntime(a, own, spoolRoot, logger, wireLogFile, cfg.retention.days || 7, cfg.hmis.patientCheck !== false));
     }
 
     if (cfg.retention.days > 0) {
@@ -122,11 +149,16 @@ export class Connector implements AdminBackend {
     // A loopback/placeholder HMIS URL starts cleanly but files nothing —
     // results just accumulate in the spool. Say so loudly rather than let a
     // placeholder reach go-live unnoticed.
-    if (this.runtimes.size && /^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:|\/|$)/i.test(this.hmisUrl)) {
+    for (const url of this.runtimes.size ? this.hmisUrls : []) {
+      if (!/^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:|\/|$)/i.test(url)) continue;
       this.logger.warn(
-        { baseUrl: this.hmisUrl },
+        { baseUrl: url },
         'HMIS base URL points at this machine — results will queue in the spool until it is set to the real gateway',
       );
+    }
+    for (const w of this.cfg.startupWarnings ?? []) this.logger.warn(w);
+    if (this.cfg.hmis.patientCheck === false && this.runtimes.size) {
+      this.logger.warn('hmis.patientCheck is off — in both HMIS mode a sample is filed even when HINAI and GenX name different patients for its barcode');
     }
 
     // Printed exactly once, on the start that seeds the auth file. File it with
@@ -151,8 +183,12 @@ export class Connector implements AdminBackend {
         analyzers: [...this.runtimes.keys()],
         autoCertify: this.autoCertifyService.enabled ? 'enabled' : 'disabled',
         hmisApi: this.cfg.hmis.api,
-        hmis: this.hmisUrl,
-        hmisLog: this.cfg.hmis.auditLog ? this.cfg.hmis.auditLog.replace(/(\.[^./\\]+)?$/, '-YYYY-MM-DD$1') : 'disabled',
+        hmis: this.hmisUrls.length === 1 ? this.hmisUrls[0] : this.hmisUrls,
+        // Single HINAI: the line it always was. GenX only: its log is
+        // hmis.auditLog. Both lanes: each its own.
+        ...(this.lanesInUse.length > 1 ? { hmisLanes: describeLanes(this.lanesInUse) } : {}),
+        hmisLog: this.lanesInUse.includes('hinai') ? dayLog(this.cfg.hmis.auditLog) : dayLog(this.genxAuditFile),
+        ...(this.lanesInUse.length > 1 ? { hmisGenxLog: dayLog(this.genxAuditFile) } : {}),
         wireLogs: `${this.cfg.retention.logDir}/wire-<analyzer>-YYYY-MM-DD.log`,
         retentionDays: this.cfg.retention.days || 'disabled',
         logRetentionDays: this.cfg.retention.days ? this.cfg.retention.logDays : 'disabled',
@@ -252,4 +288,9 @@ export class Connector implements AdminBackend {
   force(id: string, barcode: string) {
     return this.runtimes.get(id)?.stagedForce(barcode) ?? Promise.resolve(null);
   }
+}
+
+/** ./logs/hmis.log -> "./logs/hmis-YYYY-MM-DD.log", as the start-up line shows it. */
+function dayLog(file: string | null): string {
+  return file ? file.replace(/(\.[^./\\]+)?$/, '-YYYY-MM-DD$1') : 'disabled';
 }

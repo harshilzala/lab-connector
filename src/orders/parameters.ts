@@ -276,6 +276,9 @@ export class ParameterCatalogue {
           parameterId: param.parameterId,
           resultType: cat.services[svcKey]?.resultType ?? template.resultType ?? null,
           synthesized: true,
+          // Same lane as the sibling it was built from — a GenX row's
+          // labResultId must never be filed into HINAI.
+          ...(template.source ? { source: template.source } : {}),
         });
         built = true;
         break;

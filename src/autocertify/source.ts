@@ -50,7 +50,23 @@ export interface CertifySource {
   blockingParameters(labResultId: string): Promise<string[]>;
   /** Every parameter row of the result: what gets certified once nothing blocks. */
   allParameters(labResultId: string): Promise<string[]>;
+  /** The two lookups above for MANY results at once: one database round trip
+   *  per IN_CHUNK results instead of one per result. Every requested id is in
+   *  the map (an empty list when it has no such rows). Optional: a source
+   *  without them is asked one result at a time, as before. */
+  blockingParametersFor?(labResultIds: string[]): Promise<Map<string, string[]>>;
+  allParametersFor?(labResultIds: string[]): Promise<Map<string, string[]>>;
   close(): Promise<void>;
+}
+
+/** Oracle refuses an IN list longer than 1000 entries; batches stay below it. */
+export const IN_CHUNK = 900;
+
+/** Split ids into IN_CHUNK-sized slices. */
+export function chunks<T>(items: T[], size = IN_CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 /** Positional bind names for an IN list: (:p0, :p1, …). */
@@ -115,6 +131,39 @@ export function buildAllParametersQuery(labResultId: string): { sql: string; bin
     sql: 'select LRP.lab_result_parameter_id from labresultparameter LRP where LRP.lab_result_id = :resultId',
     binds: { resultId: labResultId },
   };
+}
+
+// -----------------------------------------------------------------------------
+// Batched forms of the two parameter queries. The old service asked them once
+// per result: a busy run (62 results on 2026-10-05 12:00) made ~124 round trips
+// to the remote HIS database before its last certify call. These ask for up to
+// IN_CHUNK results at once and return lab_result_id beside each row, so the
+// rows can be handed back per result. The WHERE clauses are the per-result
+// ones with `= :resultId` widened to `in (...)` — same rows, fewer trips.
+// -----------------------------------------------------------------------------
+
+export function buildBlockingParametersBatchQuery(
+  cfg: AutoCertifyConfig,
+  labResultIds: string[],
+): { sql: string; binds: Record<string, string | number> } {
+  const binds: Record<string, string | number> = {};
+  const sql = `
+    select distinct LRP.lab_result_id, LRP.lab_result_parameter_id
+      from labresultparameter LRP
+     inner join equipmentservice ES on ES.parameterid = LRP.parameter_id
+     where LRP.lab_result_id in (${inList('r', labResultIds, binds)})
+       and ES.equipmentid in (${inList('eq', cfg.equipmentIds, binds)})
+       and LRP.parameterresultstatus in (${inList('ps', cfg.parameterResultStatus, binds)})`;
+  return { sql, binds };
+}
+
+export function buildAllParametersBatchQuery(labResultIds: string[]): { sql: string; binds: Record<string, string | number> } {
+  const binds: Record<string, string | number> = {};
+  const sql =
+    'select LRP.lab_result_id, LRP.lab_result_parameter_id from labresultparameter LRP' +
+    ` where LRP.lab_result_id in (${inList('r', labResultIds, binds)})` +
+    ' order by LRP.lab_result_id, LRP.lab_result_parameter_id';
+  return { sql, binds };
 }
 
 /** The old service compared ithasparameter to "Y" exactly. Anything else, 'y'
@@ -226,6 +275,31 @@ export class OracleCertifySource implements CertifySource {
   private async ids(sql: string, binds: Record<string, string | number>): Promise<string[]> {
     const rows = await this.rows(sql, binds);
     return rows.map((r) => String(r.LAB_RESULT_PARAMETER_ID ?? '')).filter(Boolean);
+  }
+
+  async blockingParametersFor(labResultIds: string[]): Promise<Map<string, string[]>> {
+    return this.idsByResult(labResultIds, (ids) => buildBlockingParametersBatchQuery(this.cfg, ids));
+  }
+
+  async allParametersFor(labResultIds: string[]): Promise<Map<string, string[]>> {
+    return this.idsByResult(labResultIds, (ids) => buildAllParametersBatchQuery(ids));
+  }
+
+  /** Run a batched query per IN_CHUNK ids and group the rows by result. */
+  private async idsByResult(
+    labResultIds: string[],
+    build: (ids: string[]) => { sql: string; binds: Record<string, string | number> },
+  ): Promise<Map<string, string[]>> {
+    const out = new Map<string, string[]>(labResultIds.map((id) => [id, []]));
+    for (const slice of chunks([...new Set(labResultIds)])) {
+      const { sql, binds } = build(slice);
+      for (const r of await this.rows(sql, binds)) {
+        const resultId = String(r.LAB_RESULT_ID ?? '');
+        const paramId = String(r.LAB_RESULT_PARAMETER_ID ?? '');
+        if (resultId && paramId) out.get(resultId)?.push(paramId);
+      }
+    }
+    return out;
   }
 
   async close(): Promise<void> {

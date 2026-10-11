@@ -300,7 +300,16 @@ export class AdminServer {
         const id = stagedAction[1]!;
         const barcode = decodeURIComponent(stagedAction[2]!);
         if (stagedAction[3] === 'file') {
-          const ok = await this.backend.fileNow(id, barcode);
+          let ok: boolean;
+          try {
+            ok = await this.backend.fileNow(id, barcode);
+          } catch (err) {
+            // A refusal the operator must see — HINAI and GenX naming different
+            // patients for the barcode (both HMIS mode) is not overridable.
+            const message = err instanceof Error ? err.message : String(err);
+            this.logger.warn({ analyzer: id, barcode, err: message }, 'file now refused');
+            return this.json(res, { error: message }, 409);
+          }
           return this.json(res, ok ? { ok } : { error: 'unknown sample' }, ok ? 200 : 404);
         }
         let to = '';

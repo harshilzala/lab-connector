@@ -94,6 +94,12 @@ main { flex:1; width:100%; padding:26px 28px 40px; }
 .code.warn { background:var(--warn-soft); color:var(--warn); }
 .code.mut  { background:transparent; color:var(--mut); border-color:var(--line); text-decoration:line-through; }
 .codes-note { font-size:12px; color:var(--mut); margin-top:2px; }
+.codes:not(.expanded) .code-x { display:none; }
+.codes-more {
+  border:1px dashed var(--line); background:transparent; color:var(--plum-600); cursor:pointer;
+  padding:1px 7px; border-radius:5px; font-size:11.5px; font-weight:700;
+}
+.codes-more:hover { border-color:var(--plum-600); }
 .card-body { padding:14px 18px 18px; }
 
 /* ---- maximize: one machine fills the view, the rest step aside ---- */
@@ -387,6 +393,16 @@ function statusPill(a) {
   if (link === 'listening') return '<span class="pill mut" title="Port open — the instrument connects when it has a result to send">Listening</span>';
   return '<span class="pill bad"' + (a.linkError ? ' title="' + esc(a.linkError) + '"' : '') + '>Offline</span>';
 }
+// HMIS lanes (both mode files into HINAI and GenX). The API sends lane names
+// only; the page spells them.
+function laneName(l) { return l === 'genx' ? 'GenX' : l === 'hinai' ? 'HINAI' : String(l || ''); }
+function hmisLine(a) {
+  const lanes = a.lanes || [];
+  if (!lanes.length) return '&mdash;';
+  const text = esc(lanes.map(l => laneName(l.lane)).join(' + ') + (a.hmisMode === 'both' ? ' (both)' : ''));
+  const bad = lanes.filter(l => !l.ok).map(l => '<span class="pill bad" title="' + esc(l.lastError || '') + '">' + esc(laneName(l.lane)) + ' poll failing</span>');
+  return text + (bad.length ? ' ' + bad.join(' ') : '');
+}
 function queuePill(a) {
   const sp = a.spool || { pending: 0, failed: 0 };
   // A staged analyzer has no queue: its results wait, per sample, for the
@@ -429,7 +445,34 @@ function ordersLine(o) {
 // line. NOTE: this function is emitted INTO a template literal, so neither a
 // backtick nor an unescaped dollar-brace may appear anywhere in here — either
 // one ends the literal and the whole module stops compiling.
-function filterBlock(f, scope) {
+//
+// A long chip list (a 22-code allow-list, a Maglumi's full HMIS menu) pushed
+// everything under it off the card, so each list shows its first CODES_SHOWN
+// chips and folds the rest behind a "+N more" button. The open/closed choice
+// is kept per machine and list in state.codesOpen, because the 5s poll
+// rebuilds the whole grid and would otherwise fold it straight back up.
+var CODES_SHOWN = 5;
+state.codesOpen = {};
+function chipList(chips, key) {
+  if (chips.length <= CODES_SHOWN) return '<span class="codes">' + chips.join('') + '</span>';
+  var open = !!state.codesOpen[key];
+  var hidden = chips.length - CODES_SHOWN;
+  return '<span class="codes' + (open ? ' expanded' : '') + '">' +
+         chips.map(function (c, i) {
+           return i < CODES_SHOWN ? c : c.replace('class="code', 'class="code-x code');
+         }).join('') +
+         '<button type="button" class="codes-more" data-codes="' + esc(key) + '" data-hidden="' + hidden + '">' +
+         (open ? 'Show less' : '+' + hidden + ' more') + '</button></span>';
+}
+document.addEventListener('click', function (e) {
+  var b = e.target && e.target.closest ? e.target.closest('button[data-codes]') : null;
+  if (!b) return;
+  var key = b.dataset.codes;
+  state.codesOpen[key] = !state.codesOpen[key];
+  b.parentNode.classList.toggle('expanded', state.codesOpen[key]);
+  b.textContent = state.codesOpen[key] ? 'Show less' : '+' + b.dataset.hidden + ' more';
+});
+function filterBlock(f, scope, id) {
   if (!f) return '';
   var seen = {};
   (f.hmis || []).forEach(function (id) { seen[String(id).trim().toUpperCase()] = true; });
@@ -443,7 +486,7 @@ function filterBlock(f, scope) {
       var cls = !hasHmis ? 'warn' : (ok ? 'ok' : 'warn');
       var tip = !hasHmis ? 'HMIS has not offered any parameter yet' : (ok ? 'HMIS interfaces this parameter' : 'in the list, but HMIS has not offered a row for it yet');
       return '<span class="code ' + cls + '" title="' + esc(tip) + '">' + esc(c) + '</span>';
-    }).join('');
+    });
     var extra = hasHmis ? (f.hmis || []).filter(function (id) {
       var k = String(id).trim().toUpperCase();
       return !f.allow.some(function (c) { return String(c).trim().toUpperCase() === k; });
@@ -457,7 +500,7 @@ function filterBlock(f, scope) {
              (extra.length ? 'HMIS also lists ' + extra.length + ' identifier' + (extra.length === 1 ? '' : 's') + ' not interfaced here' : '');
     }
     html += '<div class="kv stack"><span class="k">Interfaced parameters <span class="mut">(' + f.allow.length + ' allowed)</span></span>' +
-            '<span class="v"><span class="codes">' + chips + '</span>' +
+            '<span class="v">' + chipList(chips, id + '|allow') +
             '<div class="codes-note"' + (extra.length ? ' title="' + esc(extra.join(', ')) + '"' : '') + '>' + esc(note) + '</div></span></div>';
   } else {
     // No allow-list (the Maglumi, the U-WAM): the scope is whatever HMIS
@@ -471,30 +514,30 @@ function filterBlock(f, scope) {
         dedup[k] = true;
         return true;
       }).sort(function (a, b) { return String(a).localeCompare(String(b)); });
-      var idChips = ids.map(function (id) {
-        return '<span class="code ok" title="registered in HMIS for this machine - a result with this code is filed">' + esc(id) + '</span>';
-      }).join('');
+      var idChips = ids.map(function (c) {
+        return '<span class="code ok" title="registered in HMIS for this machine - a result with this code is filed">' + esc(c) + '</span>';
+      });
       html += '<div class="kv stack"><span class="k">Interfaced parameters <span class="mut">(' + ids.length + ' in HMIS)</span></span>' +
-              '<span class="v"><span class="codes">' + idChips + '</span>' +
-              '<div class="codes-note">No allow-list: every parameter HMIS registers for this machine is filed. A code the machine sends that is not in this list waits as unmatched until HMIS maps it.</div></span></div>';
+              '<span class="v">' + chipList(idChips, id + '|hmis') +
+              '<div class="codes-note" title="Every parameter HMIS registers for this machine is filed. A code the machine sends that is not in this list waits as unmatched until HMIS maps it.">No allow-list</div></span></div>';
     } else {
-      html += '<div class="kv"><span class="k">Interfaced parameters</span><span class="v">No allow-list: files whatever HMIS registers for this machine. No HMIS order rows seen yet, so the list is not known.</span></div>';
+      html += '<div class="kv"><span class="k">Interfaced parameters</span><span class="v" title="Files whatever HMIS registers for this machine. No HMIS order rows seen yet.">No allow-list</span></div>';
     }
   }
   if (f.ignore && f.ignore.length) {
     html += '<div class="kv stack"><span class="k">Dropped, never filed <span class="mut">(' + f.ignore.length + ')</span></span>' +
-            '<span class="v"><span class="codes">' + f.ignore.map(function (c) {
+            '<span class="v">' + chipList(f.ignore.map(function (c) {
               return '<span class="code mut" title="ignoreTestCodes: not a reportable result">' + esc(c) + '</span>';
-            }).join('') + '</span></span></div>';
+            }), id + '|ignore') + '</span></div>';
   }
   var alias = (scope && scope.aliases) || {};
   var aliased = Object.keys(alias);
   if (aliased.length) {
     html += '<div class="kv stack"><span class="k">Filed under another name <span class="mut">(' + aliased.length + ')</span></span>' +
-            '<span class="v"><span class="codes">' + aliased.map(function (c) {
+            '<span class="v">' + chipList(aliased.map(function (c) {
               return '<span class="code" title="testCodeAliases: the instrument code HMIS knows by a different identifier">' +
                      esc(c) + '<span class="p-as">&rarr;' + esc(alias[c]) + '</span></span>';
-            }).join('') + '</span></span></div>';
+            }), id + '|alias') + '</span></div>';
   }
   if (scope && scope.excluded && scope.excluded.length) {
     html += '<div class="kv"><span class="k">Never filed into</span><span class="v">' + esc(scope.excluded.join(', ')) + '</span></div>';
@@ -580,7 +623,8 @@ function renderCards(analyzers) {
         \${a.link === 'offline' && a.linkError ? '<div class="kv"><span class="k">Link</span><span class="v err">' + esc(a.linkError) + '</span></div>' : ''}
         <div class="kv"><span class="k">\${a.filing === 'staged' ? 'Results' : 'Upload queue'}</span><span class="v">\${queuePill(a)}</span></div>
         <div class="kv"><span class="k">Orders</span><span class="v">\${ordersLine(a.orders)}</span></div>
-        \${filterBlock(a.filter, a.interface)}
+        <div class="kv"><span class="k">HMIS</span><span class="v">\${hmisLine(a)}</span></div>
+        \${filterBlock(a.filter, a.interface, a.id)}
         <div class="tabs">
           <button type="button" data-a="\${esc(a.id)}" data-t="wire"
                   class="\${state.open === a.id && state.tab === 'wire' ? 'active' : ''}">Wire log</button>
@@ -782,12 +826,17 @@ async function renderStaged(id, el) {
   const rows = (samples || []).map(s => {
     const pill = s.complete
       ? '<span class="pill ok">filed</span>' + (s.withheld ? '<span class="pill mut">' + s.withheld + ' withheld</span>' : '')
+      : s.held && s.held.mismatch ? '<span class="pill bad">held: patient differs</span>'
+      : s.held ? '<span class="pill warn">held: ' + (s.held.in && s.held.in.length ? 'only in ' + esc(s.held.in.map(laneName).join(' + ')) : 'in neither HMIS') + '</span>'
       : (s.filed > 0 ? '<span class="pill mut">partly filed</span>' : '<span class="pill warn">waiting for order</span>');
+    // Both HMIS mode: how far each system has got with this sample.
+    const laneDetail = (s.lanes || []).map(l => laneName(l.lane) + ' ' + l.filed + '/' + (l.filed + l.waiting + l.skipped) + (l.skipped ? ' (' + l.skipped + ' skipped by operator)' : '')).join(' · ');
     const codes = (s.waitingCodes || []);
     const detail = s.filed + ' of ' + s.total + ' filed' +
       (s.waiting ? ' &mdash; ' + s.waiting + ' waiting: ' + esc(codes.slice(0, 8).join(', ')) + (codes.length > 8 ? ' &hellip;' : '') : '') +
       (s.withheld ? ' &mdash; ' + s.withheld + ' withheld: ' + esc((s.withheldCodes || []).join(', ')) : '') +
-      (s.dropped ? ' &mdash; ' + s.dropped + ' not interfaced' : '');
+      (s.dropped ? ' &mdash; ' + s.dropped + ' not interfaced' : '') +
+      (laneDetail ? ' &mdash; ' + esc(laneDetail) : '');
     // Pass count only while something is genuinely waiting for HMIS — a
     // withheld value is retried too, but counting it only looked like a fault.
     const seen = 'received ' + when(s.firstReceivedAt) +
@@ -838,7 +887,9 @@ async function renderStaged(id, el) {
 }
 
 async function stagedFile(id, barcode) {
-  await j('/api/analyzers/' + encodeURIComponent(id) + '/staged/' + encodeURIComponent(barcode) + '/file', { method: 'POST' });
+  const r = await j('/api/analyzers/' + encodeURIComponent(id) + '/staged/' + encodeURIComponent(barcode) + '/file', { method: 'POST' });
+  // Refused, e.g. HINAI and GenX name different patients for this barcode.
+  if (r && r.error && r.error !== 'unknown sample') alert('File now refused: ' + r.error);
   renderPanel(id);
 }
 

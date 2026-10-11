@@ -74,6 +74,14 @@ export interface HmisGateway {
   getPending(q: PendingQuery): Promise<unknown>;
   acknowledge(items: MirthAcknowledgeItem[], eqCode?: string): Promise<void>;
   postResults(rows: LisInboundResultRow[], eqCode?: string): Promise<HmisResultUploadResponse>;
+  /** True when the bulk poll answer does not depend on the site or the date
+   *  (GenX: one worklist call covers every site and the whole batch window).
+   *  The order poll then asks it once per equipment code per tick instead of
+   *  once per code x site x day — before 2026-10 GenX was fetched
+   *  lookbackDays+1 times every tick for the same answer. */
+  readonly ignoresPollFilters?: boolean;
+  /** GenX only: certify one result line (analyzer genxAutoCertify). */
+  autoCertify?(lineId: number, eqCode?: string, barcode?: string): Promise<void>;
 }
 
 export class HmisClient implements HmisGateway {

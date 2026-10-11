@@ -24,6 +24,20 @@ import { OracleCertifySource, type CertifyCandidate, type CertifySource } from '
 //
 // A call that fails is not retried inside the run. The result is still in its
 // "ready" status, so the next tick picks it up again, as the old service did.
+//
+// Differences from the old service, each from its own logs (Jun-Oct 2026):
+//   - The portal answers HTTP 200 even when it did NOT certify:
+//     {"Statue":"Fail","Error":"... optimistic locking failed ..."} (155 times
+//     in the 35 days studied). The old service logged those as successes.
+//     Here a call counts as certified only when the body says so (see
+//     portalVerdict); the result is found again and retried next run.
+//   - A row the portal confirmed is not called again for skipRecertifyHours,
+//     even if the database still lists it as ready (the old service called
+//     some every 30 s for hours).
+//   - The two parameter lookups are made for all of a run's results at once
+//     (source.blockingParametersFor / allParametersFor), not once per result.
+//   - `concurrency` results may be certified at the same time (default 1 =
+//     the old order exactly). A result's own parameters always go one by one.
 // =============================================================================
 
 export type CertifyKind = 'result' | 'parameter';
@@ -57,6 +71,9 @@ export interface AutoCertifyRun {
   /** Results with parameters still in a parameterResultStatus: not finished,
    *  so nothing was sent. The next run looks at them again. */
   waiting: number;
+  /** Rows not called because the portal confirmed them within
+   *  skipRecertifyHours (the database still lists them as ready). */
+  skipped: number;
   error: string | null;
 }
 
@@ -76,9 +93,32 @@ export interface AutoCertifySnapshot {
     parameterResultStatus: string[];
     lookbackDays: number;
     requireHod: boolean;
+    concurrency: number;
+    skipRecertifyHours: number;
     oracle: { user: string; connectString: string; passwordSet: boolean };
     logFile: string | null;
   };
+}
+
+/**
+ * Did the portal certify it? HTTP 2xx is necessary but not enough: the HIS
+ * portal answers 200 with {"Statue":"Success"} or {"Statue":"Fail","Error":…}
+ * ("Statue" is the portal's own spelling; "Status" is accepted too, any case).
+ * A body with no such field, or one that is not JSON, is judged by the HTTP
+ * status alone — what the old service did for every answer.
+ */
+export function portalVerdict(status: number, body: string): boolean {
+  if (status < 200 || status >= 300) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return true;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return true;
+  const field = Object.entries(parsed as Record<string, unknown>).find(([k]) => /^(statue|status)$/i.test(k));
+  if (!field) return true;
+  return String(field[1]).trim().toLowerCase() === 'success';
 }
 
 /** What a run would do with one result, without doing it. */
@@ -119,6 +159,10 @@ export class AutoCertifyService {
   private readonly dayLog: DailyLogFile | null;
   private readonly makeSource: () => CertifySource;
   private readonly transport: CertifyTransport;
+  /** "result:<id>" / "parameter:<id>" -> when the portal confirmed it. */
+  private readonly confirmed = new Map<string, number>();
+  /** Rows already reported as "confirmed but still listed ready". */
+  private readonly skipWarned = new Set<string>();
 
   constructor(
     private readonly cfg: AutoCertifyConfig,
@@ -179,19 +223,12 @@ export class AutoCertifyService {
     const source = this.makeSource();
     try {
       const results = await source.pendingResults();
-      const candidates: PreviewCandidate[] = [];
-      for (const r of results) {
-        if (!r.hasParameter) {
-          candidates.push({ ...r, blockingParameterIds: null, parameterIds: null });
-          continue;
-        }
-        const blocking = await source.blockingParameters(r.labResultId);
-        candidates.push({
-          ...r,
-          blockingParameterIds: blocking,
-          parameterIds: blocking.length ? [] : await source.allParameters(r.labResultId),
-        });
-      }
+      const { blocking, params } = await this.parameterLookups(source, results);
+      const candidates: PreviewCandidate[] = results.map((r) => {
+        if (!r.hasParameter) return { ...r, blockingParameterIds: null, parameterIds: null };
+        const b = blocking.get(r.labResultId) ?? [];
+        return { ...r, blockingParameterIds: b, parameterIds: b.length ? [] : (params.get(r.labResultId) ?? []) };
+      });
       return { candidates };
     } finally {
       await source.close();
@@ -219,6 +256,8 @@ export class AutoCertifyService {
         parameterResultStatus: this.cfg.parameterResultStatus,
         lookbackDays: this.cfg.lookbackDays,
         requireHod: this.cfg.requireHod,
+        concurrency: this.concurrency(),
+        skipRecertifyHours: this.skipHours(),
         oracle: {
           user: this.cfg.oracle.user,
           connectString: this.cfg.oracle.connectString,
@@ -260,6 +299,7 @@ export class AutoCertifyService {
       certified: 0,
       failed: 0,
       waiting: 0,
+      skipped: 0,
       error: null,
     };
     this.lastRun = run;
@@ -269,20 +309,24 @@ export class AutoCertifyService {
       const results = await source.pendingResults();
       run.found = results.length;
       if (results.length) this.logger.info({ found: results.length, manual }, 'auto certify: results ready');
+      this.forgetOldConfirmations();
 
-      for (const r of results) {
+      // Both parameter lookups for the whole run first: two database round
+      // trips (per IN_CHUNK results) instead of two per result.
+      const { blocking, params } = await this.parameterLookups(source, results);
+
+      await this.eachConcurrently(results, async (r) => {
         if (r.hasParameter) {
-          if ((await source.blockingParameters(r.labResultId)).length) {
+          if ((blocking.get(r.labResultId) ?? []).length) {
             run.waiting++;
-            continue;
+            return;
           }
-          for (const p of await source.allParameters(r.labResultId)) {
-            this.tally(run, await this.certify('parameter', r, p, manual));
-          }
+          // A result's own parameters: one after another, always.
+          for (const p of params.get(r.labResultId) ?? []) await this.certifyOnce(run, 'parameter', r, p, manual);
         } else {
-          this.tally(run, await this.certify('result', r, null, manual));
+          await this.certifyOnce(run, 'result', r, null, manual);
         }
-      }
+      });
     } catch (err) {
       run.error = err instanceof Error ? err.message : String(err);
       this.logger.error({ err: run.error }, 'auto certify run failed');
@@ -295,11 +339,91 @@ export class AutoCertifyService {
     }
     if (run.certified || run.failed) {
       this.logger.info(
-        { certified: run.certified, failed: run.failed, waiting: run.waiting, manual },
+        { certified: run.certified, failed: run.failed, waiting: run.waiting, skipped: run.skipped, manual },
         'auto certify run completed',
       );
     }
     return run;
+  }
+
+  private concurrency(): number {
+    return Math.min(8, Math.max(1, Math.floor(this.cfg.concurrency ?? 1)));
+  }
+
+  private skipHours(): number {
+    return Math.max(0, this.cfg.skipRecertifyHours ?? 24);
+  }
+
+  /** Blocking and all-parameter ids for every result with parameters: batched
+   *  when the source can, else one result at a time (the old way). The
+   *  all-parameter lookup is made only for results with nothing blocking. */
+  private async parameterLookups(
+    source: CertifySource,
+    results: CertifyCandidate[],
+  ): Promise<{ blocking: Map<string, string[]>; params: Map<string, string[]> }> {
+    const withParams = results.filter((r) => r.hasParameter).map((r) => r.labResultId);
+    const blocking = await this.lookup(withParams, source.blockingParametersFor?.bind(source), (id) => source.blockingParameters(id));
+    const finished = withParams.filter((id) => !(blocking.get(id) ?? []).length);
+    const params = await this.lookup(finished, source.allParametersFor?.bind(source), (id) => source.allParameters(id));
+    return { blocking, params };
+  }
+
+  private async lookup(
+    ids: string[],
+    batch: ((ids: string[]) => Promise<Map<string, string[]>>) | undefined,
+    one: (id: string) => Promise<string[]>,
+  ): Promise<Map<string, string[]>> {
+    if (!ids.length) return new Map();
+    if (batch) return batch(ids);
+    const out = new Map<string, string[]>();
+    for (const id of ids) out.set(id, await one(id));
+    return out;
+  }
+
+  /** Run fn over items, at most concurrency() at a time, in order of start. */
+  private async eachConcurrently<T>(items: T[], fn: (item: T) => Promise<void>): Promise<void> {
+    let next = 0;
+    const worker = async () => {
+      while (next < items.length) await fn(items[next++]!);
+    };
+    await Promise.all(Array.from({ length: Math.min(this.concurrency(), items.length) }, worker));
+  }
+
+  /** Certify one row unless the portal confirmed it within skipRecertifyHours. */
+  private async certifyOnce(
+    run: AutoCertifyRun,
+    kind: CertifyKind,
+    r: CertifyCandidate,
+    parameterId: string | null,
+    manual: boolean,
+  ): Promise<void> {
+    const key = `${kind}:${parameterId ?? r.labResultId}`;
+    const at = this.confirmed.get(key);
+    if (at !== undefined && this.skipHours() > 0) {
+      run.skipped++;
+      if (!this.skipWarned.has(key)) {
+        this.skipWarned.add(key);
+        this.logger.warn(
+          { kind, labResultId: r.labResultId, parameterId, sampleId: r.sampleId, confirmedAt: new Date(at).toISOString(), hours: this.skipHours() },
+          'auto certify: the portal already confirmed this, yet the database still lists it as ready — not called again within the skip window',
+        );
+      }
+      return;
+    }
+    const attempt = await this.certify(kind, r, parameterId, manual);
+    this.tally(run, attempt);
+    if (attempt.ok) this.confirmed.set(key, Date.now());
+  }
+
+  /** Drop confirmations older than the skip window, so the map stays small. */
+  private forgetOldConfirmations(): void {
+    const cutoff = Date.now() - this.skipHours() * 3_600_000;
+    for (const [key, at] of this.confirmed) {
+      if (at < cutoff) {
+        this.confirmed.delete(key);
+        this.skipWarned.delete(key);
+      }
+    }
   }
 
   private tally(run: AutoCertifyRun, a: CertifyAttempt): void {
@@ -328,7 +452,7 @@ export class AutoCertifyService {
       const res = await this.transport.get(url, this.cfg.timeoutMs);
       httpStatus = res.status;
       response = res.body;
-      ok = res.status >= 200 && res.status < 300;
+      ok = portalVerdict(res.status, res.body);
     } catch (err) {
       response = err instanceof Error ? (err.name === 'AbortError' ? `timed out after ${this.cfg.timeoutMs} ms` : err.message) : String(err);
     }

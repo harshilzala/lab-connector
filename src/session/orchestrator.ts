@@ -2,14 +2,15 @@ import { join } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { AnalyzerConfig } from '../config.js';
 import type { HmisGateway } from '../hmis/client.js';
+import { LANES, laneLabel, type HmisMode, type Lane } from '../hmis/lanes.js';
 import type { HmisResultUpload, HostQuery, MirthAcknowledgeItem, OrderDownload, ParsedMessage, PendingOrders } from '../types.js';
 import type { ProtocolLink, WireEvent } from '../codec/types.js';
 import { createTransport } from '../transport/index.js';
 import type { Transport } from '../transport/types.js';
 import { createProtocolLink } from '../codec/index.js';
 import { SpoolQueue } from '../queue/spool.js';
-import { ResultStore, type StagedSummary } from '../results/store.js';
-import { StagedFiler } from '../results/filer.js';
+import { ResultStore, snapshotOf, isLaneHold, isPatientHold, laneCounts, summarize, type StagedSample, type StagedSummary } from '../results/store.js';
+import { StagedFiler, genxFiled } from '../results/filer.js';
 import { compileCompletion } from '../results/complete.js';
 import {
   interfacedCodeFilter,
@@ -33,7 +34,7 @@ import {
 } from '../hmis/pending.js';
 import { assayKey } from '../codec/astm/records.js';
 import { encodeTestCode } from '../codec/kermit/vitros250.js';
-import { OrderStore, ORDER_RETENTION_DAYS, codeKey } from '../orders/store.js';
+import { OrderStore, ORDER_RETENTION_DAYS, codeKey, type StoredOrder } from '../orders/store.js';
 import { ParameterCatalogue } from '../orders/parameters.js';
 import { WireAudit } from './wire-audit.js';
 
@@ -82,6 +83,16 @@ function isRefusal(err: unknown): err is Error & { linkAlive: true } {
   return err instanceof Error && (err as { linkAlive?: unknown }).linkAlive === true;
 }
 
+/** What one order-poll tick did, for its debug line. */
+interface PollTally {
+  samples: number;
+  pushed: number;
+  held: number;
+  notOurs: number;
+  notInterfaced: number;
+  refused: number;
+}
+
 const VITROS_BUSY_WAIT_MS = 60_000;
 const VITROS_DISABLED_WAIT_MS = 5 * 60_000;
 
@@ -125,6 +136,39 @@ export interface AnalyzerStatus {
    *  dials to SEND orders, one it listens on to RECEIVE results. Null on
    *  every machine that does both on a single connection. */
   channels: ChannelStatus | null;
+  /** "single" — one HMIS lane; "both" — HINAI and GenX side by side. */
+  hmisMode: HmisMode;
+  /** Each HMIS lane this analyzer uses, HINAI first, with its last order
+   *  poll — a lane that fails does not stop the other (both mode). */
+  lanes: LaneStatus[];
+}
+
+export interface LaneStatus {
+  lane: Lane;
+  ok: boolean;
+  lastError: string | null;
+  lastPollAt: string | null;
+}
+
+/** The gateways an analyzer files into, one per lane it uses. */
+export type LaneGateways = Partial<Record<Lane, HmisGateway>>;
+
+/** The HMIS side of a two-channel machine (IM), for the Auto Certify page. */
+export interface ChannelHmis {
+  mode: HmisMode;
+  /** Lane names only ("hinai" / "genx"); the page spells them. */
+  lanes: Array<LaneStatus & { filed: number; waiting: number; skipped: number }>;
+  /** Samples held because only one HMIS system has the order (both mode). */
+  held: number;
+  /** GenX auto-certify (analyzer genxAutoCertify), since start. */
+  certify: {
+    enabled: boolean;
+    certified: number;
+    failed: number;
+    lastCertifiedAt: string | null;
+    lastError: string | null;
+    lastErrorAt: string | null;
+  };
 }
 
 /** The two links of a two-channel machine, as the console shows them. */
@@ -169,6 +213,8 @@ export interface ChannelStatus {
     lastReceivedAt: string | null;
     lastReceivedBarcode: string | null;
   } | null;
+  /** The HMIS lanes this machine files into, and how filing is going. */
+  hmis?: ChannelHmis;
 }
 
 export interface FilterScope {
@@ -208,6 +254,9 @@ export interface ForceReport {
   /** Analyzer codes that resolved to no parameter — not sent, not guessed. */
   unresolved: string[];
   rows: Array<{ testCode: string; identifier: string; parameterId: number | null; value: string }>;
+  /** Both HMIS mode: the same report for each lane, from that lane's cached
+   *  rows. The fields above are then their totals. */
+  lanes?: Array<ForceReport & { lane: Lane }>;
 }
 
 /** One order (barcode) as the console shows it: every HMIS row, marked. */
@@ -359,10 +408,31 @@ export class AnalyzerRuntime {
     lastReceivedAt: null as string | null,
     lastReceivedBarcode: null as string | null,
   };
+  /** The HMIS lanes this analyzer uses, HINAI first (src/hmis/lanes.ts). */
+  private readonly lanes: Lane[];
+  private readonly gateways: LaneGateways;
+  /** Both HMIS mode — more than one lane. */
+  private readonly both: boolean;
+  /** The FIRST lane's gateway: in single mode the one gateway, exactly the
+   *  object every code path used before lanes existed. */
+  private readonly hmis: HmisGateway;
+  /** Per-lane order-poll state, for the console. */
+  private readonly laneState = new Map<Lane, { lastError: string | null; lastPollAt: string | null }>();
+  /** GenX auto-certify since start (genxAutoCertify). */
+  private readonly certifyStats = {
+    certified: 0,
+    failed: 0,
+    lastCertifiedAt: null as string | null,
+    lastError: null as string | null,
+    lastErrorAt: null as string | null,
+  };
+  private hmisChannelCache: { at: number; value: Pick<ChannelHmis, 'held'> & { counts: Map<Lane, { filed: number; waiting: number; skipped: number }> } } | null = null;
 
   constructor(
     private readonly cfg: AnalyzerConfig,
-    private readonly hmis: HmisGateway,
+    /** One gateway per lane. A bare gateway (every test written before lanes
+     *  existed) is single mode on lane hinai. */
+    hmis: HmisGateway | LaneGateways,
     spoolRoot: string,
     logger: Logger,
     /** Where to persist the wire log. Omitted (tests, ad-hoc runs) = memory only. */
@@ -370,25 +440,43 @@ export class AnalyzerRuntime {
     /** retention.days — how long a staged value waits for its order before it
      *  is discarded. */
     private readonly retentionDays = 7,
+    /** hmis.patientCheck (D9): off = no both-mode patient cross-check. */
+    private readonly patientCheck = true,
   ) {
     this.log = logger.child({ analyzer: cfg.id });
+    this.gateways = typeof (hmis as HmisGateway).getPending === 'function' ? { hinai: hmis as HmisGateway } : (hmis as LaneGateways);
+    this.lanes = LANES.filter((l) => this.gateways[l]);
+    if (!this.lanes.length) throw new Error(`analyzer "${cfg.id}": no HMIS gateway was given`);
+    this.both = this.lanes.length > 1;
+    this.hmis = this.gateways[this.lanes[0]!]!;
+    for (const l of this.lanes) this.laneState.set(l, { lastError: null, lastPollAt: null });
     this.interfacedIdentifiers = AnalyzerRuntime.interfacedIdentifiersFor(cfg);
     this.transport = createTransport(cfg.transport, this.log);
     this.link = createProtocolLink(cfg, this.transport, this.log);
     this.spool = new SpoolQueue<HmisResultUpload>(join(spoolRoot, cfg.id), this.log);
-    this.orders = new OrderStore(join(spoolRoot, cfg.id, 'orders'), this.log);
+    this.orders = new OrderStore(join(spoolRoot, cfg.id, 'orders'), this.log, this.lanes[0]);
+    // Rows written before lanes existed are attributed once, here (C1).
+    this.orders.migrateLanes(this.lanes, this.log);
     this.parameters = new ParameterCatalogue(ParameterCatalogue.fileFor(join(spoolRoot, cfg.id)), this.log);
     this.wireAudit = wireLogFile ? new WireAudit(wireLogFile, this.log) : null;
     // Start the console's Wire log from what is already on disk, so a restart
     // does not blank it while the analyzer's last exchanges are still relevant.
     if (this.wireAudit) this.wireLog.push(...this.wireAudit.recent(200));
 
-    if (cfg.filing.mode === 'staged') {
-      this.staged = new ResultStore(join(spoolRoot, cfg.id, 'results'), this.log);
+    // Both HMIS mode files only through the staged store: a value has to
+    // remember which systems it has reached, and the queue cannot.
+    if (this.both && cfg.filing.mode !== 'staged') {
+      this.log.info({ filingMode: cfg.filing.mode }, 'both HMIS mode files through the staged store');
+    }
+    if (cfg.filing.mode === 'staged' || this.both) {
+      this.staged = new ResultStore(join(spoolRoot, cfg.id, 'results'), this.log, this.lanes);
+      // A value owed only to a lane this analyzer no longer uses is done (C3).
+      this.staged.settleLanes();
       this.filer = new StagedFiler({
         store: this.staged,
-        orderRows: (barcode, opts) => this.resolveOrderRows(barcode, opts),
-        join: (upload, rows) => this.joinRows(upload, rows),
+        // Both mode: the union of the lanes' rows, for barcode completion only.
+        orderRows: (barcode, opts) => (this.both ? this.allLaneRows(barcode, opts) : this.resolveOrderRows(barcode, opts)),
+        join: (upload, rows, lane) => this.joinRows(upload, rows, { lane }),
         postResults: (rows) => this.hmis.postResults(rows, this.cfg.equipmentCode),
         acknowledge: (rows) => this.hmis.acknowledge(rows, this.cfg.equipmentCode),
         log: this.log,
@@ -398,6 +486,22 @@ export class AnalyzerRuntime {
         // harnesses build an analyzer config by hand and must not have to
         // know about a feature only one machine uses.
         pairing: cfg.filing.pairing?.devices.length ? cfg.filing.pairing : null,
+        lane: this.both ? undefined : this.lanes[0],
+        lanes: this.both
+          ? {
+              names: this.lanes,
+              orderRows: (lane, barcode, opts) => this.resolveOrderRows(barcode, opts, lane),
+              postResults: (lane, rows) => this.gateway(lane).postResults(rows, this.cfg.equipmentCode),
+              acknowledge: (lane, rows) => this.gateway(lane).acknowledge(rows, this.cfg.equipmentCode),
+            }
+          : undefined,
+        certify: this.genxCertifier(),
+        hasRowFor: (rows, code) => this.hasRowFor(rows, code),
+        patientMismatch: (barcode) => {
+          const m = this.patientMismatch(barcode);
+          return m ? AnalyzerRuntime.mismatchMessage(m) : null;
+        },
+        certifyRecheckMs: cfg.filing.passIntervalMs,
       });
       if (cfg.barcodeCompletion) {
         this.log.info(
@@ -462,6 +566,79 @@ export class AnalyzerRuntime {
       this.resumeDownloads('the analyzer solicited a download');
       void this.pollOrders();
     });
+  }
+
+  /** The gateway of one of this analyzer's lanes. */
+  private gateway(lane: Lane): HmisGateway {
+    const gw = this.gateways[lane];
+    if (!gw) throw new Error(`analyzer "${this.cfg.id}" has no ${laneLabel(lane)} gateway`);
+    return gw;
+  }
+
+  /** Rows of one lane. A row with no `source` (stored before lanes existed)
+   *  belongs to the first lane — in single mode that is every such row. */
+  private rowsOfLane(rows: MirthAcknowledgeItem[], lane: Lane): MirthAcknowledgeItem[] {
+    const first = this.lanes[0];
+    // A quarantined row (lane unknown, C1) belongs to no lane at all.
+    return rows.filter((r) => !r.quarantined && r.source !== null && (r.source ?? first) === lane);
+  }
+
+  /**
+   * Both mode: the two systems name DIFFERENT patients for this barcode
+   * (addendum C2) — a barcode reused, or a tube registered on the wrong
+   * patient in one of them. Compared on the patient id each lane last gave,
+   * ignoring case and spaces; no check while either side has none.
+   */
+  private patientMismatch(barcode: string): { hinai: string; genx: string } | null {
+    if (!this.both || !this.patientCheck) return null;
+    const p = this.orders.get(barcode)?.patients;
+    const hinai = (p?.hinai?.patientId ?? '').trim();
+    const genx = (p?.genx?.patientId ?? '').trim();
+    if (!hinai || !genx) return null;
+    const norm = (v: string) => v.replace(/\s+/g, '').toUpperCase();
+    return norm(hinai) === norm(genx) ? null : { hinai, genx };
+  }
+
+  /** Does any of these rows answer to this analyzer code — its own spelling
+   *  or its alias, on the join's canonical key, excluded rows included? Used
+   *  by "File now" in both mode (D3): only a code with NO row is skipped. */
+  private hasRowFor(rows: MirthAcknowledgeItem[], code: string): boolean {
+    const key = this.assayJoinKey();
+    const names = new Set([key(code)]);
+    const alias = this.aliasFor(code);
+    if (alias) names.add(key(alias));
+    return rows.some((r) => names.has(key(r.identifier)));
+  }
+
+  private static mismatchMessage(m: { hinai: string; genx: string }): string {
+    return `patient differs between HINAI (${m.hinai}) and GenX (${m.genx}) for this barcode — not filed; correct it in HMIS`;
+  }
+
+  /**
+   * GenX auto-certify, when this analyzer asks for it (genxAutoCertify) AND
+   * files into GenX. Counted for the Auto Certify page. HINAI certification is
+   * not done here: it stays the Oracle certify job (autoCertify block).
+   */
+  private genxCertifier(): ((lineId: number, barcode: string) => Promise<void>) | undefined {
+    if (!this.cfg.genxAutoCertify) return undefined;
+    const gw = this.gateways.genx;
+    if (!gw?.autoCertify) {
+      this.log.warn('genxAutoCertify is set but GenX is not one of this analyzer\'s HMIS lanes — nothing is certified in GenX');
+      return undefined;
+    }
+    this.log.info('GenX auto-certify enabled — each GenX result line is certified once all its values are filed');
+    return async (lineId, barcode) => {
+      try {
+        await gw.autoCertify!(lineId, this.cfg.equipmentCode, barcode);
+        this.certifyStats.certified++;
+        this.certifyStats.lastCertifiedAt = new Date().toISOString();
+      } catch (err) {
+        this.certifyStats.failed++;
+        this.certifyStats.lastError = `${barcode} line ${lineId}: ${err instanceof Error ? err.message : String(err)}`;
+        this.certifyStats.lastErrorAt = new Date().toISOString();
+        throw err;
+      }
+    };
   }
 
   async start(): Promise<void> {
@@ -654,8 +831,11 @@ export class AnalyzerRuntime {
       // On a staged analyzer "pending" is the samples still waiting for an
       // order row, so the console tiles keep meaning "not yet in HMIS".
       spool: stagedCounts ? { pending: stagedCounts.waiting, failed: this.spool.counts().failed } : this.spool.counts(),
-      filing: this.cfg.filing.mode,
+      // Both HMIS mode always files staged, whatever filing.mode says.
+      filing: this.staged ? 'staged' : this.cfg.filing.mode,
       staged: stagedCounts,
+      hmisMode: this.both ? 'both' : 'single',
+      lanes: this.laneStatuses(),
       interface: {
         syncCodes: [...this.cfg.allowTestCodes],
         aliases: { ...this.cfg.testCodeAliases },
@@ -680,6 +860,42 @@ export class AnalyzerRuntime {
         ignore: [...this.cfg.ignoreTestCodes],
         hmis: this.parameters.identifiers(),
       },
+    };
+  }
+
+  private laneStatuses(): LaneStatus[] {
+    return this.lanes.map((lane) => {
+      const st = this.laneState.get(lane) ?? { lastError: null, lastPollAt: null };
+      return { lane, ok: st.lastError === null, lastError: st.lastError, lastPollAt: st.lastPollAt };
+    });
+  }
+
+  /** The HMIS half of a two-channel machine's cards: lanes, values filed per
+   *  lane, held samples and GenX certify counts. The staged store is read at
+   *  most every WAITING_COUNT_TTL_MS — the console asks every few seconds. */
+  private channelHmis(): ChannelHmis {
+    if (!this.hmisChannelCache || Date.now() - this.hmisChannelCache.at > WAITING_COUNT_TTL_MS) {
+      const counts = new Map<Lane, { filed: number; waiting: number; skipped: number }>();
+      for (const l of this.lanes) counts.set(l, { filed: 0, waiting: 0, skipped: 0 });
+      let held = 0;
+      for (const s of this.staged?.list() ?? []) {
+        // Only both mode holds; a stale reason after a switch to single is not one.
+        if (this.both && (isLaneHold(s.lastError) || isPatientHold(s.lastError))) held++;
+        for (const c of laneCounts(s, this.lanes)) {
+          const t = counts.get(c.lane)!;
+          t.filed += c.filed;
+          t.waiting += c.waiting;
+          t.skipped += c.skipped;
+        }
+      }
+      this.hmisChannelCache = { at: Date.now(), value: { held, counts } };
+    }
+    const { held, counts } = this.hmisChannelCache.value;
+    return {
+      mode: this.both ? 'both' : 'single',
+      lanes: this.laneStatuses().map((l) => ({ ...l, ...(counts.get(l.lane) ?? { filed: 0, waiting: 0, skipped: 0 }) })),
+      held,
+      certify: { enabled: !!(this.cfg.genxAutoCertify && this.gateways.genx), ...this.certifyStats },
     };
   }
 
@@ -728,6 +944,7 @@ export class AnalyzerRuntime {
             ...this.resultStats,
           }
         : null,
+      hmis: this.channelHmis(),
     };
   }
 
@@ -752,153 +969,102 @@ export class AnalyzerRuntime {
   // analyzer only the tests it has not been given. Nothing is acknowledged —
   // that still happens after the result is filed — so the same rows come back
   // on the next tick and the store is what makes the download idempotent.
+  //
+  // Per HMIS lane (src/hmis/lanes.ts). HINAI is asked per code x site x day as
+  // always; a gateway that ignores site and date (GenX) once per code. In both
+  // mode every lane is read FIRST and the pushes follow, so a tube both
+  // systems list goes to the machine as ONE order with the union of their
+  // tests, delta-only as ever; a lane that fails does not stop the other.
+  // Single mode pushes as it reads, exactly as before.
   // ---------------------------------------------------------------------------
   private async pollOrders(): Promise<void> {
     if (this.polling) return; // a slow gateway must not stack ticks
     this.polling = true;
-    const { lookbackDays, download, downloadPrefixes } = this.cfg.orderPoll;
+    const { lookbackDays } = this.cfg.orderPoll;
     const neverDownload = this.neverDownload();
-    let samples = 0;
-    let pushed = 0;
-    let held = 0; // ready to send, but the download breaker is open
-    let notOurs = 0; // cached but outside downloadPrefixes — never sent
-    let notInterfaced = 0; // every offered row was for a parameter outside allowTestCodes
-    let refused = 0; // the receiver read the order and answered no
-    const downloadable = (barcode: string): boolean =>
-      downloadPrefixes.length === 0 ||
-      downloadPrefixes.some((p) => barcode.toUpperCase().startsWith(p.toUpperCase()));
+    // samples / pushed / held (breaker open) / notOurs (outside
+    // downloadPrefixes) / notInterfaced (every row outside allowTestCodes) /
+    // refused (the receiver read the order and answered no)
+    const tally: PollTally = { samples: 0, pushed: 0, held: 0, notOurs: 0, notInterfaced: 0, refused: 0 };
+    const collected = this.both ? new Map<string, { order: StoredOrder; newCodes: string[]; eqCode: string }>() : null;
+    const laneErrors: string[] = [];
     try {
-      for (const eqCode of this.equipmentCodes()) {
-        for (const siteId of this.siteIds()) {
-          for (let daysAgo = 0; daysAgo <= lookbackDays; daysAgo++) {
-            const body = await this.hmis.getPending({
-              sampleId: '',
-              eqCode,
-              siteId,
-              showCulture: this.cfg.showCulture,
-              date: formatApiDateDaysAgo(daysAgo),
-            });
-            const groups = groupPendingByBarcode(body, {
-              eqCode,
-              equipmentId: this.cfg.equipmentId ?? null,
-              ipAddress: this.ackIpAddress,
-              portNo: this.ackPortNo,
-            });
-            for (const [, offered] of groups) {
-              samples++;
-              const pending = this.interfacedOnly(offered);
-              if (!pending.found) {
-                // Every row HMIS raised for this tube is for a parameter this
-                // interface does not carry — nothing to store, nothing to wait
-                // for, and nothing to acknowledge.
-                notInterfaced++;
-                continue;
-              }
-              // The poll is where a complete panel is most likely to be seen, so
-              // it is the catalogue's main source.
-              this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
-              // `neverDownload` (orderPoll.excludeTestCodes) has to be passed
-              // here as well as on the query path: the row is stored either way
-              // so a result can still be joined, but the code must not come back
-              // as waiting to be programmed. Leaving it off is what put the
-              // derived values into the VITROS 250's sample program.
-              const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll', { neverDownload });
-              if (!download || newCodes.length === 0) continue;
-              if (!downloadable(order.sampleId)) {
-                // The gateway lists this barcode under our eqCode, but the
-                // analyzer does not run it (see orderPoll.downloadPrefixes). The
-                // rows stay cached for result-time joins; nothing is programmed.
-                notOurs++;
-                continue;
-              }
-              if (!this.transport.connected) {
-                // Leave it un-downloaded; the next tick after reconnect sends it.
-                this.log.warn({ barcode: order.sampleId, tests: newCodes }, 'order waiting — analyzer link is down');
-                continue;
-              }
-              if (this.downloadsPaused()) {
-                // The instrument is not answering. Keep the order in the store,
-                // un-downloaded, so it goes out as soon as the breaker closes.
-                held++;
-                continue;
-              }
-              // What goes on the wire. An analyzer that keeps ONE program per
-              // sample and lets a later download replace it (VITROS 250, see
-              // KermitLink.downloadReplacesProgram) must be given the whole
-              // panel every time — a delta of the newly seen tests would wipe
-              // the ones it already had. Everything else takes just the delta.
-              const codes = this.link.downloadReplacesProgram ? this.programmable(order.testCodes) : newCodes;
-              if ((this.refusedUntil.get(order.barcode) ?? 0) > Date.now()) continue; // refused a moment ago
-              this.refusedUntil.delete(order.barcode);
-              try {
-                await this.link.sendOrders([
-                  {
-                    sampleId: order.sampleId,
-                    // `codes`, not `newCodes`: on a replace-program link the whole
-                    // panel goes down every time, and downloadCodeAliases is
-                    // applied to whatever is actually being sent.
-                    testCodes: this.downloadCodes(codes),
-                    priority: order.priority,
-                    patient: this.cfg.sendDemographics ? order.patient : null,
-                    specimenType: order.specimenType,
-                  },
-                ]);
-                this.orders.markDownloaded(order.sampleId, codes);
-                this.downloadedCount++;
-                pushed++;
-                this.pushStats.sent++;
-                this.pushStats.lastSentAt = new Date().toISOString();
-                this.pushStats.lastSentBarcode = order.sampleId;
-                this.resumeDownloads('an order was accepted');
-                this.log.info(
-                  { barcode: order.sampleId, tests: codes, ...(codes.length !== newCodes.length ? { added: newCodes } : {}), eqCode },
-                  'order downloaded to analyzer',
-                );
-              } catch (err) {
-                if (isRefusal(err)) {
-                  // The receiver read the order and said no. The line is
-                  // fine, so this is not the breaker's business and the
-                  // tubes behind this one still go. The order stays
-                  // un-downloaded and is offered again after a wait.
-                  this.refusedUntil.set(order.barcode, Date.now() + REFUSED_RETRY_MS);
-                  refused++;
-                  this.pushStats.refused++;
-                  this.pushStats.lastError = order.sampleId + ': ' + err.message;
-                  this.pushStats.lastErrorAt = new Date().toISOString();
-                  this.log.error(
-                    { barcode: order.sampleId, tests: newCodes, err: err.message, retryInMs: REFUSED_RETRY_MS },
-                    'order refused by the receiver — the other orders continue, this one is tried again later',
-                  );
-                  continue;
-                }
-                // Not marked downloaded, so it is retried once the breaker closes.
-                this.downloadFailStreak++;
-                this.pushStats.failed++;
-                this.pushStats.lastError = order.sampleId + ': ' + (err instanceof Error ? err.message : String(err));
-                this.pushStats.lastErrorAt = new Date().toISOString();
-                this.log.error(
-                  {
-                    barcode: order.sampleId,
-                    tests: newCodes,
-                    consecutiveFailures: this.downloadFailStreak,
-                    err: err instanceof Error ? err.message : String(err),
-                  },
-                  'order download failed — will retry on the next poll',
-                );
-                if (this.downloadFailStreak >= DOWNLOAD_FAIL_THRESHOLD) {
-                  this.pauseDownloads();
-                  break; // stop hammering the rest of this tick's orders
+      for (const lane of this.lanes) {
+        const gw = this.gateway(lane);
+        const sites = gw.ignoresPollFilters ? [undefined] : this.siteIds();
+        const days = gw.ignoresPollFilters ? 0 : lookbackDays;
+        try {
+          for (const eqCode of this.equipmentCodes()) {
+            for (const siteId of sites) {
+              for (let daysAgo = 0; daysAgo <= days; daysAgo++) {
+                const body = await gw.getPending({
+                  sampleId: '',
+                  eqCode,
+                  siteId,
+                  showCulture: this.cfg.showCulture,
+                  date: formatApiDateDaysAgo(daysAgo),
+                });
+                const groups = groupPendingByBarcode(body, {
+                  eqCode,
+                  equipmentId: this.cfg.equipmentId ?? null,
+                  ipAddress: this.ackIpAddress,
+                  portNo: this.ackPortNo,
+                  source: lane,
+                });
+                for (const [, offered] of groups) {
+                  tally.samples++;
+                  const pending = this.interfacedOnly(offered);
+                  if (!pending.found) {
+                    // Every row HMIS raised for this tube is for a parameter this
+                    // interface does not carry — nothing to store, nothing to wait
+                    // for, and nothing to acknowledge.
+                    tally.notInterfaced++;
+                    continue;
+                  }
+                  // The poll is where a complete panel is most likely to be seen, so
+                  // it is the catalogue's main source.
+                  this.parameters.learn(pending.ackItems, { excludeParameterIds: this.cfg.excludeParameterIds });
+                  // `neverDownload` (orderPoll.excludeTestCodes) has to be passed
+                  // here as well as on the query path: the row is stored either way
+                  // so a result can still be joined, but the code must not come back
+                  // as waiting to be programmed. Leaving it off is what put the
+                  // derived values into the VITROS 250's sample program.
+                  const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll', { neverDownload });
+                  if (collected) {
+                    // The LAST upsert of a tube sees every lane's rows, so its
+                    // newCodes are the union still to be sent.
+                    collected.set(order.barcode, { order, newCodes, eqCode });
+                    continue;
+                  }
+                  if ((await this.pushPolled(order, newCodes, eqCode, tally)) === 'stop') break;
                 }
               }
             }
           }
+          this.laneState.set(lane, { lastError: null, lastPollAt: new Date().toISOString() });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.laneState.set(lane, { lastError: message, lastPollAt: this.laneState.get(lane)?.lastPollAt ?? null });
+          if (!this.both) throw err;
+          laneErrors.push(`${laneLabel(lane)}: ${message}`);
+          this.log.error({ lane, err: message }, 'order poll failed for this HMIS lane — the other lane carries on');
         }
       }
-      this.lastPollAt = new Date().toISOString();
-      if (this.lastPollError) this.log.info('order polling recovered');
-      this.lastPollError = null;
+      if (collected) {
+        for (const { order, newCodes, eqCode } of collected.values()) {
+          if ((await this.pushPolled(order, newCodes, eqCode, tally)) === 'stop') break;
+        }
+      }
+      if (laneErrors.length < this.lanes.length) this.lastPollAt = new Date().toISOString();
+      if (laneErrors.length) {
+        this.lastPollError = laneErrors.join('; ');
+      } else {
+        if (this.lastPollError) this.log.info('order polling recovered');
+        this.lastPollError = null;
+      }
       // New rows may have arrived for a staged sample that was waiting.
       if (this.filer) void this.filer.run('poll');
+      const { samples, pushed, held, notOurs, notInterfaced, refused } = tally;
       if (samples || pushed || held || notOurs || notInterfaced || refused) {
         this.log.debug({ samples, pushed, held, notOurs, notInterfaced, refused }, 'order poll complete');
       }
@@ -907,6 +1073,105 @@ export class AnalyzerRuntime {
       this.log.error({ err: this.lastPollError }, 'order poll failed — new orders are not reaching this analyzer');
     } finally {
       this.polling = false;
+    }
+  }
+
+  /**
+   * Push one polled tube's new tests to the analyzer. Returns 'stop' when the
+   * download breaker has just opened — the rest of this batch of orders is
+   * then left for the next tick.
+   */
+  private async pushPolled(order: StoredOrder, newCodes: string[], eqCode: string, tally: PollTally): Promise<'stop' | void> {
+    const { download, downloadPrefixes } = this.cfg.orderPoll;
+    const downloadable = (barcode: string): boolean =>
+      downloadPrefixes.length === 0 ||
+      downloadPrefixes.some((p) => barcode.toUpperCase().startsWith(p.toUpperCase()));
+    if (!download || newCodes.length === 0) return;
+    if (!downloadable(order.sampleId)) {
+      // The gateway lists this barcode under our eqCode, but the
+      // analyzer does not run it (see orderPoll.downloadPrefixes). The
+      // rows stay cached for result-time joins; nothing is programmed.
+      tally.notOurs++;
+      return;
+    }
+    if (!this.transport.connected) {
+      // Leave it un-downloaded; the next tick after reconnect sends it.
+      this.log.warn({ barcode: order.sampleId, tests: newCodes }, 'order waiting — analyzer link is down');
+      return;
+    }
+    if (this.downloadsPaused()) {
+      // The instrument is not answering. Keep the order in the store,
+      // un-downloaded, so it goes out as soon as the breaker closes.
+      tally.held++;
+      return;
+    }
+    // What goes on the wire. An analyzer that keeps ONE program per
+    // sample and lets a later download replace it (VITROS 250, see
+    // KermitLink.downloadReplacesProgram) must be given the whole
+    // panel every time — a delta of the newly seen tests would wipe
+    // the ones it already had. Everything else takes just the delta.
+    const codes = this.link.downloadReplacesProgram ? this.programmable(order.testCodes) : newCodes;
+    if ((this.refusedUntil.get(order.barcode) ?? 0) > Date.now()) return; // refused a moment ago
+    this.refusedUntil.delete(order.barcode);
+    try {
+      await this.link.sendOrders([
+        {
+          sampleId: order.sampleId,
+          // `codes`, not `newCodes`: on a replace-program link the whole
+          // panel goes down every time, and downloadCodeAliases is
+          // applied to whatever is actually being sent.
+          testCodes: this.downloadCodes(codes),
+          priority: order.priority,
+          patient: this.cfg.sendDemographics ? order.patient : null,
+          specimenType: order.specimenType,
+        },
+      ]);
+      this.orders.markDownloaded(order.sampleId, codes);
+      this.downloadedCount++;
+      tally.pushed++;
+      this.pushStats.sent++;
+      this.pushStats.lastSentAt = new Date().toISOString();
+      this.pushStats.lastSentBarcode = order.sampleId;
+      this.resumeDownloads('an order was accepted');
+      this.log.info(
+        { barcode: order.sampleId, tests: codes, ...(codes.length !== newCodes.length ? { added: newCodes } : {}), eqCode },
+        'order downloaded to analyzer',
+      );
+    } catch (err) {
+      if (isRefusal(err)) {
+        // The receiver read the order and said no. The line is
+        // fine, so this is not the breaker's business and the
+        // tubes behind this one still go. The order stays
+        // un-downloaded and is offered again after a wait.
+        this.refusedUntil.set(order.barcode, Date.now() + REFUSED_RETRY_MS);
+        tally.refused++;
+        this.pushStats.refused++;
+        this.pushStats.lastError = order.sampleId + ': ' + err.message;
+        this.pushStats.lastErrorAt = new Date().toISOString();
+        this.log.error(
+          { barcode: order.sampleId, tests: newCodes, err: err.message, retryInMs: REFUSED_RETRY_MS },
+          'order refused by the receiver — the other orders continue, this one is tried again later',
+        );
+        return;
+      }
+      // Not marked downloaded, so it is retried once the breaker closes.
+      this.downloadFailStreak++;
+      this.pushStats.failed++;
+      this.pushStats.lastError = order.sampleId + ': ' + (err instanceof Error ? err.message : String(err));
+      this.pushStats.lastErrorAt = new Date().toISOString();
+      this.log.error(
+        {
+          barcode: order.sampleId,
+          tests: newCodes,
+          consecutiveFailures: this.downloadFailStreak,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        'order download failed — will retry on the next poll',
+      );
+      if (this.downloadFailStreak >= DOWNLOAD_FAIL_THRESHOLD) {
+        this.pauseDownloads();
+        return 'stop'; // stop hammering the rest of this tick's orders
+      }
     }
   }
 
@@ -1113,6 +1378,16 @@ export class AnalyzerRuntime {
   }
 
   stagedSummaries(): StagedSummary[] | null {
+    if (this.both && this.staged) {
+      // Both mode: per-lane counts and the hold reason, so the Results tab
+      // can say "held: only in HINAI".
+      return this.staged.list().map((sample) => {
+        const s = this.markWithheld(summarize(sample, this.lanes));
+        const m = isPatientHold(sample.lastError) ? this.patientMismatch(sample.barcode) : null;
+        const held = m ? { mismatch: m } : isLaneHold(sample.lastError) ? this.holdLanes(sample.barcode) : null;
+        return { ...s, lanes: laneCounts(sample, this.lanes), held };
+      });
+    }
     const list = this.staged?.summaries() ?? null;
     return list ? list.map((s) => this.markWithheld(s)) : null;
   }
@@ -1166,6 +1441,14 @@ export class AnalyzerRuntime {
     };
   }
 
+  /** Which lanes a held sample's tube is in, by lane name — the page spells
+   *  "held: only in HINAI" from it. */
+  private holdLanes(barcode: string): { in: Lane[]; waitingFor: Lane[] } {
+    const rows = this.orders.get(barcode)?.rows ?? [];
+    const present = this.lanes.filter((l) => this.rowsOfLane(rows, l).length > 0);
+    return { in: present, waitingFor: this.lanes.filter((l) => !present.includes(l)) };
+  }
+
   /** Operator "file now": one immediate pass for this barcode, with a live
    *  HMIS lookup regardless of the recheck cadence. */
   async stagedFileNow(barcode: string): Promise<boolean> {
@@ -1173,6 +1456,9 @@ export class AnalyzerRuntime {
     const s = this.staged.get(barcode);
     if (!s) return false;
     await this.filer.run('operator', s.barcode);
+    // The operator cannot override a patient mismatch (C2): say so.
+    const m = this.patientMismatch(s.barcode);
+    if (m) throw new Error(AnalyzerRuntime.mismatchMessage(m));
     return true;
   }
 
@@ -1206,10 +1492,22 @@ export class AnalyzerRuntime {
    */
   async stagedForce(barcode: string): Promise<ForceReport | null> {
     if (!this.staged) return null;
+    // Never alongside a filing pass (D6): the two would post the same values.
+    return this.filer ? this.filer.exclusive(() => this.stagedForceLocked(barcode)) : this.stagedForceLocked(barcode);
+  }
+
+  private async stagedForceLocked(barcode: string): Promise<ForceReport | null> {
+    if (!this.staged) return null;
     const s = this.staged.get(normalizeBarcode(barcode));
     if (!s) return null;
+    if (this.both) {
+      // Force cannot override a patient mismatch either (C2).
+      const m = this.patientMismatch(s.barcode);
+      if (m) throw new Error(AnalyzerRuntime.mismatchMessage(m));
+      return this.stagedForceLanes(this.staged, s);
+    }
     const upload = this.staged.forceUpload(s, `${s.barcode}-force-${Date.now()}`);
-    const cached = this.orders.get(s.barcode)?.rows ?? [];
+    const cached = this.rowsOfLane(this.orders.get(s.barcode)?.rows ?? [], this.lanes[0]!);
     const joined = this.joinRows(upload, cached, { force: true });
     const report: ForceReport = {
       barcode: s.barcode,
@@ -1238,7 +1536,10 @@ export class AnalyzerRuntime {
     const res = await this.hmis.postResults(joined.rows, this.cfg.equipmentCode);
     report.accepted = res.filed;
     report.message = res.message;
-    this.staged.markFiled(s.barcode, joined.filedCodes);
+    // GenX marks only what it placed (D2); a value replaced meanwhile stays
+    // pending (D6).
+    const filed = this.lanes[0] === 'genx' ? genxFiled(joined.filedCodes, cached, res.unmatched) : joined.filedCodes;
+    this.staged.markFiled(s.barcode, filed as typeof joined.filedCodes, undefined, this.lanes[0], snapshotOf(s));
     try {
       await this.hmis.acknowledge(joined.matched, this.cfg.equipmentCode);
     } catch (err) {
@@ -1249,6 +1550,80 @@ export class AnalyzerRuntime {
     }
     this.log.warn({ barcode: s.barcode, accepted: res.filed, sent: joined.rows.length, message: res.message }, 'FORCE push: HMIS answered');
     return report;
+  }
+
+  /**
+   * "Force" in both HMIS mode: the same push, once per lane, each from that
+   * lane's own cached rows (and, for HINAI, the parameter catalogue) and to
+   * that lane's gateway. A lane with nothing mappable, or one that fails, is
+   * reported in its entry and does not stop the other. The top-level fields
+   * are the totals, so the console's dialog reads as before.
+   */
+  private async stagedForceLanes(store: ResultStore, s: StagedSample): Promise<ForceReport> {
+    const upload = store.forceUpload(s, `${s.barcode}-force-${Date.now()}`);
+    const cachedAll = this.orders.get(s.barcode)?.rows ?? [];
+    const lanes: Array<ForceReport & { lane: Lane }> = [];
+    for (const lane of this.lanes) {
+      const cached = this.rowsOfLane(cachedAll, lane);
+      const joined = this.joinRows(upload, cached, { force: true, lane });
+      const entry: ForceReport & { lane: Lane } = {
+        lane,
+        barcode: s.barcode,
+        values: upload.results.length,
+        sent: joined.rows.length,
+        accepted: 0,
+        message: '',
+        unresolved: joined.unmatched,
+        rows: joined.rows.map((r, i) => ({
+          testCode: joined.filedCodes[i]?.testCode ?? r.identifier,
+          identifier: r.identifier,
+          parameterId: r.parameterId,
+          value: r.resultValue,
+        })),
+      };
+      lanes.push(entry);
+      this.log.warn(
+        { barcode: s.barcode, lane, values: entry.values, sending: entry.sent, unresolved: joined.unmatched, cachedRows: cached.length },
+        'FORCE push from the admin console to this HMIS lane — pending rows NOT checked',
+      );
+      if (joined.rows.length === 0) {
+        entry.message = `nothing could be mapped to a ${laneLabel(lane)} row from the cached order rows`;
+        continue;
+      }
+      const gw = this.gateway(lane);
+      let unplaced: string[] | undefined;
+      try {
+        const res = await gw.postResults(joined.rows, this.cfg.equipmentCode);
+        unplaced = res.unmatched;
+        entry.accepted = res.filed;
+        entry.message = res.message;
+      } catch (err) {
+        entry.message = `${laneLabel(lane)} refused or failed: ${err instanceof Error ? err.message : String(err)}`;
+        this.log.error({ barcode: s.barcode, lane, err: entry.message }, 'FORCE push failed in this HMIS lane');
+        continue;
+      }
+      const filed = lane === 'genx' ? genxFiled(joined.filedCodes, cached, unplaced) : joined.filedCodes;
+      store.markLaneFiled(s.barcode, lane, filed, this.lanes, undefined, { expect: snapshotOf(s) });
+      try {
+        await gw.acknowledge(joined.matched, this.cfg.equipmentCode);
+      } catch (err) {
+        this.log.error(
+          { barcode: s.barcode, lane, err: err instanceof Error ? err.message : String(err) },
+          'acknowledge failed AFTER a forced push — results are filed, rows may still show pending',
+        );
+      }
+      this.log.warn({ barcode: s.barcode, lane, accepted: entry.accepted, sent: entry.sent, message: entry.message }, 'FORCE push: HMIS answered');
+    }
+    return {
+      barcode: s.barcode,
+      values: upload.results.length,
+      sent: lanes.reduce((n, l) => n + l.sent, 0),
+      accepted: lanes.reduce((n, l) => n + l.accepted, 0),
+      message: lanes.map((l) => `${laneLabel(l.lane)}: ${l.message || 'no answer'}`).join(' | '),
+      unresolved: [...new Set(lanes.flatMap((l) => l.unresolved))],
+      rows: lanes.flatMap((l) => l.rows),
+      lanes,
+    };
   }
 
   /**
@@ -1283,7 +1658,7 @@ export class AnalyzerRuntime {
    *  unit scaling, and the dialect's canonical assay key — HMIS spells a
    *  VITROS identifier as the full "1.000000+032+1" where the codec reports
    *  "032", so the two meet on the canonical form. */
-  private joinRows(payload: HmisResultUpload, orderRows: MirthAcknowledgeItem[], opts: { force?: boolean } = {}) {
+  private joinRows(payload: HmisResultUpload, orderRows: MirthAcknowledgeItem[], opts: { force?: boolean; lane?: Lane } = {}) {
     const canonical = this.cfg.protocol === 'astm' ? assayKey(this.cfg.astm.dialect) : undefined;
     const join = (rows: MirthAcknowledgeItem[]) =>
       toLisResultRows(
@@ -1312,6 +1687,9 @@ export class AnalyzerRuntime {
     // A forced push always tries the catalogue: the whole point of it is a
     // row HMIS is no longer offering.
     if ((!this.cfg.fillMissingOrderRows && !opts.force) || joined.unmatched.length === 0) return joined;
+    // Never for GenX rows in both mode: the catalogue holds HINAI's parameter
+    // ids, and a GenX line is not a HINAI panel.
+    if (opts.lane === 'genx') return joined;
 
     // Every value here is one HMIS is not currently offering a row for. If the
     // catalogue has seen the parameter on this service before, the row can be
@@ -1712,30 +2090,51 @@ export class AnalyzerRuntime {
   }
 
   /** Load and normalise the pending rows for one barcode, under every code
-   *  this machine is registered as, merged into one order. */
-  private async fetchPending(lookup: string, includeTransmitted = false): Promise<PendingOrders> {
+   *  this machine is registered as, merged into one order — from every lane
+   *  given (all of the analyzer's by default; a host query and the console's
+   *  Re-send ask both systems in both mode). With more than one lane, a lane
+   *  that fails is logged and the others still answer; it throws only when
+   *  every lane failed. */
+  private async fetchPending(lookup: string, includeTransmitted = false, lanes: readonly Lane[] = this.lanes): Promise<PendingOrders> {
     const parts: PendingOrders[] = [];
-    for (const eqCode of this.equipmentCodes()) {
-      const body = await this.hmis.getPending({
-        sampleId: lookup,
-        eqCode,
-        siteId: this.cfg.siteId,
-        showCulture: this.cfg.showCulture,
-        // Off by default: an order raised yesterday for a tube run today would
-        // otherwise not be found.
-        date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
-      });
-      parts.push(
-        normalizePending(body, {
-          sampleId: lookup,
-          eqCode,
-          equipmentId: this.cfg.equipmentId ?? null,
-          ipAddress: this.ackIpAddress,
-          portNo: this.ackPortNo,
-          includeTransmitted,
-        }),
-      );
+    let failure: unknown = null;
+    let answered = 0;
+    for (const lane of lanes) {
+      const gw = this.gateway(lane);
+      try {
+        for (const eqCode of this.equipmentCodes()) {
+          const body = await gw.getPending({
+            sampleId: lookup,
+            eqCode,
+            siteId: this.cfg.siteId,
+            showCulture: this.cfg.showCulture,
+            // Off by default: an order raised yesterday for a tube run today would
+            // otherwise not be found.
+            date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
+          });
+          parts.push(
+            normalizePending(body, {
+              sampleId: lookup,
+              eqCode,
+              equipmentId: this.cfg.equipmentId ?? null,
+              ipAddress: this.ackIpAddress,
+              portNo: this.ackPortNo,
+              includeTransmitted,
+              source: lane,
+            }),
+          );
+        }
+        answered++;
+      } catch (err) {
+        if (lanes.length === 1) throw err;
+        failure = err;
+        this.log.warn(
+          { barcode: lookup, lane, err: err instanceof Error ? err.message : String(err) },
+          'HMIS lookup failed in this lane — answering from the other',
+        );
+      }
     }
+    if (answered === 0 && failure) throw failure;
     // Same door as the poll: a row for a parameter this interface does not carry
     // is not stored, not waited for and not acknowledged, whichever path fetched
     // it. Filtering in both places is what keeps a host-query answer and a poll
@@ -1803,18 +2202,40 @@ export class AnalyzerRuntime {
    * never saw), and `refresh` forces one even when the store has rows, for a
    * result whose test was added after the rows were cached.
    */
-  private async resolveOrderRows(barcode: string, opts: { refresh?: boolean } = {}): Promise<MirthAcknowledgeItem[]> {
+  private async resolveOrderRows(
+    barcode: string,
+    /** cachedOnly: never ask the gateway (a lane failing this pass, D4). */
+    opts: { refresh?: boolean; cachedOnly?: boolean } = {},
+    /** Only this lane's rows (and only its gateway asked). Default: the first
+     *  lane, which in single mode is the analyzer's one lane. */
+    lane: Lane = this.lanes[0]!,
+  ): Promise<MirthAcknowledgeItem[]> {
     const lookup = normalizeBarcode(barcode);
     const stored = this.orders.get(lookup);
-    if (stored?.rows.length && !opts.refresh) return stored.rows;
+    const mine = stored ? this.rowsOfLane(stored.rows, lane) : [];
+    if ((mine.length && !opts.refresh) || opts.cachedOnly) return mine;
 
     // includeTransmitted: a re-sent or corrected result must still find its
     // rows after a previous upload already acknowledged them.
-    const pending = await this.fetchPending(lookup, true);
+    const pending = await this.fetchPending(lookup, true, [lane]);
     if (pending.ackItems.length) {
-      return this.orders.upsert(lookup, pending, 'result').order.rows;
+      return this.rowsOfLane(this.orders.upsert(lookup, pending, 'result').order.rows, lane);
     }
-    return stored?.rows ?? [];
+    return mine;
+  }
+
+  /** Both mode: every lane's rows for a barcode (barcode completion asks
+   *  whether ANY system has the full barcode). A lane that fails is skipped. */
+  private async allLaneRows(barcode: string, opts: { refresh?: boolean } = {}): Promise<MirthAcknowledgeItem[]> {
+    const out: MirthAcknowledgeItem[] = [];
+    for (const lane of this.lanes) {
+      try {
+        out.push(...(await this.resolveOrderRows(barcode, opts, lane)));
+      } catch (err) {
+        this.log.warn({ barcode, lane, err: err instanceof Error ? err.message : String(err) }, 'HMIS lookup failed in this lane');
+      }
+    }
+    return out;
   }
 
   /** Reported in the acknowledge body; derived from a TCP transport when the

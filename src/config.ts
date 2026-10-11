@@ -2,8 +2,12 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { DEFAULT_DIALECT, ASTM_DIALECT_NAMES, type AstmDialect } from './codec/astm/records.js';
-import { PROFILE_NAMES, applyProfiles } from './profiles/index.js';
+import { PROFILE_LIBRARY, PROFILE_NAMES, applyProfiles } from './profiles/index.js';
 import { compileCompletion } from './results/complete.js';
+import { lanesFor, resolveLanes } from './hmis/lanes.js';
+
+export { lanesFor } from './hmis/lanes.js';
+export type { Lane } from './hmis/lanes.js';
 
 // Minimal .env loader (no dependency). Reads KEY=VALUE lines and populates
 // process.env without overwriting variables already set in the real environment.
@@ -193,6 +197,15 @@ function validRegex(v: string | null | undefined): boolean {
     return false;
   }
 }
+
+/** `mode` / `use` — at the top of `hmis` and per analyzer. "mirth" is
+ *  accepted for `use` as hinai's older name. */
+const HmisMode = z.enum(['single', 'both']);
+const HmisUse = z.enum(['hinai', 'genx', 'mirth']).transform((v) => (v === 'mirth' ? 'hinai' : v) as 'hinai' | 'genx');
+const HmisLaneSetting = z.object({
+  mode: HmisMode.optional(),
+  use: HmisUse.optional(),
+});
 
 const AnalyzerSchema = z.object({
   id: z.string().regex(/^[a-z0-9-]+$/, 'analyzer id must be kebab-case'),
@@ -473,6 +486,13 @@ const AnalyzerSchema = z.object({
    *  which analyte, because a wrong guess files a value against the wrong
    *  analyte on a patient's CBC. */
   fillMissingOrderRows: z.boolean().default(false),
+  /** This analyzer's own HMIS lanes, overriding the top-level `hmis.mode` /
+   *  `hmis.use`. Absent = the top-level setting. See src/hmis/lanes.ts. */
+  hmis: HmisLaneSetting.optional(),
+  /** Certify this analyzer's GenX result lines through GenX's autocertify
+   *  endpoint once every value of a line is filed in GenX. Only acts when
+   *  GenX is one of the analyzer's lanes. Set by `im.autoCertify.genx`. */
+  genxAutoCertify: z.boolean().default(false),
   /** What to do with a result whose sample id carries an operator's rerun
    *  mark — "PL2609240011/R", "PL2609260017-R2".
    *
@@ -624,6 +644,19 @@ const AutoCertifySchema = z
     logFile: z.string().nullable().default('./logs/autocertify.log'),
     /** How many recent certify attempts the console keeps in memory. */
     historySize: z.number().int().positive().default(300),
+    /** Results certified at the same time. 1 (default) = one after another,
+     *  exactly the old service's order. Raise it only if volume outgrows a
+     *  single run: measured 2026-10 the busiest run was 62 results / 115
+     *  calls in 29 s, about 7% of what one-at-a-time can do. More parallel
+     *  calls also make HIS's "optimistic locking failed" clash likelier. A
+     *  result's own parameters are always certified one after another. */
+    concurrency: z.number().int().min(1).max(8).default(1),
+    /** A result or parameter the portal confirmed certified is not called
+     *  again for this many hours, even if the database still lists it as
+     *  ready. The old service re-certified such rows every 30 s, sometimes
+     *  for hours: 2,794 extra calls for 30 results in 3-12 Oct 2026. Logged
+     *  once per row. 0 = call again every run, as the old service did. */
+    skipRecertifyHours: z.number().min(0).max(168).default(24),
   })
   .default({})
   .superRefine((c, ctx) => {
@@ -695,8 +728,21 @@ const ConfigSchema = z.object({
     // (its settings live in the `hinai` block, lifted up by liftHmisBlocks);
     // "mirth" is the same gateway under its older name. Only "genx" differs.
     api: z.enum(['mirth', 'hinai', 'genx']).default('mirth'),
-    /** GenX LIMS Lab Equipment External API — used only when api = "genx".
-     *  See src/hmis/genx.ts. */
+    /** "single" — every analyzer files into one gateway (`use`); "both" —
+     *  into HINAI and GenX side by side. Absent = derived from `api` (single
+     *  mode on api's gateway), so a config written before this key reads as it
+     *  always did. Wins over `api` when both are given; an analyzer's own
+     *  `hmis` block overrides it. New code reads lanes through lanesFor(). */
+    mode: HmisMode.optional(),
+    /** Single mode only: "hinai" | "genx". Ignored in both mode. */
+    use: HmisUse.optional(),
+    /** Both mode: hold a sample whose patient id differs between HINAI and
+     *  GenX (addendum C2). Switch off only after checking real rows — HINAI
+     *  may give an MRN where GenX gives a UHID numbered differently, which
+     *  would hold every sample. */
+    patientCheck: z.boolean().default(true),
+    /** GenX LIMS Lab Equipment External API — used by every analyzer whose
+     *  lanes include genx. See src/hmis/genx.ts. */
     genx: z
       .object({
         /** Gateway host, e.g. https://uat.genx.example — no trailing path. */
@@ -726,6 +772,17 @@ const ConfigSchema = z.object({
         /** barcode → accessionNumber memory, so results after a restart still
          *  find their tube. Relative to the working directory. */
         accessionCacheFile: z.string().default('./spool/genx-accessions.json'),
+        /** GenX's own transaction log while HINAI is ALSO in use in this
+         *  process, so the two gateways' evidence trails stay apart. When GenX
+         *  is the only lane it keeps writing to `hmis.auditLog`, as before.
+         *  Same daily naming (hmis-genx-YYYY-MM-DD.log); null = off. */
+        auditLog: z.string().nullable().default('./logs/hmis-genx.log'),
+        /** Certify one GenX result line (analyzer `genxAutoCertify`). */
+        autoCertifyPath: z.string().default('/integration-service/external/v1/lab/equipment/autocertify'),
+        /** GET sends `<autoCertifyParam>=<lineId>` as a query string; POST sends
+         *  it as a JSON body `{ <autoCertifyParam>: <lineId> }`. */
+        autoCertifyMethod: z.enum(['GET', 'POST']).default('GET'),
+        autoCertifyParam: z.string().min(1).default('labresultid'),
       })
       .default({}),
   }).default({}),
@@ -784,9 +841,19 @@ const ConfigSchema = z.object({
       message: 'configure at least one analyzer, or enable autoCertify to run in Auto-Certify-only mode',
     });
   }
-  if (c.analyzers.length && c.hmis.api === 'genx') {
+  if (!c.analyzers.length) return;
+  // Each lane in use by ANY analyzer needs its gateway — per analyzer, since
+  // one block (IM) may file into both while the rest stay on one.
+  const lanes = c.analyzers.map((a) => lanesFor(a, c));
+  const anyGenx = lanes.some((l) => l.includes('genx'));
+  const anyHinai = lanes.some((l) => l.includes('hinai'));
+  if (anyGenx) {
     if (!c.hmis.genx.baseUrl) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'genx', 'baseUrl'], message: 'required when hmis.api is "genx"' });
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['hmis', 'genx', 'baseUrl'],
+        message: 'required when hmis.api is "genx" or an analyzer\'s HMIS lanes include genx',
+      });
     }
     // An analyzer that PUSHES orders (IM) must be told which GenX services
     // are its own. The Mirth gateway filtered the worklist by equipment code
@@ -795,8 +862,10 @@ const ConfigSchema = z.object({
     // (src/hmis/genx.ts toRows). For a machine that only answers host queries
     // that costs nothing, but a push would send IM an order for every tube in
     // the lab — under codes IM does not know, refused and retried for ever.
+    // Judged per analyzer: only one whose own lanes include genx.
     const listed = new Set(Object.keys(c.hmis.genx.equipmentServices).map((k) => k.trim().toUpperCase()));
     c.analyzers.forEach((a, i) => {
+      if (!lanes[i]!.includes('genx')) return;
       const pushes = a.protocol === 'hl7' && a.hl7.orderPush.enabled && a.orderPoll.enabled && a.orderPoll.download;
       if (!pushes) return;
       const codes = [a.equipmentCode, ...a.extraEquipmentCodes];
@@ -809,12 +878,16 @@ const ConfigSchema = z.object({
           `${codes.join(' / ')} — GenX would hand it every service on every tube. List the serviceCodes this machine runs there.`,
       });
     });
-  } else if (c.analyzers.length && !c.hmis.baseUrl) {
+  }
+  if (anyHinai && !c.hmis.baseUrl) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'baseUrl'], message: 'required when analyzers are configured' });
   }
 });
 
-export type AppConfig = z.infer<typeof ConfigSchema>;
+export type AppConfig = z.infer<typeof ConfigSchema> & {
+  /** Config points worth a warning that are not errors — logged at start. */
+  startupWarnings?: string[];
+};
 export type AnalyzerConfig = z.infer<typeof AnalyzerSchema>;
 export type TransportConfig = z.infer<typeof TransportSchema>;
 export type AutoCertifyConfig = z.infer<typeof AutoCertifySchema>;
@@ -964,6 +1037,93 @@ function liftHmisBlocks(raw: unknown): unknown {
   return { ...raw, hmis: { ...rest, ...hinai } };
 }
 
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/** Objects merge at every depth, arrays and scalars replace — `b` wins. */
+function deepMerge(a: Record<string, unknown>, b: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...a };
+  for (const [k, v] of Object.entries(b)) {
+    if (v === undefined) continue;
+    const base = out[k];
+    out[k] = isObj(base) && isObj(v) ? deepMerge(base, v) : v;
+  }
+  return out;
+}
+
+/**
+ * The top-level `im` block → an ordinary analyzer block, appended to
+ * `analyzers` BEFORE profiles are applied, so IM keeps running on the same
+ * machinery as a hand-written `"profile": "im"` block (order push, refusal
+ * retry, result channel, channel cards).
+ *
+ * The block says only what differs per site: the two addresses, the equipment
+ * code / id, HINAI's sites, the HMIS lanes and auto-certify. `analyzer` is the
+ * escape hatch for any other analyzer key, merged last and deeply — so
+ * `analyzer.hl7.orderPush.version` changes the version without switching the
+ * push off (the profile merge alone is one level deep).
+ *
+ * `autoCertify.hinai` puts IM's equipmentId into the existing Oracle certify
+ * job (autoCertify.equipmentIds); that job has no other notion of IM.
+ */
+function translateImBlock(raw: unknown, warnings: string[]): unknown {
+  if (!isObj(raw) || !isObj(raw.im)) return raw;
+  const { im: imRaw, ...rest } = raw;
+  const im = imRaw as Record<string, unknown>;
+  if (im.enabled === false) return rest;
+
+  const fail = (msg: string): never => {
+    throw new Error(`Invalid config:\n  • im: ${msg}`);
+  };
+  if (typeof im.equipmentCode !== 'string' || !im.equipmentCode.trim()) fail('equipmentCode is required');
+  const orders = isObj(im.orders) ? im.orders : {};
+  const results = isObj(im.results) ? im.results : {};
+  if (typeof orders.host !== 'string' || !orders.host.trim()) fail('orders.host is required — the address the connector dials to send IM its orders');
+  const certify = isObj(im.autoCertify) ? im.autoCertify : {};
+
+  const block: Record<string, unknown> = {
+    id: typeof im.id === 'string' && im.id ? im.id : 'im',
+    profile: 'im',
+    equipmentCode: im.equipmentCode,
+    equipmentId: im.equipmentId,
+    siteIds: im.siteIds,
+    hmis: isObj(im.hmis) ? im.hmis : undefined,
+    transport: { type: 'tcp', mode: 'client', host: orders.host, port: orders.port },
+    resultTransport: { type: 'tcp', mode: 'server', host: results.host ?? '0.0.0.0', port: results.port },
+    genxAutoCertify: certify.genx === true,
+  };
+  // Profile defaults first (deep), so the escape hatch can reach nested keys;
+  // applyProfiles then re-applies "im" over a block that already says it all.
+  const merged = deepMerge(
+    deepMerge(PROFILE_LIBRARY.im.defaults as Record<string, unknown>, block),
+    isObj(im.analyzer) ? im.analyzer : {},
+  );
+  const analyzers = Array.isArray(rest.analyzers) ? [...rest.analyzers, merged] : [merged];
+  let out: Record<string, unknown> = { ...rest, analyzers };
+
+  if (certify.hinai === true) {
+    const hmis = isObj(rest.hmis) ? rest.hmis : {};
+    const lanes = resolveLanes(
+      isObj(merged.hmis) ? (merged.hmis as { mode?: 'single' | 'both'; use?: string }) : undefined,
+      hmis as { mode?: 'single' | 'both'; use?: string; api?: string },
+    );
+    if (!lanes.includes('hinai')) {
+      warnings.push('im.autoCertify.hinai ignored: IM does not use the HINAI lane');
+    } else {
+      const ac = isObj(rest.autoCertify) ? rest.autoCertify : {};
+      if (ac.enabled !== true) {
+        fail('autoCertify.hinai is true but autoCertify.enabled is not — the HINAI certify job must be enabled (autoCertify.enabled: true) for IM to be certified, or set im.autoCertify.hinai to false');
+      }
+      if (im.equipmentId === undefined || im.equipmentId === null || String(im.equipmentId).trim() === '') {
+        fail('equipmentId is required when im.autoCertify.hinai is true — it is what the certify job selects IM\'s results by');
+      }
+      const id = String(im.equipmentId).trim();
+      const have = Array.isArray(ac.equipmentIds) ? ac.equipmentIds.map((x) => String(x).trim()) : [];
+      out = { ...out, autoCertify: { ...ac, equipmentIds: have.includes(id) ? have : [...have, id] } };
+    }
+  }
+  return out;
+}
+
 export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.json'): AppConfig {
   loadEnvFile(); // populate process.env from .env before applying overrides
   const abs = resolve(path);
@@ -977,7 +1137,9 @@ export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.
   }
   // Model-level defaults from the analyzer's profile go under the block first,
   // so the schema validates the RESULT — a profile cannot bypass validation.
-  const withEnv = applyEnvOverrides(applyProfiles(liftHmisBlocks(raw)));
+  // The `im` block becomes an ordinary analyzer block before that.
+  const warnings: string[] = [];
+  const withEnv = applyEnvOverrides(applyProfiles(translateImBlock(liftHmisBlocks(raw), warnings)));
   const parsed = ConfigSchema.safeParse(withEnv);
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `  • ${i.path.join('.')}: ${i.message}`).join('\n');
@@ -986,23 +1148,33 @@ export function loadConfig(path = process.env.LAB_CONNECTOR_CONFIG || './config.
   // Two analyzers sharing an equipmentCode would acknowledge each other's rows.
   // Extra codes count too: an extra on one analyzer that is another's primary
   // (or extra) would have both machines downloading the same order.
-  const seen = new Map<string, string>();
-  for (const a of parsed.data.analyzers) {
+  // Judged per BLOCK, not per id: the `im` block and an analyzer entry may both
+  // be called "im", and that is still two machines claiming one code.
+  const seen = new Map<string, { id: string; index: number }>();
+  parsed.data.analyzers.forEach((a, index) => {
     for (const raw of [a.equipmentCode, ...a.extraEquipmentCodes]) {
       const code = raw.trim().toUpperCase();
       const owner = seen.get(code);
-      if (owner && owner !== a.id) {
-        throw new Error(`Analyzers "${owner}" and "${a.id}" both claim equipment code "${raw}" — a code must identify exactly one machine.`);
+      if (owner && owner.index !== index) {
+        throw new Error(`Analyzers "${owner.id}" and "${a.id}" both claim equipment code "${raw}" — a code must identify exactly one machine.`);
       }
-      if (owner === a.id) {
+      if (owner) {
         throw new Error(`Analyzer "${a.id}" lists equipment code "${raw}" twice.`);
       }
-      seen.set(code, a.id);
+      seen.set(code, { id: a.id, index });
     }
+  });
+  // Two blocks with one id would share a spool directory and a console card.
+  const ids = new Set<string>();
+  for (const a of parsed.data.analyzers) {
+    if (ids.has(a.id)) throw new Error(`Two analyzers are both called "${a.id}" — each needs its own id (the im block is "im" unless im.id says otherwise).`);
+    ids.add(a.id);
   }
   // Site-wide barcode format → every analyzer that does not name its own.
   for (const a of parsed.data.analyzers) {
     if (a.sampleIdFormat === undefined) a.sampleIdFormat = parsed.data.sampleIdFormat;
   }
+  // Said once at start by the connector (there is no logger here yet).
+  if (warnings.length) (parsed.data as AppConfig).startupWarnings = warnings;
   return parsed.data;
 }

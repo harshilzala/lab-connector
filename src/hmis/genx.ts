@@ -76,6 +76,11 @@ export interface GenxClientOptions {
   tlsRejectUnauthorized: boolean;
   logger: Logger;
   audit?: HmisAudit;
+  /** Auto-certify one result line. Optional so existing callers need not
+   *  know about it; defaults are the config schema's. */
+  autoCertifyPath?: string;
+  autoCertifyMethod?: 'GET' | 'POST';
+  autoCertifyParam?: string;
 }
 
 interface GenxTest {
@@ -106,6 +111,9 @@ export class GenxHmisClient implements HmisGateway {
   /** GenX takes the branch from the token — there is no site filter. */
   readonly siteId: string | null = null;
   readonly defaultSiteIds: (string | undefined)[] = [undefined];
+  /** The batch worklist call ignores site and date (eqCode only narrows the
+   *  rows afterwards, in toRows) — see HmisGateway. */
+  readonly ignoresPollFilters = true;
 
   private token: { value: string; expiresAt: number } | null = null;
   private tokenInFlight: Promise<string> | null = null;
@@ -230,6 +238,9 @@ export class GenxHmisClient implements HmisGateway {
           codes = [String(test.serviceCode)];
         }
         const transmitted = !this.pendingStatuses.has(key(test.lineStatus));
+        // The line's whole code list, before the shared-code de-duplication
+        // below drops any of them — auto-certify needs all of it filed.
+        const lineCodes = codes.map(String);
         for (const code of codes) {
           const k = key(code);
           if (!k || seen.has(k)) continue; // two services sharing an analyte: one row
@@ -241,6 +252,7 @@ export class GenxHmisClient implements HmisGateway {
             serviceCode: test.serviceCode,
             labResultId: toNum(test.sampleLineId) ?? undefined,
             labServiceId: toNum(test.serviceId) ?? undefined,
+            lineCodes,
             isTransmitted: transmitted,
             priority: tube.priority,
             specimenName: tube.specimenName,
@@ -314,6 +326,7 @@ export class GenxHmisClient implements HmisGateway {
     }
 
     const successData: HmisResultUploadResponse['successData'] = [];
+    const unplaced = new Set<string>();
     const messages: string[] = [];
     for (const [barcode, tubeRows] of byTube) {
       const path = this.opts.resultsPath;
@@ -346,6 +359,7 @@ export class GenxHmisClient implements HmisGateway {
               (unmatched.size ? ` — unmatched: ${[...unmatched].join(', ')}` : ''),
           );
         }
+        for (const c of unmatched) unplaced.add(c);
         if (unmatched.size) {
           this.opts.logger.warn(
             { barcode, accessionNumber, unmatched: [...unmatched] },
@@ -375,7 +389,40 @@ export class GenxHmisClient implements HmisGateway {
         throw err;
       }
     }
-    return { status: 'success', message: messages.join('; '), successData, filed: successData.length };
+    return { status: 'success', message: messages.join('; '), successData, filed: successData.length, unmatched: [...unplaced] };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto-certify — one result line (GenX sampleLineId = our labResultId)
+  // ---------------------------------------------------------------------------
+  /**
+   * Certify one GenX result line, once every value of it has been filed.
+   * Same authentication, 401 retry and double-envelope check as every other
+   * call; a refusal or an outage throws, and the staged filer retries it on
+   * its next pass (a certify never un-files anything). GET sends the line id
+   * as `?<param>=<id>`, POST as `{ "<param>": <id> }`.
+   */
+  async autoCertify(lineId: number, eqCode?: string, barcode?: string): Promise<void> {
+    const base = this.opts.autoCertifyPath ?? '/integration-service/external/v1/lab/equipment/autocertify';
+    const method = this.opts.autoCertifyMethod ?? 'GET';
+    const param = this.opts.autoCertifyParam ?? 'labresultid';
+    const path = method === 'GET' ? `${base}${base.includes('?') ? '&' : '?'}${new URLSearchParams({ [param]: String(lineId) })}` : base;
+    const request = method === 'POST' ? { [param]: lineId } : undefined;
+    const startedAt = Date.now();
+    let response: unknown = null;
+    try {
+      response = await this.call(method, path, request, `cert-${Date.now()}`);
+      this.record({
+        kind: 'certify', sampleId: barcode ?? null, eqCode, method, path, startedAt,
+        request, httpStatus: 200, response, outcome: 'sent', rows: 1, filed: [`labResultId ${lineId} certified`],
+      });
+    } catch (err) {
+      this.record({
+        kind: 'certify', sampleId: barcode ?? null, eqCode, method, path, startedAt,
+        request, httpStatus: null, response, outcome: 'error', rows: 0, error: errText(err),
+      });
+      throw err;
+    }
   }
 
   // ---------------------------------------------------------------------------

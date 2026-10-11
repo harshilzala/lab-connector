@@ -1,8 +1,9 @@
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { MirthAcknowledgeItem, PatientDemographics, PendingOrders } from '../types.js';
 import { safeSpoolId } from '../queue/spool.js';
+import type { Lane } from '../hmis/lanes.js';
 
 // =============================================================================
 // OrderStore — the connector's durable memory of every HMIS order row it has
@@ -40,6 +41,10 @@ export interface StoredOrder {
   rows: MirthAcknowledgeItem[];
   testCodes: string[];
   patient: PatientDemographics | null;
+  /** The patient each HMIS lane last gave for this tube, refreshed from that
+   *  lane's rows on every upsert — so a patient corrected in HMIS clears the
+   *  both-mode mismatch hold. `patient` above stays what the machine is sent. */
+  patients?: Partial<Record<Lane, PatientDemographics | null>>;
   specimenType: string | null;
   priority: 'S' | 'R';
   /** Assay identifiers already handed to the analyzer. */
@@ -73,6 +78,9 @@ export class OrderStore {
   constructor(
     private readonly dir: string,
     private readonly logger: Logger,
+    /** The lane a row with no `source` belongs to — the analyzer's FIRST
+     *  lane. Rows stored before lanes existed carry none. */
+    private readonly defaultLane?: Lane,
   ) {
     mkdirSync(dir, { recursive: true });
   }
@@ -155,15 +163,17 @@ export class OrderStore {
     // VITROS) keys on its labResultId instead, which is what distinguishes
     // those, and falls back to the bare identifier if it has neither.
     const byCode = new Map<string, MirthAcknowledgeItem>();
-    for (const row of order.rows) byCode.set(rowKey(row), row);
+    for (const row of order.rows) byCode.set(rowKey(row, this.defaultLane), row);
     const downloaded = new Set(order.downloaded.map(codeKey));
 
     let changed = existing === null;
     for (const row of pending.ackItems) {
-      const k = rowKey(row);
+      const k = rowKey(row, this.defaultLane);
       if (!k) continue;
       const have = byCode.get(k);
-      if (have && sameRow(have, row)) continue;
+      // A row the C1 migration attributed is replaced by the same row coming
+      // from the gateway itself — from then on its lane is known, not inferred.
+      if (have && sameRow(have, row) && !(have.migrated && !row.migrated)) continue;
       if (have && have.labResultId !== row.labResultId) {
         // Re-ordered: the instrument must run it again.
         downloaded.delete(codeKey(row.identifier));
@@ -179,6 +189,11 @@ export class OrderStore {
     }
     if (order.specimenType === null && pending.specimenType !== null) {
       order.specimenType = pending.specimenType;
+      changed = true;
+    }
+    for (const [lane, pt] of Object.entries(pending.patients ?? {}) as Array<[Lane, PatientDemographics | null]>) {
+      if (JSON.stringify(order.patients?.[lane] ?? null) === JSON.stringify(pt ?? null) && order.patients && lane in order.patients) continue;
+      order.patients = { ...(order.patients ?? {}), [lane]: pt ?? null };
       changed = true;
     }
     if (order.priority === 'R' && pending.priority === 'S') {
@@ -280,6 +295,57 @@ export class OrderStore {
     return removed;
   }
 
+  /**
+   * One-time lane attribution of rows written before lanes existed (addendum
+   * C1). Runs only while `.lanes.json` is absent, then writes it, so it is
+   * never guessed again: every row written since is tagged when it is stored.
+   *
+   * Started in SINGLE mode, the old rows can only have come from that one
+   * lane: they are tagged with it and `migrated`. Started in BOTH mode there
+   * is no telling — a site that ran GenX and then switched would otherwise
+   * file HINAI values against GenX line ids — so they are QUARANTINED: kept,
+   * but never used to file, acknowledge, certify, force or rebuild a row.
+   */
+  migrateLanes(lanes: readonly Lane[], log: Logger): { tagged: number; quarantined: number } {
+    const marker = join(this.dir, '.lanes.json');
+    const out = { tagged: 0, quarantined: 0 };
+    if (existsSync(marker)) return out;
+    const single = lanes.length === 1 ? lanes[0]! : null;
+    for (const file of this.listFiles()) {
+      const o = this.read(file.replace(/\.json$/, ''));
+      if (!o) continue;
+      let changed = false;
+      for (const r of o.rows) {
+        if (r.source !== undefined) continue;
+        if (single) {
+          r.source = single;
+          r.migrated = true;
+          out.tagged++;
+        } else {
+          r.source = null;
+          r.quarantined = true;
+          out.quarantined++;
+        }
+        changed = true;
+      }
+      if (changed) this.write(o);
+    }
+    try {
+      writeFileSync(marker, JSON.stringify({ migratedAt: new Date().toISOString(), lanes: [...lanes] }, null, 2));
+    } catch (err) {
+      log.warn({ marker, err: err instanceof Error ? err.message : String(err) }, 'could not write the order-store lane marker — the migration runs again next start');
+    }
+    if (out.quarantined) {
+      log.warn(
+        { quarantined: out.quarantined, lanes },
+        'cannot tell which HMIS these old order rows came from — start the new version in the mode the site ran before, then switch. They are kept but never used to file.',
+      );
+    } else if (out.tagged) {
+      log.info({ tagged: out.tagged, lane: single }, 'order rows stored before HMIS lanes existed attributed to the analyzer’s one lane');
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------------------
   private fileFor(key: string): string {
     return join(this.dir, `${safeSpoolId(key)}.json`);
@@ -321,7 +387,8 @@ export class OrderStore {
 
   private listFiles(): string[] {
     try {
-      return readdirSync(this.dir).filter((f) => f.endsWith('.json'));
+      // Dot files are bookkeeping (.lanes.json), not orders.
+      return readdirSync(this.dir).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
     } catch {
       return [];
     }
@@ -344,10 +411,19 @@ export class OrderStore {
  * parameterId — the ECiQ's and VITROS's "Numeric" services — therefore share
  * one bucket per code, which is what they had before and all that can be told
  * apart about them.
+ *
+ * The LANE leads the key (both HMIS mode, 2026-10): HINAI and GenX each list
+ * the same tube with their own labResultId, and both rows must survive — a
+ * GenX row replacing a HINAI one would read as a re-order and file HINAI's
+ * value against GenX's line. A row with no source belongs to the first lane.
  */
-function rowKey(row: MirthAcknowledgeItem): string {
+function rowKey(row: MirthAcknowledgeItem, defaultLane?: Lane): string {
   const k = codeKey(row.identifier);
-  return k ? `${k}#${row.parameterId ?? ''}` : '';
+  if (!k) return '';
+  // A quarantined row (lane unknown) never shares a key with a real one, so a
+  // fresh row is stored beside it rather than read as its re-order.
+  const lane = row.quarantined ? 'quarantine' : (row.source ?? defaultLane ?? '');
+  return `${lane}|${k}#${row.parameterId ?? ''}`;
 }
 
 function sameRow(a: MirthAcknowledgeItem, b: MirthAcknowledgeItem): boolean {

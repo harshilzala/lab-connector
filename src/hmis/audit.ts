@@ -22,8 +22,8 @@ import { DailyLogFile } from '../maintenance/daily-log.js';
 //   findstr LB2609020570 logs\hmis-*.log
 // =============================================================================
 
-/** Which of the three endpoints the entry describes. */
-export type HmisAuditKind = 'query' | 'acknowledge' | 'result';
+/** Which endpoint the entry describes (certify: GenX auto-certify only). */
+export type HmisAuditKind = 'query' | 'acknowledge' | 'result' | 'certify';
 
 /**
  * The verdict, judged on the response BODY:

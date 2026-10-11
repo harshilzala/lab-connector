@@ -22,8 +22,18 @@
 // Run: npx tsx test/auto-certify.test.ts
 // =============================================================================
 import assert from 'node:assert/strict';
-import { AutoCertifyService, type CertifyTransport } from '../src/autocertify/service.js';
-import { buildAllParametersQuery, buildBlockingParametersQuery, buildResultsQuery, isYes, type CertifyCandidate, type CertifySource } from '../src/autocertify/source.js';
+import { AutoCertifyService, portalVerdict, type CertifyTransport } from '../src/autocertify/service.js';
+import {
+  buildAllParametersBatchQuery,
+  buildAllParametersQuery,
+  buildBlockingParametersBatchQuery,
+  buildBlockingParametersQuery,
+  buildResultsQuery,
+  chunks,
+  isYes,
+  type CertifyCandidate,
+  type CertifySource,
+} from '../src/autocertify/source.js';
 import type { AutoCertifyConfig } from '../src/config.js';
 import { logger } from '../src/logger.js';
 
@@ -53,6 +63,8 @@ function cfg(over: Partial<AutoCertifyConfig> = {}): AutoCertifyConfig {
     oracle: { user: 'u', password: 'p', connectString: 'h:1/s' },
     logFile: null,
     historySize: 300,
+    concurrency: 1,
+    skipRecertifyHours: 24,
     ...over,
   };
 }
@@ -335,6 +347,186 @@ await check('Auto-Certify-only mode: no analyzers and no hmis block', async () =
     }),
   );
   assert.throws(() => loadConfig(file), /hmis\.baseUrl: required when analyzers are configured/);
+});
+
+// -----------------------------------------------------------------------------
+// Improvements over the old service, each taken from its own logs (Jun-Oct 2026).
+console.log('\nimprovements');
+
+await check('portal verdict: HTTP 200 with "Statue":"Fail" is NOT certified', () => {
+  assert.equal(portalVerdict(200, '{"Statue":"Success"}'), true);
+  assert.equal(portalVerdict(200, '{"Statue":"Fail","Error":"Object of class [com.his.lab.domain.LabResult] with identifier [1]: optimistic locking failed"}'), false);
+  assert.equal(portalVerdict(200, '{"Statue":"FAIL"}'), false, 'any case');
+  assert.equal(portalVerdict(200, '{"status":"success"}'), true, '"status" and lower case are accepted too');
+  assert.equal(portalVerdict(200, '{"Status":"Error"}'), false);
+  assert.equal(portalVerdict(200, 'ok'), true, 'not JSON: the HTTP status decides, as before');
+  assert.equal(portalVerdict(200, '{}'), true, 'no status field: the HTTP status decides');
+  assert.equal(portalVerdict(500, '{"Statue":"Success"}'), false, 'never certified on a non-2xx');
+});
+
+await check('a "Statue":"Fail" call counts as failed and is called again next run', async () => {
+  const source = new FakeSource([candidate('1', false)], {});
+  let answers = 0;
+  const portal = new FakePortal(() =>
+    ++answers === 1 ? { status: 200, body: '{"Statue":"Fail","Error":"optimistic locking failed"}' } : { status: 200, body: '{"Statue":"Success"}' },
+  );
+  const svc = new AutoCertifyService(cfg(), silent, { source: () => source, transport: portal });
+  const first = await svc.runNow();
+  assert.deepEqual([first.certified, first.failed], [0, 1]);
+  assert.equal(svc.history()[0]!.ok, false);
+  const second = await svc.runNow();
+  assert.deepEqual([second.certified, second.failed], [1, 0], 'retried on the next run and certified');
+  assert.equal(portal.calls.length, 2);
+});
+
+await check('a row the portal confirmed is not called again within skipRecertifyHours', async () => {
+  // The database keeps listing the same result and parameters as ready.
+  const source = new FakeSource([candidate('10', false), candidate('20', true)], { '20': ['201', '202'] });
+  const portal = new FakePortal(() => ({ status: 200, body: '{"Statue":"Success"}' }));
+  const svc = new AutoCertifyService(cfg(), silent, { source: () => source, transport: portal });
+  const first = await svc.runNow();
+  assert.deepEqual([first.certified, first.skipped], [3, 0]);
+  const second = await svc.runNow();
+  assert.equal(portal.calls.length, 3, 'nothing called again');
+  assert.deepEqual([second.found, second.certified, second.skipped], [2, 0, 3]);
+
+  const off = new AutoCertifyService(cfg({ skipRecertifyHours: 0 }), silent, {
+    source: () => source,
+    transport: new FakePortal(() => ({ status: 200, body: '{"Statue":"Success"}' })),
+  });
+  await off.runNow();
+  const again = await off.runNow();
+  assert.deepEqual([again.certified, again.skipped], [3, 0], '0 = called every run, as the old service did');
+});
+
+await check('a failed call is never remembered as confirmed', async () => {
+  const source = new FakeSource([candidate('1', false)], {});
+  const portal = new FakePortal(() => ({ status: 503, body: 'down' }));
+  const svc = new AutoCertifyService(cfg(), silent, { source: () => source, transport: portal });
+  await svc.runNow();
+  const second = await svc.runNow();
+  assert.equal(second.skipped, 0);
+  assert.equal(portal.calls.length, 2, 'the failure is tried again');
+});
+
+/** A source with the batched lookups; counts every database round trip. */
+class BatchSource extends FakeSource {
+  trips = { blockingOne: 0, allOne: 0, blockingBatch: 0, allBatch: 0 };
+  constructor(results: CertifyCandidate[], private readonly p: Record<string, string[]>, private readonly b: Record<string, string[]> = {}) {
+    super(results, p, b);
+  }
+  async blockingParameters(id: string) {
+    this.trips.blockingOne++;
+    return this.b[id] ?? [];
+  }
+  async allParameters(id: string) {
+    this.trips.allOne++;
+    return this.p[id] ?? [];
+  }
+  async blockingParametersFor(ids: string[]) {
+    this.trips.blockingBatch++;
+    return new Map(ids.map((id) => [id, this.b[id] ?? []]));
+  }
+  async allParametersFor(ids: string[]) {
+    this.trips.allBatch++;
+    return new Map(ids.map((id) => [id, this.p[id] ?? []]));
+  }
+}
+
+await check('parameter lookups: two round trips for the whole run, same calls as before', async () => {
+  const results: CertifyCandidate[] = [];
+  const params: Record<string, string[]> = {};
+  const blocking: Record<string, string[]> = {};
+  for (let i = 1; i <= 62; i++) {
+    const id = String(1000 + i);
+    results.push(candidate(id, i % 2 === 0));
+    if (i % 2 === 0) params[id] = [`${id}1`, `${id}2`];
+    if (i % 10 === 0) blocking[id] = [`${id}2`];
+  }
+  const batched = new BatchSource(results, params, blocking);
+  const viaBatch = new FakePortal(() => ({ status: 200, body: '{"Statue":"Success"}' }));
+  const runB = await new AutoCertifyService(cfg(), silent, { source: () => batched, transport: viaBatch }).runNow();
+  assert.deepEqual(batched.trips, { blockingOne: 0, allOne: 0, blockingBatch: 1, allBatch: 1 }, '2 round trips instead of ~124');
+
+  // The same run through the old one-result-at-a-time path makes the same calls, in the same order.
+  const viaOne = new FakePortal(() => ({ status: 200, body: '{"Statue":"Success"}' }));
+  const runO = await new AutoCertifyService(cfg(), silent, { source: () => new FakeSource(results, params, blocking), transport: viaOne }).runNow();
+  assert.deepEqual(viaBatch.calls, viaOne.calls);
+  assert.deepEqual([runB.found, runB.certified, runB.waiting], [runO.found, runO.certified, runO.waiting]);
+  assert.equal(runB.waiting, 6, 'results with a parameter still in 1108 wait (every 10th of 62)');
+});
+
+await check('batched SQL: same clauses, the result id widened to an IN list, chunked below 1000', () => {
+  const b = buildBlockingParametersBatchQuery(cfg(), ['1', '2']);
+  assert.match(b.sql, /select distinct LRP\.lab_result_id, LRP\.lab_result_parameter_id/);
+  assert.match(b.sql, /inner join equipmentservice ES on ES\.parameterid = LRP\.parameter_id/);
+  assert.match(b.sql, /LRP\.lab_result_id in \(:r0, :r1\)/);
+  assert.match(b.sql, /ES\.equipmentid in \(:eq0, :eq1\)/);
+  assert.match(b.sql, /LRP\.parameterresultstatus in \(:ps0\)/);
+  assert.deepEqual(b.binds, { r0: '1', r1: '2', eq0: '46150218', eq1: '46150219', ps0: '1108' });
+  const a = buildAllParametersBatchQuery(['7']);
+  assert.match(a.sql, /from labresultparameter LRP where LRP\.lab_result_id in \(:r0\)/);
+  assert.deepEqual(a.binds, { r0: '7' });
+  for (const v of ['46150218', '1108']) assert.ok(!b.sql.includes(v), `${v} leaked into the SQL`);
+  const sizes = chunks(Array.from({ length: 2000 }, (_, i) => i)).map((c) => c.length);
+  assert.deepEqual(sizes, [900, 900, 200]);
+});
+
+await check('concurrency: at most N results at once; a result\'s own parameters never overlap', async () => {
+  const results = Array.from({ length: 12 }, (_, i) => candidate(String(500 + i), i % 3 === 0));
+  const params = Object.fromEntries(results.filter((r) => r.hasParameter).map((r) => [r.labResultId, [`${r.labResultId}a`, `${r.labResultId}b`, `${r.labResultId}c`]]));
+  const owner = new Map<string, string>();
+  for (const [rid, ps] of Object.entries(params)) for (const p of ps) owner.set(p, rid);
+  const measure = async (concurrency: number) => {
+    let inFlight = 0;
+    let max = 0;
+    const busyResults = new Map<string, number>();
+    let overlap = false;
+    const portal: CertifyTransport = {
+      async get(url) {
+        const id = /=(\w+)$/.exec(url)![1]!;
+        const rid = owner.get(id) ?? id;
+        inFlight++;
+        max = Math.max(max, inFlight);
+        busyResults.set(rid, (busyResults.get(rid) ?? 0) + 1);
+        if (busyResults.get(rid)! > 1) overlap = true;
+        await new Promise((r) => setTimeout(r, 5));
+        busyResults.set(rid, busyResults.get(rid)! - 1);
+        inFlight--;
+        return { status: 200, body: '{"Statue":"Success"}' };
+      },
+    };
+    const run = await new AutoCertifyService(cfg({ concurrency }), silent, { source: () => new BatchSource(results, params), transport: portal }).runNow();
+    return { max, overlap, certified: run.certified };
+  };
+  const one = await measure(1);
+  assert.deepEqual([one.max, one.overlap, one.certified], [1, false, 20], 'default: one call at a time, as the old service');
+  const three = await measure(3);
+  assert.equal(three.max, 3, 'three results at once');
+  assert.equal(three.overlap, false, 'never two parameters of one result at the same time');
+  assert.equal(three.certified, 20, 'every row certified once');
+});
+
+await check('schema: concurrency 1 and a 24 h skip by default; concurrency capped at 8', async () => {
+  const { writeFileSync, mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { loadConfig } = await import('../src/config.js');
+  const file = join(mkdtempSync(join(tmpdir(), 'autocert-defaults-')), 'c.json');
+  const ac = {
+    enabled: true,
+    baseUrl: 'http://his.test:8050',
+    siteId: '2',
+    equipmentIds: ['46150218'],
+    resultStatus: ['303'],
+    parameterResultStatus: ['1108'],
+    oracle: { user: 'u', password: 'p', connectString: 'h:1/s' },
+  };
+  writeFileSync(file, JSON.stringify({ autoCertify: ac }));
+  const c = loadConfig(file).autoCertify;
+  assert.deepEqual([c.concurrency, c.skipRecertifyHours], [1, 24]);
+  writeFileSync(file, JSON.stringify({ autoCertify: { ...ac, concurrency: 9 } }));
+  assert.throws(() => loadConfig(file), /concurrency/);
 });
 
 console.log(`\n${checks} checks passed\n`);

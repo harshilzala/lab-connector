@@ -29,6 +29,9 @@ const el = (id: string) => {
     // an element and starts inventing one that cannot exist.
     dataset: {} as Record<string, string>,
     addEventListener: () => {},
+    // snapInner/restoreInner look for scrolled <pre> blocks inside the panel
+    // before and after each refresh; the stub panel has none.
+    querySelectorAll: () => [] as unknown[],
     scrollTop: 0,
     scrollHeight: 0,
     _classes: classes,

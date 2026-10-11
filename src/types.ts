@@ -142,6 +142,22 @@ export interface MirthAcknowledgeItem {
    *  row plus a remembered parameterId, rather than HMIS offering it. See
    *  orders/parameters.ts. */
   synthesized?: boolean;
+  /** The HMIS lane (hinai | genx) this row came from — see src/hmis/lanes.ts.
+   *  Connector-side only, like resultType: it never reaches a gateway's wire
+   *  body. A row stored before lanes existed has none until the one-time
+   *  migration at the first start (src/orders/store.ts migrateLanes); null =
+   *  quarantined there, lane unknown. */
+  source?: 'hinai' | 'genx' | null;
+  /** Tagged by that migration, not by a gateway response — never backs a
+   *  GenX auto-certify. */
+  migrated?: boolean;
+  /** Lane unknown (written by the old code, first started in both mode):
+   *  kept on disk, never used to file, acknowledge, certify, force or fill. */
+  quarantined?: boolean;
+  /** GenX only: EVERY analyzer code this row's result line (labResultId =
+   *  GenX sampleLineId) expands to, taken before any de-duplication or
+   *  interface filter — what auto-certify requires filed (addendum D1). */
+  lineCodes?: string[];
 }
 
 /** Pending rows for one barcode, collapsed into a single downloadable order. */
@@ -154,6 +170,9 @@ export interface PendingOrders {
   specimenType: string | null;
   /** The rows behind this order, ready to POST once the download succeeds. */
   ackItems: MirthAcknowledgeItem[];
+  /** The patient each HMIS lane gives for the tube (both mode compares
+   *  them). Set only when the rows were fetched for a named lane. */
+  patients?: Partial<Record<'hinai' | 'genx', PatientDemographics | null>>;
 }
 
 // POST {resultsPath}
@@ -241,4 +260,8 @@ export interface HmisResultUploadResponse {
   }>;
   /** Convenience: `successData.length`. */
   filed: number;
+  /** GenX only: machine codes (upper-cased) GenX could not place although it
+   *  filed others. Those values are NOT filed (addendum D2). HINAI never sets
+   *  it. */
+  unmatched?: string[];
 }

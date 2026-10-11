@@ -244,6 +244,7 @@ function renderLastRun(s) {
       kv('Certified', '<span style="color:var(--ok)">' + esc(lr.certified) + '</span>') +
       kv('Failed', lr.failed ? '<span style="color:var(--bad)">' + esc(lr.failed) + '</span>' : '0') +
       kv('Waiting on the analyzer', '<span title="Parameters still in a parameter result status. Checked again on the next run.">' + esc(lr.waiting) + '</span>') +
+      (lr.skipped ? kv('Already confirmed, not called again', '<span title="The portal confirmed these within the skip window, but the database still lists them as ready.">' + esc(lr.skipped) + '</span>') : '') +
       (lr.error ? kv('Error', '<span style="color:var(--bad)">' + esc(lr.error) + '</span>') : '')
     : '<div class="empty">' + (s.enabled ? 'The first run starts a few seconds after the connector starts.' : 'Auto Certify is disabled.') + '</div>';
 
@@ -269,6 +270,8 @@ function renderSettings(s) {
     kv('Parameter result status', chips(c.parameterResultStatus)) +
     kv('Accepted within', 'today + ' + esc(c.lookbackDays) + ' previous day' + (c.lookbackDays === 1 ? '' : 's')) +
     kv('Department must have HOD', c.requireHod ? 'yes' : 'no') +
+    kv('Results certified at once', esc(c.concurrency ?? 1)) +
+    kv('Confirmed rows not re-called for', c.skipRecertifyHours ? esc(c.skipRecertifyHours) + ' h' : 'off (called every run)') +
     kv('Log file', '<span class="mono">' + esc(c.logFile || 'off') + '</span>');
 }
 
@@ -306,11 +309,38 @@ function orderCard(m) {
       kv('No answer / link lost', o.failed ? '<span style="color:var(--bad)">' + esc(o.failed) + '</span>' : '0') +
       kv('Last order sent', o.lastSentAt ? ago(o.lastSentAt) + ' <span class="mono">' + esc(o.lastSentBarcode) + '</span>' : '<span class="mut">none since start</span>') +
       (o.linkError ? kv('Link error', '<span class="chan-err">' + esc(o.linkError) + '</span>') : '') +
-      (o.lastError ? kv('Last problem', '<span class="chan-err">' + esc(o.lastError) + '</span> <span class="mut">' + esc(time(o.lastErrorAt)) + '</span>') : '');
+      (o.lastError ? kv('Last problem', '<span class="chan-err">' + esc(o.lastError) + '</span> <span class="mut">' + esc(time(o.lastErrorAt)) + '</span>') : '') +
+      (m.results ? '' : hmisRows(m)); // no result card to carry it
     note = 'The connector dials IM. An order counts as sent only when IM answers <code>MSA|AA</code>.';
   }
   return '<div class="card"><div class="card-head"><span class="dir out">out</span><h2>Order channel</h2><span class="note">orders sent to IM</span>' + linkPill(o) + '</div>' +
     '<div class="card-body">' + body + '</div><div class="chan-note">' + note + '</div></div>';
+}
+// Where IM's results are filed: HINAI, GenX, or both side by side. The API
+// sends lane names only ("hinai" / "genx"); they are spelled here.
+function laneName(l) { return l === 'genx' ? 'GenX' : l === 'hinai' ? 'HINAI' : String(l || ''); }
+function hmisRows(m) {
+  const h = m && m.hmis;
+  if (!h) return '';
+  const lanes = h.lanes || [];
+  let out = kv('HMIS', esc(lanes.map(l => laneName(l.lane)).join(' + ') + (h.mode === 'both' ? ' (both)' : '')));
+  for (const l of lanes) {
+    out += kv('Values filed to ' + esc(laneName(l.lane)),
+      '<span style="color:var(--ok)">' + esc(l.filed) + '</span>' +
+      (l.waiting ? ' <span class="mut">&middot; ' + esc(l.waiting) + ' waiting</span>' : '') +
+      (l.skipped ? ' <span class="mut">&middot; ' + esc(l.skipped) + ' skipped by operator</span>' : ''));
+    if (!l.ok) out += kv(esc(laneName(l.lane)) + ' order poll', '<span class="chan-err">' + esc(l.lastError) + '</span>');
+  }
+  if (h.mode === 'both') {
+    out += kv('Held &mdash; order in one HMIS only', h.held ? '<span style="color:var(--warn)">' + esc(h.held) + '</span>' : '0');
+  }
+  const c = h.certify;
+  if (c && c.enabled) {
+    out += kv('GenX lines auto-certified', '<span style="color:var(--ok)">' + esc(c.certified) + '</span>' + (c.lastCertifiedAt ? ' <span class="mut">last ' + ago(c.lastCertifiedAt) + '</span>' : ''));
+    out += kv('GenX certify failed', c.failed ? '<span style="color:var(--bad)">' + esc(c.failed) + '</span>' : '0');
+    if (c.lastError) out += kv('Last certify problem', '<span class="chan-err">' + esc(c.lastError) + '</span> <span class="mut">' + esc(time(c.lastErrorAt)) + '</span>');
+  }
+  return out;
 }
 function resultCard(m) {
   const r = m && m.results;
@@ -327,7 +357,8 @@ function resultCard(m) {
       kv('Result messages received', esc(r.messages)) +
       kv('Values inside them', esc(r.values)) +
       kv('Last result received', r.lastReceivedAt ? ago(r.lastReceivedAt) + ' <span class="mono">' + esc(r.lastReceivedBarcode) + '</span>' : '<span class="mut">none since start</span>') +
-      (r.linkError ? kv('Link error', '<span class="chan-err">' + esc(r.linkError) + '</span>') : '');
+      (r.linkError ? kv('Link error', '<span class="chan-err">' + esc(r.linkError) + '</span>') : '') +
+      hmisRows(m);
     note = 'IM dials the connector. Each result is joined to the order that went out and filed in HMIS.';
   }
   return '<div class="card"><div class="card-head"><span class="dir in">in</span><h2>Result channel</h2><span class="note">orders received back with results</span>' + linkPill(r) + '</div>' +
