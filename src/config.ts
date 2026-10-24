@@ -176,7 +176,7 @@ const Hl7Options = z.object({
       /** No MSA within this long = the order did not go; it is retried. */
       ackTimeoutMs: z.number().int().min(1000).default(15000),
     })
-    .default({}),
+    .prefault({}),
 });
 
 /** Lifotronic GH900 Plus HbA1c analyzer — see src/codec/gh900. */
@@ -316,7 +316,7 @@ const AnalyzerSchema = z.object({
        *  keeps the rest of the panel downloadable. Exact after trim/upper-case. */
       excludeTestCodes: z.array(z.string().min(1)).default([]),
     })
-    .default({}),
+    .prefault({}),
   /** Recognising a control/QC run so it is not filed as a patient result.
    *  Two independent tests, either of which marks the sample as QC:
    *    - sampleIdPrefixes / sampleIdRegex: a DENY list — the id looks like a
@@ -337,14 +337,14 @@ const AnalyzerSchema = z.object({
        *  with no order row, so filing it only produces retry churn. */
       upload: z.boolean().default(false),
     })
-    .default({}),
+    .prefault({}),
   /** Analyzer assay code → HMIS `eqIdntifier`, for analytes the two systems
    *  NAME differently (H360 "HGB" vs ZHFC03 "HAEMOGLOBIN"). Only consulted when
    *  the analyzer's own code matches no pending row, so it can never shadow a
    *  code that already works. Prefer correcting the Identifier column in HMIS —
    *  this is the escape hatch when the parameter is named after the report
    *  line rather than the instrument. */
-  testCodeAliases: z.record(z.string()).default({}),
+  testCodeAliases: z.record(z.string(), z.string()).default({}),
   /** HMIS `eqIdntifier` → the code the INSTRUMENT wants to see in an order
    *  download, for analyzers whose order vocabulary differs from their result
    *  vocabulary. The aliased code is sent IN ADDITION to the HMIS one, so a
@@ -356,7 +356,7 @@ const AnalyzerSchema = z.object({
    *  from 2026-09-18 15:27 to 2026-09-19, U-WAM host log). Case-insensitive
    *  on the HMIS side. A list sends every spelling in it — for an item whose
    *  order code is not yet known, so the candidates can be tried on one tube. */
-  downloadCodeAliases: z.record(z.union([z.string(), z.array(z.string())])).default({}),
+  downloadCodeAliases: z.record(z.string(), z.union([z.string(), z.array(z.string())])).default({}),
   /** HMIS `eqIdntifier` values this analyzer must NEVER file into, even when
    *  the instrument's own code is spelled exactly the same. For an HMIS
    *  service that carries both "WBC COUNT" and a smear-review row named "WBC"
@@ -432,7 +432,7 @@ const AnalyzerSchema = z.object({
    *  "*" wildcards, because a wrong factor silently files a wrong number on a
    *  patient's report, and a wildcard makes it easy to hit an analyte that was
    *  already in the right unit. */
-  testCodeScale: z.record(z.number().finite().positive()).default({}),
+  testCodeScale: z.record(z.string(), z.number().finite().positive()).default({}),
   /** Instrument value → the value HMIS is sent, per assay code, for the
    *  qualitative results a lab reports as WORDS. The Sysmex U-WAM's strip
    *  pads arrive as "-", "+-", "1+" … while the report says "Absent",
@@ -444,7 +444,7 @@ const AnalyzerSchema = z.object({
    *  listed passes through unchanged ("1+" stays "1+"). Applied at delivery
    *  time, like testCodeAliases, so a corrected map also repairs results
    *  already waiting in the spool. */
-  testValueMap: z.record(z.record(z.string())).default({}),
+  testValueMap: z.record(z.string(), z.record(z.string(), z.string())).default({}),
   /** Decimal places a numeric value is ROUNDED to before filing, per assay
    *  code, for the parameters the lab reports as whole numbers. The Sysmex
    *  UF-4000 sends the epithelial cell counts in /HPF with one decimal
@@ -453,7 +453,7 @@ const AnalyzerSchema = z.object({
    *  (0.5 → 1). Only a strictly numeric value is touched; a flag or a "<0.1"
    *  files unchanged. Applied after unit scaling and before the word map, at
    *  delivery time like the others. Exact, case-insensitive code match. */
-  testCodeDecimals: z.record(z.number().int().min(0).max(6)).default({}),
+  testCodeDecimals: z.record(z.string(), z.number().int().min(0).max(6)).default({}),
   /** Rebuild the order rows HMIS has stopped offering, so a result can still be
    *  filed against the parameter it belongs to.
    *
@@ -578,14 +578,14 @@ const AnalyzerSchema = z.object({
             .nullable()
             .default(10 * 60_000),
         })
-        .default({}),
+        .prefault({}),
     })
-    .default({}),
-  astm: AstmOptions.default({}),
-  abl9: Abl9Options.default({}),
-  kermit: KermitOptions.default({}),
-  hl7: Hl7Options.default({}),
-  gh900: Gh900Options.default({}),
+    .prefault({}),
+  astm: AstmOptions.prefault({}),
+  abl9: Abl9Options.prefault({}),
+  kermit: KermitOptions.prefault({}),
+  hl7: Hl7Options.prefault({}),
+  gh900: Gh900Options.prefault({}),
 });
 
 // Oracle ids are NUMBER columns. Only digits are accepted, because every one of
@@ -658,7 +658,7 @@ const AutoCertifySchema = z
      *  once per row. 0 = call again every run, as the old service did. */
     skipRecertifyHours: z.number().min(0).max(168).default(24),
   })
-  .default({})
+  .prefault({})
   .superRefine((c, ctx) => {
     if (!c.enabled) return;
     const need = (ok: unknown, path: string, message: string) => {
@@ -763,9 +763,9 @@ const ConfigSchema = z.object({
         /** The worklist field printed on the tube as its barcode. */
         barcodeField: z.enum(['sampleNumber', 'accessionNumber']).default('sampleNumber'),
         /** GenX serviceCode → the analyzer assay codes reported under it. */
-        serviceTests: z.record(z.array(z.string())).default({}),
+        serviceTests: z.record(z.string(), z.array(z.string())).default({}),
         /** equipmentCode → the serviceCodes that machine runs (unlisted = all). */
-        equipmentServices: z.record(z.array(z.string())).default({}),
+        equipmentServices: z.record(z.string(), z.array(z.string())).default({}),
         pendingLineStatuses: z.array(z.string()).default(['PENDING']),
         batchDays: z.number().int().nonnegative().default(1),
         batchPageSize: z.number().int().positive().max(500).default(200),
@@ -784,8 +784,8 @@ const ConfigSchema = z.object({
         autoCertifyMethod: z.enum(['GET', 'POST']).default('GET'),
         autoCertifyParam: z.string().min(1).default('labresultid'),
       })
-      .default({}),
-  }).default({}),
+      .prefault({}),
+  }).prefault({}),
   /** Housekeeping: how long logs and unfiled spool items are kept on disk. */
   retention: z
     .object({

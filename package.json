@@ -64,7 +64,7 @@
   },
   "dependencies": {
     "pino": "^9.5.0",
-    "zod": "^3.23.8"
+    "zod": "^4.6.7"
   },
   "optionalDependencies": {
     "oracledb": "^6.10.0",
@@ -79,6 +79,7 @@
   },
   "allowScripts": {
     "@serialport/bindings-cpp@12.0.1": true,
-    "esbuild@0.28.1": true
+    "esbuild@0.28.1": true,
+    "oracledb@6.10.0": true
   }
 }
