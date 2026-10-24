@@ -213,7 +213,9 @@ const newSpool = (name: string) => {
 };
 
 // ---- what the OLD code wrote (git show HEAD:src/orders/store.ts / src/results/store.ts) ----
-const T0 = '2026-10-10T08:00:00.000Z';
+// Relative to now: a fixed date ages past retention.days and the runtime's
+// start-up sweep discards the old-code spool before the checks look at it.
+const T0 = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 function writeOldOrder(spool: string, barcode: string, rows: Array<[string, number]>) {
   const dir = join(spool, 'chem', 'orders');
   mkdirSync(dir, { recursive: true });
