@@ -244,6 +244,11 @@ export interface LisInboundResultRow {
   isLoaded: boolean;
   uniqueIdentifier: string;
   parameterId: number | null;
+  /** The analyzer's unit for the value, when it sent one and no unit
+   *  conversion was applied. Sent only by Tatva v1; never on the HINAI wire. */
+  unit?: string;
+  /** The analyzer's abnormal flag ("H", "L", "N" …). Tatva v1 only. */
+  abnormalFlag?: string;
 }
 
 /** The gateway's envelope. NOTE: it answers HTTP 200 even on failure — the

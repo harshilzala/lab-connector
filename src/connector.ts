@@ -4,6 +4,8 @@ import { lanesFor, type AppConfig } from './config.js';
 import type { Logger } from './logger.js';
 import { HmisClient } from './hmis/client.js';
 import { GenxHmisClient } from './hmis/genx.js';
+import { ResultRoutedGateway, TATVA_LABEL, makeTatvaClient, tatvaClientOptions, tatvaEquipmentOptions, tatvaTls, type ResultSink } from './hmis/tatva.js';
+import { TatvaEquipmentClient } from './hmis/tatva-equipment.js';
 import { HmisAudit } from './hmis/audit.js';
 import { RetentionSweeper } from './maintenance/retention.js';
 import { AnalyzerRuntime, type LaneGateways } from './session/orchestrator.js';
@@ -20,6 +22,10 @@ export class Connector implements AdminBackend {
   private readonly runtimes = new Map<string, AnalyzerRuntime>();
   /** GenX's audit file when GenX is in use (for the start-up line). */
   private readonly genxAuditFile: string | null;
+  /** Tatva v1's audit file while it takes the HINAI lane's results. */
+  private tatvaAuditFile: string | null = null;
+  /** True while HINAI-lane results are posted to Tatva v1 (hmis.tatva). */
+  private readonly tatvaResults: boolean;
   private readonly admin: AdminServer;
   private readonly auth: AuthStore;
   /** Absent when retention.days is 0 — the sweep is then switched off. */
@@ -41,6 +47,7 @@ export class Connector implements AdminBackend {
     this.lanesInUse = LANES.filter((l) => [...perAnalyzer.values()].some((ls) => ls.includes(l)));
     const usesHinai = this.lanesInUse.includes('hinai');
     const usesGenx = this.lanesInUse.includes('genx');
+    this.tatvaResults = usesHinai && cfg.hmis.tatva.enabled;
 
     // Separate from the application log on purpose: this one is the evidence
     // trail for "did HMIS actually take it?", and stays greppable by barcode.
@@ -102,6 +109,12 @@ export class Connector implements AdminBackend {
       });
     }
 
+    // Tatva v1 (post-only rollout): the HINAI lane keeps its orders and posts
+    // its results to Tatva v1 instead of /mirth results — single and both
+    // (twin) mode alike. "oauth": one shared client; "equipment": one client
+    // per machine, with that machine's own credential.
+    const tatvaSinkFor = this.tatvaResults ? this.buildTatva(cfg, logger, openAudit) : null;
+
     const spoolRoot = resolve(cfg.spoolDir);
     for (const a of cfg.analyzers) {
       // Wire frames go to logs/wire-<id>-YYYY-MM-DD.log beside the HMIS
@@ -112,6 +125,9 @@ export class Connector implements AdminBackend {
       // Each runtime gets the gateways of ITS lanes only.
       const own: LaneGateways = {};
       for (const l of perAnalyzer.get(a.id) ?? []) own[l] = gateways[l];
+      if (tatvaSinkFor && own.hinai) {
+        own.hinai = new ResultRoutedGateway(own.hinai, tatvaSinkFor(a), cfg.hmis.tatva.acknowledge);
+      }
       this.runtimes.set(a.id, new AnalyzerRuntime(a, own, spoolRoot, logger, wireLogFile, cfg.retention.days || 7, cfg.hmis.patientCheck !== false));
     }
 
@@ -189,6 +205,7 @@ export class Connector implements AdminBackend {
         ...(this.lanesInUse.length > 1 ? { hmisLanes: describeLanes(this.lanesInUse) } : {}),
         hmisLog: this.lanesInUse.includes('hinai') ? dayLog(this.cfg.hmis.auditLog) : dayLog(this.genxAuditFile),
         ...(this.lanesInUse.length > 1 ? { hmisGenxLog: dayLog(this.genxAuditFile) } : {}),
+        ...(this.tatvaResults ? { hinaiResultsTo: TATVA_LABEL, hmisTatva: this.cfg.hmis.tatva.baseUrl, hmisTatvaLog: dayLog(this.tatvaAuditFile) } : {}),
         wireLogs: `${this.cfg.retention.logDir}/wire-<analyzer>-YYYY-MM-DD.log`,
         retentionDays: this.cfg.retention.days || 'disabled',
         logRetentionDays: this.cfg.retention.days ? this.cfg.retention.logDays : 'disabled',
@@ -250,6 +267,39 @@ export class Connector implements AdminBackend {
 
   staged(id: string) {
     return this.runtimes.get(id)?.stagedSummaries() ?? null;
+  }
+
+  /** Tatva v1 result clients: returns, per analyzer, where its results go. */
+  private buildTatva(
+    cfg: AppConfig,
+    logger: Logger,
+    openAudit: (file: string | null, mod: string) => HmisAudit | undefined,
+  ): (a: AppConfig['analyzers'][number]) => ResultSink {
+    const t = cfg.hmis.tatva;
+    const settings = { ...t, accessionCacheFile: t.accessionCacheFile ? resolve(t.accessionCacheFile) : null };
+    const log = logger.child({ mod: 'hmis-tatva' });
+    const audit = openAudit(t.auditLog, 'hmis-tatva-audit');
+    this.tatvaAuditFile = t.auditLog ?? null;
+
+    logger.warn(
+      { baseUrl: t.baseUrl, auth: t.auth, acknowledge: t.acknowledge, mTLS: !!tatvaTls(settings) },
+      `HINAI results are posted to ${TATVA_LABEL} — /mirth results is NOT called; orders still come from HINAI`,
+    );
+
+    if (t.auth === 'equipment') {
+      return (a) =>
+        new TatvaEquipmentClient(
+          tatvaEquipmentOptions(
+            settings,
+            { equipmentId: a.tatva?.equipmentId ?? '', equipmentSecret: a.tatva?.equipmentSecret ?? '' },
+            { timeoutMs: cfg.hmis.timeoutMs, logger: log.child({ analyzer: a.id }), audit },
+          ),
+        );
+    }
+    const shared = makeTatvaClient(
+      tatvaClientOptions(settings, { timeoutMs: cfg.hmis.timeoutMs, tlsRejectUnauthorized: cfg.hmis.tlsRejectUnauthorized, logger: log, audit }),
+    );
+    return () => shared;
   }
 
   ordersView(id: string) {

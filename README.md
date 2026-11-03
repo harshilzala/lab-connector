@@ -789,6 +789,63 @@ system's tests go out later as a delta, once it answers again. A tube known so
 far only to the system that is up is held for filing until the other one lists
 it (see the hold rule).
 
+## Tatva v1: results to the ZyHos partner API (post-only)
+
+`hmis.tatva` configures the ZyHos HMIS partner Lab Middleware API (contract
+v3.1, the `ZyHos-Preprod-Lab-Middleware` Postman collection). It uses the GenX
+library (`src/hmis/genx.ts`), because the wire contract is the same: OAuth
+`client_credentials`, the `{ success, data: { data } }` envelope,
+`Idempotency-Key`, and `machineTestCode` results answered with `filed` and
+`unmatched`. Only the defaults differ (`/oauth/token`, credentials in the form
+body, `/external/v1`, `X-Api-Key`). Also, codes listed under `outOfRange` count
+as **not filed**.
+
+For now the integration is **post-only**. The new system and HINAI share a synced
+database, so with `"enabled": true`:
+
+- every analyzer on the **HINAI lane** keeps getting its orders from HINAI
+  (pending poll, downloads, joins, labResultIds), and that applies in single
+  mode and in both (twin) mode alike;
+- its **result POST** goes to `{apiPrefix}/lab/equipment/results` instead of
+  `/mirth/labresult`, so HINAI's results endpoint is no longer called;
+- the acknowledge after filing stays on HINAI (`"acknowledge": "orders"`).
+  It can be moved to Tatva v1 (`"tatva"`) or switched `"off"`;
+- the GenX lane is untouched. In both mode the hold rule still requires the
+  order in HINAI and GenX before a tube is filed to either.
+
+The tube barcode is taken as the new system's `sampleNumber`. Its
+`accessionNumber` is looked up once on the worklist (`?barcode=`), which needs
+`lab.equipment.worklist.read`, and cached in `spool/tatva-accessions.json`. Set
+`"barcodeField": "accessionNumber"` to send the barcode as-is with no lookup.
+A value that Tatva v1 lists as `unmatched` or `outOfRange` stays pending
+and is retried, just like GenX. Every call is logged in
+`logs/hmis-tatva-YYYY-MM-DD.log`. To go back, set `"enabled": false` and
+restart. Results return to `/mirth/labresult` and nothing else changes.
+
+**Two ways to authenticate** (`hmis.tatva.auth`). Use one per machine; the
+contract does not allow mixing them.
+
+- `"oauth"`: the partner API. One `clientId`/`clientSecret` for the whole
+  connector, results to `{apiPrefix}/lab/equipment/results`, as described above.
+- `"equipment"`: the Mirth-compatibility API. Each machine has its own
+  `X-Equipment-ID` / `X-Equipment-Secret` pair, issued once under Analyser
+  Interface → rotate key and written in that analyzer's `"tatva": {
+  "equipmentId", "equipmentSecret" }` block. Results go to
+  `/diagnostic-service/mirth/labresult` with the tube barcode as `sampleId`,
+  so no lookup is needed. A `status: "success"` reply is not taken on trust:
+  `filed` is compared with the number of values sent, and any code the message
+  names as `unmapped` or `Outside the reportable range` stays pending. Start-up
+  is refused if a machine on the HINAI lane has no credential.
+
+Both modes send each value's unit and abnormal flag (`sendUnitAndFlag`). They
+can also send the optional `X-Facility-ID` / `X-Organization-ID` headers and
+present a client certificate (`tls.certFile` / `keyFile`) if mTLS is switched
+on. Every setting can be overridden from the environment with `TATVA_*`
+variables, listed in `.env.example`. Per-machine credentials use
+`TATVA_EQUIPMENT_ID_<ID>` / `TATVA_EQUIPMENT_SECRET_<ID>`.
+
+Run `npm run tatva` for the stub-server test.
+
 ## Result filing: queue or staged
 
 Each analyzer chooses how its results reach HMIS with `filing.mode`:

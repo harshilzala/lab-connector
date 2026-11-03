@@ -339,7 +339,9 @@ export class StagedFiler {
         // GenX: only what it placed is filed (D2), each with its line's code
         // list (D1). HINAI never reports `unmatched`: its rows go as before. A
         // value replaced while the post was in flight stays pending (D6).
-        const filed = this.deps.lane === 'genx' ? genxFiled(joined.filedCodes, rows, res.unmatched) : joined.filedCodes;
+        // Tatva v1 posting for the HINAI lane answers `unmatched` the same
+        // way, so whenever the gateway names unplaced codes they stay pending.
+        const filed = this.deps.lane === 'genx' || res.unmatched?.length ? genxFiled(joined.filedCodes, rows, res.unmatched) : joined.filedCodes;
         store.markFiled(barcode, filed as typeof joined.filedCodes, undefined, this.deps.lane, snapshotOf(sample));
         log.info(
           { barcode, filed: res.filed, sent: joined.rows.length, stillWaiting: joined.unmatched, message: res.message, reason },
@@ -567,7 +569,7 @@ export class StagedFiler {
         );
         continue;
       }
-      const filed = lane === 'genx' ? genxFiled(joined.filedCodes, laneRows, res.unmatched) : joined.filedCodes;
+      const filed = lane === 'genx' || res.unmatched?.length ? genxFiled(joined.filedCodes, laneRows, res.unmatched) : joined.filedCodes;
       store.markLaneFiled(barcode, lane, filed, names, undefined, { expect: snapshot });
       filedAny = true;
       log.info(

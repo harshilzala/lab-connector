@@ -625,6 +625,9 @@ export function toLisResultRows(
       isLoaded: false,
       uniqueIdentifier: ctx.identifier,
       parameterId: ctx.parameterId,
+      // A converted value no longer has the analyzer's unit, so it is not sent.
+      ...(r.unit && factor === undefined ? { unit: r.unit } : {}),
+      ...(r.abnormalFlag ? { abnormalFlag: r.abnormalFlag } : {}),
     });
   }
 

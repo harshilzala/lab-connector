@@ -5,6 +5,7 @@ import type { Logger } from '../logger.js';
 import type { HmisResultUploadResponse, LisInboundResultRow, MirthAcknowledgeItem, MirthPendingRow } from '../types.js';
 import type { HmisAudit, HmisAuditKind, HmisAuditOutcome } from './audit.js';
 import { HmisUnavailableError, type HmisGateway, type PendingQuery } from './client.js';
+import { httpSend, type ClientTls } from './http.js';
 
 // =============================================================================
 // GenX LIMS "Lab Equipment External API" client — the alternative to the
@@ -81,6 +82,21 @@ export interface GenxClientOptions {
   autoCertifyPath?: string;
   autoCertifyMethod?: 'GET' | 'POST';
   autoCertifyParam?: string;
+  /** How errors and log lines name this gateway. Default "GenX"; the Tatva v1
+   *  preset (src/hmis/tatva.ts) reuses this client as "Tatva v1". */
+  label?: string;
+  /** The config block the credentials come from, for the error message. */
+  configBlock?: string;
+  /** Treat the codes a results answer lists under `outOfRange` as NOT filed,
+   *  like `unmatched`. The ZyHos partner contract (Tatva v1) says a value
+   *  outside the reportable range is not saved. Off for GenX, as before. */
+  outOfRangeUnfiled?: boolean;
+  /** Also send each value's `unit` and `flag` (Tatva v1). Off for GenX. */
+  sendUnitAndFlag?: boolean;
+  /** Headers added to every API call (Tatva v1: X-Facility-ID …). */
+  extraHeaders?: Record<string, string>;
+  /** Client certificate for mTLS; null/absent = none. */
+  tls?: ClientTls | null;
 }
 
 interface GenxTest {
@@ -122,8 +138,10 @@ export class GenxHmisClient implements HmisGateway {
   private readonly equipmentServices = new Map<string, Set<string>>();
   private readonly pendingStatuses: Set<string>;
   private readonly unmappedWarned = new Set<string>();
+  private readonly label: string;
 
   constructor(private readonly opts: GenxClientOptions) {
+    this.label = opts.label ?? 'GenX';
     if (!opts.tlsRejectUnauthorized) {
       process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
       opts.logger.warn('TLS certificate verification is DISABLED (tlsRejectUnauthorized=false)');
@@ -136,7 +154,7 @@ export class GenxHmisClient implements HmisGateway {
     this.loadAccessions();
     opts.logger.info(
       { baseUrl: opts.baseUrl, barcodeField: opts.barcodeField, services: this.serviceTests.size },
-      'HMIS api = genx (GenX LIMS Lab Equipment API)',
+      opts.label ? `HMIS api = ${opts.label}` : 'HMIS api = genx (GenX LIMS Lab Equipment API)',
     );
   }
 
@@ -299,7 +317,7 @@ export class GenxHmisClient implements HmisGateway {
       // logged, not thrown — a throw would only re-queue the upload.
       const refused = answered.filter((a) => a.acknowledged === false);
       if (refused.length) {
-        this.opts.logger.warn({ refused }, 'GenX did not acknowledge every tube');
+        this.opts.logger.warn({ refused }, `${this.label} did not acknowledge every tube`);
       }
       this.record({
         kind: 'acknowledge', sampleId: barcodes, eqCode, method: 'POST', path, startedAt,
@@ -336,7 +354,16 @@ export class GenxHmisClient implements HmisGateway {
       let response: unknown = null;
       try {
         const accessionNumber = await this.accessionFor(barcode);
-        const results = tubeRows.map((r) => ({ machineTestCode: r.identifier, value: r.resultValue }));
+        const results = tubeRows.map((r) =>
+          this.opts.sendUnitAndFlag
+            ? {
+                machineTestCode: r.identifier,
+                value: r.resultValue,
+                ...(r.unit ? { unit: r.unit } : {}),
+                ...(r.abnormalFlag ? { flag: r.abnormalFlag } : {}),
+              }
+            : { machineTestCode: r.identifier, value: r.resultValue },
+        );
         // Same content → same key, so a spool retry after a timeout is
         // replayed by GenX rather than filed twice. A corrected value is new
         // content and therefore a new key.
@@ -352,10 +379,13 @@ export class GenxHmisClient implements HmisGateway {
         response = await this.call('POST', path, request, `res-${Date.now()}`, uuidFrom(digest));
         const p = (response ?? {}) as { filed?: unknown; unmatched?: unknown; panics?: unknown; outOfRange?: unknown };
         const filed = Number(p.filed ?? 0);
-        const unmatched = new Set((Array.isArray(p.unmatched) ? p.unmatched : []).map((c) => key(String(c))));
+        const unmatched = new Set((Array.isArray(p.unmatched) ? p.unmatched : []).map((c) => key(codeOfEntry(c))));
+        if (this.opts.outOfRangeUnfiled && Array.isArray(p.outOfRange)) {
+          for (const c of p.outOfRange) unmatched.add(key(codeOfEntry(c)));
+        }
         if (!(filed > 0)) {
           throw new NoneMatched(
-            `GenX ${path} filed 0 of ${results.length} value(s) for ${barcode}` +
+            `${this.label} ${path} filed 0 of ${results.length} value(s) for ${barcode}` +
               (unmatched.size ? ` — unmatched: ${[...unmatched].join(', ')}` : ''),
           );
         }
@@ -363,10 +393,10 @@ export class GenxHmisClient implements HmisGateway {
         if (unmatched.size) {
           this.opts.logger.warn(
             { barcode, accessionNumber, unmatched: [...unmatched] },
-            'GenX could not place these machine codes — set up the machineTestCode mapping in GenX for this equipmentCode',
+            `${this.label} could not place these machine codes (unmapped or outside the reportable range) — check the machineTestCode mapping for this equipmentCode`,
           );
         }
-        if (Array.isArray(p.panics) && p.panics.length) this.opts.logger.warn({ barcode, panics: p.panics }, 'GenX flagged panic values');
+        if (Array.isArray(p.panics) && p.panics.length) this.opts.logger.warn({ barcode, panics: p.panics }, `${this.label} flagged panic values`);
         for (const r of tubeRows) {
           if (unmatched.has(key(r.identifier))) continue;
           successData.push({
@@ -438,7 +468,7 @@ export class GenxHmisClient implements HmisGateway {
     if (this.opts.barcodeField === 'accessionNumber') return barcode;
     await this.fetchByBarcode(barcode).then((tubes) => this.toRows(tubes, barcode, ''));
     const found = this.accessions.get(barcode);
-    if (!found) throw new Error(`GenX has no accessionNumber for tube ${barcode} — the worklist does not know it`);
+    if (!found) throw new Error(`${this.label} has no accessionNumber for tube ${barcode} — the worklist does not know it`);
     return found;
   }
 
@@ -453,6 +483,7 @@ export class GenxHmisClient implements HmisGateway {
   ): Promise<unknown> {
     const token = await this.accessToken();
     const headers: Record<string, string> = {
+      ...this.opts.extraHeaders,
       accept: 'application/json',
       authorization: `Bearer ${token}`,
       'x-correlation-id': `lc-${correlation}`,
@@ -468,17 +499,17 @@ export class GenxHmisClient implements HmisGateway {
       return this.call(method, path, body, correlation, idempotencyKey, true);
     }
     if (status === 401 || status === 403) {
-      throw new HmisUnavailableError(`GenX ${method} ${path} -> HTTP ${status}: ${text.slice(0, 300)}`);
+      throw new HmisUnavailableError(`${this.label} ${method} ${path} -> HTTP ${status}: ${text.slice(0, 300)}`);
     }
     if (status < 200 || status >= 300) {
-      const message = `GenX ${method} ${path} -> HTTP ${status}: ${text.slice(0, 300)}`;
+      const message = `${this.label} ${method} ${path} -> HTTP ${status}: ${text.slice(0, 300)}`;
       throw status >= 500 || status === 429 ? new HmisUnavailableError(message) : new Error(message);
     }
     const parsed = parseJson(text);
     const outer = (parsed ?? {}) as { success?: unknown; data?: unknown; message?: unknown };
     const inner = (outer.data ?? {}) as { success?: unknown; data?: unknown; message?: unknown };
     if (outer.success === false || inner.success === false) {
-      throw new Error(`GenX ${method} ${path} refused: ${String(inner.message ?? outer.message ?? 'success=false')}`);
+      throw new Error(`${this.label} ${method} ${path} refused: ${String(inner.message ?? outer.message ?? 'success=false')}`);
     }
     return inner.data ?? null;
   }
@@ -493,7 +524,7 @@ export class GenxHmisClient implements HmisGateway {
 
   private async fetchToken(): Promise<string> {
     if (!this.opts.clientId || !this.opts.clientSecret) {
-      throw new HmisUnavailableError('GenX clientId / clientSecret are not configured (hmis.genx)');
+      throw new HmisUnavailableError(`${this.label} clientId / clientSecret are not configured (${this.opts.configBlock ?? "hmis.genx"})`);
     }
     const form = new URLSearchParams({ grant_type: 'client_credentials' });
     if (this.opts.scope) form.set('scope', this.opts.scope);
@@ -511,11 +542,11 @@ export class GenxHmisClient implements HmisGateway {
     const body = parseJson(text) as { access_token?: string; expires_in?: number } | null;
     if (status < 200 || status >= 300 || !body?.access_token) {
       // Not a verdict on any one result — every call would fail the same way.
-      throw new HmisUnavailableError(`GenX token request -> HTTP ${status}: ${text.slice(0, 300)}`);
+      throw new HmisUnavailableError(`${this.label} token request -> HTTP ${status}: ${text.slice(0, 300)}`);
     }
     const ttl = Math.max(30, Number(body.expires_in ?? 3600) - 60);
     this.token = { value: body.access_token, expiresAt: Date.now() + ttl * 1000 };
-    this.opts.logger.info({ expiresInS: ttl }, 'GenX access token obtained');
+    this.opts.logger.info({ expiresInS: ttl }, `${this.label} access token obtained`);
     return body.access_token;
   }
 
@@ -526,21 +557,16 @@ export class GenxHmisClient implements HmisGateway {
     body?: string,
   ): Promise<{ status: number; text: string }> {
     const url = this.opts.baseUrl.replace(/\/$/, '') + path;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
     try {
-      const res = await fetch(url, { method, headers, body, signal: controller.signal });
-      return { status: res.status, text: await res.text() };
+      return await httpSend(url, { method, headers, body, timeoutMs: this.opts.timeoutMs, tls: this.opts.tls });
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new HmisUnavailableError(`GenX ${method} ${path} -> timed out after ${this.opts.timeoutMs}ms`);
+        throw new HmisUnavailableError(`${this.label} ${method} ${path} -> timed out after ${this.opts.timeoutMs}ms`);
       }
       if (err instanceof TypeError) {
-        throw new HmisUnavailableError(`GenX ${method} ${path} -> ${(err.cause as Error | undefined)?.message ?? err.message}`);
+        throw new HmisUnavailableError(`${this.label} ${method} ${path} -> ${(err.cause as Error | undefined)?.message ?? err.message}`);
       }
       throw err;
-    } finally {
-      clearTimeout(timer);
     }
   }
 
@@ -603,6 +629,15 @@ export class GenxHmisClient implements HmisGateway {
 }
 
 class NoneMatched extends Error {}
+
+/** `unmatched` / `outOfRange` list either bare codes or objects naming one. */
+function codeOfEntry(c: unknown): string {
+  if (c && typeof c === 'object') {
+    const o = c as Record<string, unknown>;
+    return String(o.machineTestCode ?? o.code ?? o.testCode ?? o.identifier ?? '');
+  }
+  return String(c);
+}
 
 function key(v: unknown): string {
   return v === null || v === undefined ? '' : String(v).trim().toUpperCase();

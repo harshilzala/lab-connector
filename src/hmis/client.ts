@@ -278,7 +278,7 @@ export class HmisClient implements HmisGateway {
     let httpStatus: number | null = null;
     let response: unknown = null;
     try {
-      const sent = await this.send('POST', path, JSON.stringify(rows));
+      const sent = await this.send('POST', path, JSON.stringify(rows.map(toResultWire)));
       httpStatus = sent.status;
       const parsed = this.parse(sent.text, path) as Partial<HmisResultUploadResponse> | null;
       response = parsed ?? sent.text;
@@ -422,6 +422,15 @@ export class HmisClient implements HmisGateway {
       return null;
     }
   }
+}
+
+/**
+ * The HINAI results row: everything but the Tatva-only `unit` / `abnormalFlag`,
+ * so the /mirth/* body stays exactly what it has always been.
+ */
+function toResultWire(row: LisInboundResultRow): Omit<LisInboundResultRow, 'unit' | 'abnormalFlag'> {
+  const { unit: _unit, abnormalFlag: _flag, ...wire } = row;
+  return wire;
 }
 
 /**

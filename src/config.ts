@@ -489,6 +489,16 @@ const AnalyzerSchema = z.object({
   /** This analyzer's own HMIS lanes, overriding the top-level `hmis.mode` /
    *  `hmis.use`. Absent = the top-level setting. See src/hmis/lanes.ts. */
   hmis: HmisLaneSetting.optional(),
+  /** Tatva v1 credentials for THIS machine (hmis.tatva.auth "equipment"):
+   *  issued on Analyser Interface → rotate key, shown once. Env
+   *  TATVA_EQUIPMENT_ID_<ID> / TATVA_EQUIPMENT_SECRET_<ID> win, where <ID> is
+   *  the analyzer id upper-cased with "-" as "_" (maglumi → MAGLUMI). */
+  tatva: z
+    .object({
+      equipmentId: z.union([z.string(), z.number()]).transform(String).default(''),
+      equipmentSecret: z.string().default(''),
+    })
+    .optional(),
   /** Certify this analyzer's GenX result lines through GenX's autocertify
    *  endpoint once every value of a line is filed in GenX. Only acts when
    *  GenX is one of the analyzer's lanes. Set by `im.autoCertify.genx`. */
@@ -785,6 +795,73 @@ const ConfigSchema = z.object({
         autoCertifyParam: z.string().min(1).default('labresultid'),
       })
       .prefault({}),
+    /** Tatva v1 — the ZyHos HMIS partner Lab Middleware API (contract v3.1).
+     *  POST-ONLY for now: with `enabled`, every analyzer on the HINAI lane
+     *  (single or both mode) keeps taking its orders from HINAI and posts its
+     *  RESULTS here instead of /mirth/results. Built on the GenX library —
+     *  see src/hmis/tatva.ts. */
+    tatva: z
+      .object({
+        enabled: z.boolean().default(false),
+        /** API profile. Only "tatva-v1" exists today. */
+        profile: z.literal('tatva-v1').default('tatva-v1'),
+        /** "oauth" = partner API, one client_id/secret for the connector;
+         *  "equipment" = Mirth-compatibility API, each analyzer's own
+         *  X-Equipment-ID / X-Equipment-Secret (analyzers[].tatva). Never
+         *  both on one instrument. */
+        auth: z.enum(['oauth', 'equipment']).default('oauth'),
+        /** API origin — NOT the /app staff portal. */
+        baseUrl: z.union([z.string().url(), z.literal('')]).default('https://hmispreprod.zydushospitals.com'),
+        /** "/external/v1" or the alternate "/integration-service/external/v1". */
+        apiPrefix: z.string().default('/external/v1'),
+        tokenPath: z.string().default('/oauth/token'),
+        revokePath: z.string().default('/oauth/revoke'),
+        /** Empty = {apiPrefix}/lab/equipment/<worklist|acknowledge|results>. */
+        worklistPath: z.string().default(''),
+        acknowledgePath: z.string().default(''),
+        resultsPath: z.string().default(''),
+        /** auth "equipment": the Mirth-compatibility endpoints. */
+        equipmentResultsPath: z.string().default('/diagnostic-service/mirth/labresult'),
+        equipmentAcknowledgePath: z.string().default('/diagnostic-service/mirth/acknowledge'),
+        /** Partner OAuth client. Env TATVA_CLIENT_ID / TATVA_CLIENT_SECRET win. */
+        clientId: z.string().default(''),
+        clientSecret: z.string().default(''),
+        scope: z.string().default('lab.equipment.worklist.read lab.equipment.acknowledge lab.equipment.result.publish'),
+        /** The collection sends client_id / client_secret as form fields. */
+        clientAuth: z.enum(['basic', 'body']).default('body'),
+        /** PROD, when issued. Env TATVA_API_KEY wins. */
+        apiKey: z.string().default(''),
+        apiKeyHeader: z.string().default('X-Api-Key'),
+        /** Optional headers X-Facility-ID / X-Organization-ID; empty = not sent.
+         *  Env TATVA_FACILITY_ID / TATVA_ORGANIZATION_ID win. */
+        facilityId: z.union([z.string(), z.number()]).transform(String).default(''),
+        organizationId: z.union([z.string(), z.number()]).transform(String).default(''),
+        /** Send each value's unit and abnormal flag (partner `unit`/`flag`,
+         *  Mirth `unit`/`abnormalFlag`). A unit-converted value has no unit. */
+        sendUnitAndFlag: z.boolean().default(true),
+        /** Client certificate (mTLS) — the contract says acknowledge and results
+         *  "may require mTLS". Empty certFile/keyFile = no certificate. */
+        tls: z
+          .object({
+            certFile: z.string().default(''),
+            keyFile: z.string().default(''),
+            caFile: z.string().default(''),
+            passphrase: z.string().default(''),
+          })
+          .prefault({}),
+        /** What the tube barcode is in the new system. "sampleNumber" = look
+         *  the accessionNumber up once on the worklist (?barcode=, needs
+         *  lab.equipment.worklist.read); "accessionNumber" = send the barcode
+         *  as the accessionNumber, no lookup. */
+        barcodeField: z.enum(['sampleNumber', 'accessionNumber']).default('sampleNumber'),
+        accessionCacheFile: z.string().nullable().default('./spool/tatva-accessions.json'),
+        /** After a post: acknowledge in the system the orders came from
+         *  ("orders" = HINAI, unchanged), in Tatva v1 ("tatva"), or not at all. */
+        acknowledge: z.enum(['orders', 'tatva', 'off']).default('orders'),
+        /** Tatva v1's own transaction log (hmis-tatva-YYYY-MM-DD.log); null = off. */
+        auditLog: z.string().nullable().default('./logs/hmis-tatva.log'),
+      })
+      .prefault({}),
   }).prefault({}),
   /** Housekeeping: how long logs and unfiled spool items are kept on disk. */
   retention: z
@@ -878,6 +955,28 @@ const ConfigSchema = z.object({
           `${codes.join(' / ')} — GenX would hand it every service on every tube. List the serviceCodes this machine runs there.`,
       });
     });
+  }
+  if (anyHinai && c.hmis.tatva.enabled) {
+    const t = c.hmis.tatva;
+    if (!t.baseUrl) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'tatva', 'baseUrl'], message: 'required when hmis.tatva.enabled is true' });
+    }
+    if (!!t.tls.certFile !== !!t.tls.keyFile) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'tatva', 'tls'], message: 'mTLS needs both certFile and keyFile' });
+    }
+    // Equipment auth: every machine whose results go to Tatva v1 needs its
+    // own credential — without one its results would have nowhere to go.
+    if (t.auth === 'equipment') {
+      c.analyzers.forEach((a, i) => {
+        if (!lanes[i]!.includes('hinai')) return;
+        if (a.tatva?.equipmentId && a.tatva.equipmentSecret) return;
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['analyzers', i, 'tatva'],
+          message: `analyzer "${a.id}": hmis.tatva.auth is "equipment" — set tatva.equipmentId and tatva.equipmentSecret (Analyser Interface → rotate key)`,
+        });
+      });
+    }
   }
   if (anyHinai && !c.hmis.baseUrl) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'baseUrl'], message: 'required when analyzers are configured' });
@@ -1013,12 +1112,62 @@ function applyEnvOverrides(raw: any): any {
     if (process.env.GENX_API_KEY) g.apiKey = process.env.GENX_API_KEY;
     cfg.hmis = { ...h, genx: g };
   }
+  applyTatvaEnv(cfg);
   if (process.env.ADMIN_AUTH_FILE) cfg.admin = { ...cfg.admin, authFile: process.env.ADMIN_AUTH_FILE };
   if (process.env.AUTOCERTIFY_ORACLE_PASSWORD) {
     const ac = cfg.autoCertify ?? {};
     cfg.autoCertify = { ...ac, oracle: { ...(ac.oracle ?? {}), password: process.env.AUTOCERTIFY_ORACLE_PASSWORD } };
   }
   return cfg;
+}
+
+/** TATVA_* environment variables → hmis.tatva and analyzers[].tatva. */
+const TATVA_ENV: Record<string, string> = {
+  TATVA_ENABLED: 'enabled',
+  TATVA_AUTH: 'auth',
+  TATVA_BASE_URL: 'baseUrl',
+  TATVA_API_PREFIX: 'apiPrefix',
+  TATVA_CLIENT_ID: 'clientId',
+  TATVA_CLIENT_SECRET: 'clientSecret',
+  TATVA_SCOPE: 'scope',
+  TATVA_API_KEY: 'apiKey',
+  TATVA_FACILITY_ID: 'facilityId',
+  TATVA_ORGANIZATION_ID: 'organizationId',
+};
+
+function applyTatvaEnv(cfg: any): void {
+  const env = process.env;
+  const t: Record<string, unknown> = { ...(cfg.hmis?.tatva ?? {}) };
+  let touched = false;
+  for (const [name, field] of Object.entries(TATVA_ENV)) {
+    const v = env[name];
+    if (v === undefined || v === '') continue;
+    t[field] = field === 'enabled' ? v.trim().toLowerCase() === 'true' : v;
+    touched = true;
+  }
+  const tls: Record<string, unknown> = { ...((t.tls as object) ?? {}) };
+  for (const [name, field] of [['TATVA_TLS_CERT_FILE', 'certFile'], ['TATVA_TLS_KEY_FILE', 'keyFile'], ['TATVA_TLS_CA_FILE', 'caFile'], ['TATVA_TLS_PASSPHRASE', 'passphrase']] as const) {
+    if (env[name]) {
+      tls[field] = env[name];
+      touched = true;
+    }
+  }
+  if (touched) cfg.hmis = { ...(cfg.hmis ?? {}), tatva: { ...t, tls } };
+
+  // Per machine: TATVA_EQUIPMENT_ID_<ID> / TATVA_EQUIPMENT_SECRET_<ID>.
+  const machines: any[] = [...(Array.isArray(cfg.analyzers) ? cfg.analyzers : []), ...(isObj(cfg.im) ? [cfg.im] : [])];
+  for (const a of machines) {
+    if (!isObj(a)) continue;
+    const id = String(a.id ?? (a === cfg.im ? 'im' : '')).toUpperCase().replace(/-/g, '_');
+    if (!id) continue;
+    const eid = env[`TATVA_EQUIPMENT_ID_${id}`];
+    const secret = env[`TATVA_EQUIPMENT_SECRET_${id}`];
+    if (!eid && !secret) continue;
+    const own = isObj(a.tatva) ? { ...a.tatva } : {};
+    if (eid) own.equipmentId = eid;
+    if (secret) own.equipmentSecret = secret;
+    a.tatva = own;
+  }
 }
 
 /**

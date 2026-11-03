@@ -97,6 +97,31 @@
     //   "autoCertifyMethod": "GET",        // "GET" = ?<param>=<lineId>; "POST" = JSON body { "<param>": <lineId> }
     //   "autoCertifyParam": "labresultid"  // the parameter that carries the GenX result line id
     // },
+
+    // Tatva v1 — ZyHos HMIS partner Lab Middleware API (contract v3.1), built
+    // on the GenX library. POST-ONLY rollout: with "enabled": true, every
+    // analyzer on the HINAI lane (single AND both/twin mode) keeps taking its
+    // orders from HINAI and posts its RESULTS here instead of /mirth/labresult.
+    // GenX is untouched. "enabled": false puts results back on HINAI.
+    // Paths default to {apiPrefix}/lab/equipment/{worklist,acknowledge,results}.
+    // "tatva": {
+    //   "enabled": true,
+    //   "profile": "tatva-v1",
+    //   "baseUrl": "https://hmispreprod.zydushospitals.com",   // API origin, NOT /app
+    //   "apiPrefix": "/external/v1",       // or "/integration-service/external/v1"
+    //   "tokenPath": "/oauth/token",
+    //   "clientId": "",                    // better via env TATVA_CLIENT_ID
+    //   "clientSecret": "",                // better via env TATVA_CLIENT_SECRET
+    //   "clientAuth": "body",              // client_id/secret as form fields
+    //   "scope": "lab.equipment.worklist.read lab.equipment.acknowledge lab.equipment.result.publish",
+    //   "apiKey": "",                      // PROD when issued; env TATVA_API_KEY
+    //   // Tube barcode = sampleNumber: the accessionNumber is looked up once
+    //   // on the worklist (?barcode=) and cached. "accessionNumber" = no lookup.
+    //   "barcodeField": "sampleNumber",
+    //   // After filing, acknowledge in HINAI ("orders", unchanged), "tatva", or "off".
+    //   "acknowledge": "orders",
+    //   "auditLog": "./logs/hmis-tatva.log"
+    // },
   },
 
   // IM, the instrument middleware, as ONE block — instead of an analyzer entry

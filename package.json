@@ -55,6 +55,7 @@
     "replay:0028": "tsx test/ch2609080028-replay.ts",
     "autocertify": "tsx test/auto-certify.test.ts",
     "genx": "tsx test/genx-client.test.ts",
+    "tatva": "tsx test/tatva-client.test.ts",
     "dist": "node scripts/make-dist.mjs",
     "dist:seal": "node scripts/make-dist.mjs --seal",
     "deploy": "node scripts/deploy.mjs",
