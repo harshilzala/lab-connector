@@ -828,5 +828,77 @@
         }
       }
     ]
-  }
+  },
+
+
+   "tatva": {
+      "enabled": true,
+      "profile": "tatva-v1",
+
+      // "equipment" = Mirth-compatibility API, per-machine credential
+      //               (analyzers[].tatva below). Needs no OAuth client.
+      // "oauth"     = partner API, needs clientId / clientSecret below.
+      // Never both on one machine.
+      "auth": "equipment",
+
+      // API origin — NOT .../app (that is the staff portal).
+      "baseUrl": "https://hmispreprod.zydushospitals.com",
+
+      // auth "equipment" endpoints
+      "equipmentResultsPath": "/diagnostic-service/mirth/labresult",
+      "equipmentAcknowledgePath": "/diagnostic-service/mirth/acknowledge",
+
+      // auth "oauth" endpoints and client (unused with "equipment")
+      "apiPrefix": "/external/v1",              // or "/integration-service/external/v1"
+      "tokenPath": "/oauth/token",
+      "revokePath": "/oauth/revoke",
+      "clientId": "",                           // env TATVA_CLIENT_ID
+      "clientSecret": "",                       // env TATVA_CLIENT_SECRET
+      "clientAuth": "body",
+      "scope": "lab.equipment.worklist.read lab.equipment.acknowledge lab.equipment.result.publish",
+      "barcodeField": "sampleNumber",           // oauth: tube barcode = sampleNumber
+      "accessionCacheFile": "./spool/tatva-accessions.json",
+
+      // Optional headers — empty = not sent
+      "apiKey": "",                             // X-Api-Key, PROD when issued
+      "apiKeyHeader": "X-Api-Key",
+      "facilityId": "",                         // X-Facility-ID
+      "organizationId": "",                     // X-Organization-ID
+
+      // Send each value's unit and abnormal flag with the result
+      "sendUnitAndFlag": true,
+
+      // Client certificate, only if ZyHos turns on mTLS (cert + key, CA optional)
+      "tls": {
+        "certFile": "",
+        "keyFile": "",
+        "caFile": "",
+        "passphrase": ""
+      },
+
+      // After filing, acknowledge in: "orders" (HINAI, as today) | "tatva" | "off"
+      "acknowledge": "orders",
+
+      // Every Tatva v1 call, one file per day: logs/hmis-tatva-YYYY-MM-DD.log
+      "auditLog": "./logs/hmis-tatva.log"
+    },
+    "meglumi" :{
+      {
+      // Snibe Maglumi — ASTM over TCP; the analyzer dials this PC
+      "id": "maglumi",
+      "profile": "snibe-maglumi",
+      "equipmentCode": "CHANGE-ME",             // eqCode HINAI raises this machine's orders under
+      "transport": {
+        "host": "0.0.0.0",
+        "port": 5600                            // CHANGE-ME: LIS port set on the Maglumi
+      },
+
+      // Tatva v1 credential for THIS machine (Analyser Interface → rotate key).
+      // Env TATVA_EQUIPMENT_ID_MAGLUMI / TATVA_EQUIPMENT_SECRET_MAGLUMI win.
+      "tatva": {
+        "equipmentId": "49",
+        "equipmentSecret": "lfDs3pbNZy1_lkdFWj8MnLfCw771tbQxxrjJpWhqVD"
+      }
+    }
+    }
 }
