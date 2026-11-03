@@ -24,6 +24,10 @@ function loadEnvFile(path = process.env.LAB_CONNECTOR_ENV || './.env'): void {
     let val = trimmed.slice(eq + 1).trim();
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
+    } else {
+      // Unquoted: a " #" starts a trailing comment (KEY=value   # note).
+      // Quote the value to keep a literal " #" in it.
+      val = val.replace(/\s+#.*$/, '').replace(/^#.*$/, '');
     }
     if (!(key in process.env)) process.env[key] = val;
   }
