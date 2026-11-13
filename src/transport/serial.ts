@@ -45,6 +45,23 @@ export class SerialTransport extends EventEmitter implements Transport {
         'Serial transport requested but the "serialport" package is not installed. Run: npm install serialport',
       );
     }
+    // A port that cannot be opened (COM port not present yet — e.g. a Moxa
+    // Real COM port before its driver is installed — or held by another
+    // program) must not stop the connector: every other analyzer would go down
+    // with it. Log it and keep retrying, the way the TCP client re-dials.
+    try {
+      await this.open(SerialPortCtor);
+    } catch (err) {
+      this.opts.logger.warn(
+        { endpoint: this.describe, err: (err as Error).message, retryInMs: 5000 },
+        'serial port could not be opened — retrying',
+      );
+      this.port = null;
+      if (!this.stopping) setTimeout(() => this.start().catch(() => {}), 5000);
+    }
+  }
+
+  private async open(SerialPortCtor: any): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       this.port = new SerialPortCtor(
         {

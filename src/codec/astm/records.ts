@@ -222,7 +222,8 @@ export function parseMessage(
         // ("O|1|10032022012933|Sample #^5696|..."). Either way its ZC tube
         // barcode is on the P record — which is why that analyzer is configured
         // sampleIdFrom:"patient"; see where the R record is built.
-        currentSampleId = comps(f[2], d)[0]?.trim() || (f[2] || '').trim();
+        currentSampleId =
+          dialect(name).specimenId?.(f, 'O', d) ?? (comps(f[2], d)[0]?.trim() || (f[2] || '').trim());
         break;
       }
       case 'Q': {
@@ -231,7 +232,7 @@ export function parseMessage(
         // container id / aliquot sequence. Use the FIRST non-empty component, to
         // match the O-record specimen-id logic and the barcode HMIS registers.
         const rangeComps = comps(f[2], d);
-        const sampleId = rangeComps.find((x) => x.trim())?.trim() || '';
+        const sampleId = dialect(name).specimenId?.(f, 'Q', d) ?? (rangeComps.find((x) => x.trim())?.trim() || '');
         // Keep the field verbatim as well: a Sysmex matches the reply on the
         // padded sample number + rack + tube position it sent, not on the
         // bare barcode.
@@ -371,10 +372,16 @@ export function buildOrderMessage(
     // type "Q") and may echo the instrument's own specimen-id field.
     const isReply = !!o.queryReply;
     const orderMap = isReply && fmt.orderQueryReply ? fmt.orderQueryReply : fmt.order;
-    const sample = isReply && fmt.echoQuerySpecimenId && o.specimenIdField ? o.specimenIdField : o.sampleId;
+    const sample =
+      isReply && fmt.replySpecimenId && o.specimenIdField
+        ? fmt.replySpecimenId(o.sampleId, o.specimenIdField, d)
+        : isReply && fmt.echoQuerySpecimenId && o.specimenIdField
+          ? o.specimenIdField
+          : o.sampleId;
     const orderRecord = (n: number, codes: readonly string[]) =>
       renderRecord(orderMap, {
         $seq: String(n),
+        $stamp: stamp,
         $sample: sample,
         $tests: fmt.tests.encode(codes, d),
         $priority: o.priority ?? 'R',

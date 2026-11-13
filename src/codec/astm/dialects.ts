@@ -71,6 +71,15 @@ export interface DialectProfile {
    *  reply — Sysmex sends "<sample no>^<rack>^<tube position>" and matches
    *  the answer on that, not on the bare barcode. Unset: the bare barcode. */
   readonly echoQuerySpecimenId?: boolean;
+  /** Read the tube barcode from an inbound O or Q record, for an analyzer
+   *  that puts it somewhere the ASTM default does not look. Given the
+   *  record's fields; return null to fall back to the default. Unset: the
+   *  default (first component of field 3) for every dialect that has always
+   *  used it. */
+  specimenId?(fields: readonly string[], record: 'O' | 'Q', d: Delimiters): string | null;
+  /** Build the O-record specimen field of a QUERY REPLY from the barcode and
+   *  the instrument's own field. Takes precedence over echoQuerySpecimenId. */
+  replySpecimenId?(sampleId: string, specimenIdField: string, d: Delimiters): string;
   readonly terminator: FieldMap;
   /** One O record per assay, vs one O carrying every assay for the tube. */
   readonly orderPerTest: boolean;
@@ -124,6 +133,43 @@ const sysmexCode: TestIdCodec = {
   decode: (component) => component.trim(),
   reportable: (c) => (c[6] ?? '').trim().toUpperCase() !== 'IF',
 };
+
+/**
+ * Sysmex CS-2500: result/HMIS code → the code the analyzer takes in an order.
+ * The order code itself maps to itself, so either spelling works.
+ */
+export const CS2500_ORDER_CODES: Readonly<Record<string, readonly string[]>> = {
+  '040': ['040'], '041': ['040'], '044': ['040'],
+  '050': ['050'], '051': ['050'],
+  '060': ['060'], '061': ['060'], '062': ['060'],
+  '180': ['180'], '181': ['180'], '182': ['180'],
+  '270': ['270'], '271': ['270'],
+  '280': ['280'], '281': ['280'],
+  '300': ['300'], '301': ['300'], '302': ['300'],
+  '411': ['270', '280'], // LA ratio is calculated from LA1 and LA2
+  '610': ['610'], '611': ['610'], '612': ['610'],
+};
+
+/** "^^^041^PT THS~sec^100.00^9" in, "^^^040^^100.00^DF\^^^040^^100.00^DR" out. */
+function sysmexCsCode(): TestIdCodec {
+  return {
+    encode: (codes, d) => {
+      const out: string[] = [];
+      for (const raw of codes) {
+        for (const code of CS2500_ORDER_CODES[raw.trim()] ?? []) if (!out.includes(code)) out.push(code);
+      }
+      return out
+        .flatMap((code) =>
+          code === '040'
+            ? [['', '', '', '040', '', '100.00', 'DF'], ['', '', '', '040', '', '100.00', 'DR']]
+            : [['', '', '', code, '', '100.00']],
+        )
+        .map((parts) => parts.join(d.component))
+        .join(d.repeat);
+    },
+    decode: (component) => component.trim(),
+  };
+}
 
 /**
  * "^^^1.0+075+1\035+1\032+1" — the VITROS shape.
@@ -318,6 +364,59 @@ export const ASTM_DIALECT_LIBRARY = {
     orderPerTest: false,
     timestamp: 'datetime',
     tests: sysmexCode,
+  },
+
+  /**
+   * Sysmex CS-2500 coagulation analyzer — host-query mode.
+   *
+   * Every layout below is copied from the legacy "Lab Integration.exe"
+   * traffic the analyzer has been accepting at Ahmedabad (SYSMEX_CS_2500.txt,
+   * Aug–Nov 2026, ~13 000 tubes):
+   *
+   *   CS → LIS  H|\^&|||CS-2500^00-16^26899^^^CP^BV981798||||||||E1394-97
+   *             Q|1|001162^01^   HE2611120391^M||^^^040^PT-THS\^^^050^APTT-FS|0|20261112202141
+   *   LIS → CS  H|\^&|||||||||||E1394-97|
+   *             P|1|||100|^^NAME||19800428|M|||||^||||||||||||^^^|||||||||
+   *             O|1|001162^01^ HE2611120391^C||^^^040^^100.00^DF\^^^040^^100.00^DR|R|20261112082432|||||N|…
+   *             L|1|N
+   *   CS → LIS  O|1||001160^02^   ZC2611120097^M^||R||||||N
+   *             R|1|^^^041^PT THS~sec^100.00^9^^^|  10.7|sec||N||||||20261112200207
+   *
+   * The barcode is the THIRD component of the specimen field — Q field 3, and
+   * O field 4 on results (O field 3 is empty) — after the rack and position.
+   * The reply echoes rack^position, the barcode right-aligned in 13
+   * characters, then "C".
+   *
+   * Order codes differ from result codes: PT is ordered as 040 and reported
+   * as 041 (sec) / 044 (INR); APTT 050 → 051; Fbg 060 → 061/062; VIII
+   * 180 → 181/182; LA1 270 → 271; LA2 280 → 281; AT3 300 → 301/302;
+   * D-dimer 610 → 611/612. The order encoder maps either spelling to the
+   * order code and drops anything the CS-2500 does not know. PT always goes
+   * as the DF + DR pair the legacy interface sent.
+   */
+  'sysmex-cs': {
+    label: 'Sysmex CS-2500 coagulation (host query)',
+    confirmedBy: 'Legacy Lab Integration.exe traffic accepted by the Ahmedabad CS-2500 (BV981798), Aug–Nov 2026',
+    header: { 0: 'H', 1: '$delims', 12: 'E1394-97', 13: '' },
+    patient: { 0: 'P', 1: '$seq', 4: '100', 5: '$name', 7: '$birth', 8: '$sex', 13: '^', 25: '^^^', 34: '' },
+    patientAnonymous: { 0: 'P', 1: '$seq', 34: '' },
+    order: { 0: 'O', 1: '$seq', 2: '$sample', 4: '$tests', 5: '$priority', 6: '$stamp', 11: 'N', 30: '' },
+    echoQuerySpecimenId: true,
+    specimenId: (f, record, d) => {
+      const field = record === 'Q' ? f[2] : f[3] || f[2];
+      if (!field) return null;
+      const c = field.split(d.component);
+      return (c.length >= 3 ? c[2] : c.find((x) => x.trim()))?.trim() || null;
+    },
+    replySpecimenId: (sampleId, specimenIdField, d) => {
+      const c = specimenIdField.split(d.component);
+      if (c.length < 3) return sampleId;
+      return [c[0], c[1], sampleId.padStart(13, ' '), 'C'].join(d.component);
+    },
+    terminator: { 0: 'L', 1: '1', 2: 'N' },
+    orderPerTest: false,
+    timestamp: 'datetime',
+    tests: sysmexCsCode(),
   },
 } as const satisfies Record<string, DialectProfile>;
 

@@ -9,6 +9,9 @@ import { ClinitekAdvantusLink } from './clinitek/link.js';
 import { KermitLink } from './kermit/link.js';
 import { Hl7Link } from './hl7/link.js';
 import { Gh900Link } from './gh900/link.js';
+import { H100Link } from './h100/link.js';
+import { RollerLink } from './roller/link.js';
+import { Abl800Link } from './abl800/link.js';
 
 // Factory for the pluggable protocol layer.
 export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transport, logger: Logger): ProtocolLink {
@@ -54,6 +57,8 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
         encoding: analyzer.hl7.encoding,
         idleFlushMs: analyzer.hl7.idleFlushMs,
         hostQuery: analyzer.hostQuery,
+        queryStyle: analyzer.hl7.queryStyle ?? 'standard',
+        mindrayNoOrderTestMode: analyzer.hl7.mindrayNoOrderTestMode,
         // Optional-chained: the schema always fills this in, but the test
         // harnesses build an analyzer config by hand.
         orderPush: analyzer.hl7.orderPush?.enabled ? analyzer.hl7.orderPush : undefined,
@@ -65,6 +70,31 @@ export function createProtocolLink(analyzer: AnalyzerConfig, transport: Transpor
       return new Gh900Link(transport, {
         fileOnSamplingError: analyzer.gh900.fileOnSamplingError,
         logger: logger.child({ codec: 'gh900' }),
+      });
+    case 'h100':
+      // Lifotronic H100 HbA1c analyzer — its own codec, results-only, the
+      // analyzer dials in. See src/codec/h100/.
+      return new H100Link(transport, {
+        fileOnSamplingError: analyzer.h100.fileOnSamplingError,
+        logger: logger.child({ codec: 'h100' }),
+      });
+    case 'abl800':
+      // Radiometer ABL800 FLEX — HL7 ORU^R31 inside SOH…EOT, results-only,
+      // the analyzer dials in. See src/codec/abl800/.
+      return new Abl800Link(transport, {
+        ackFraming: analyzer.abl800.ackFraming,
+        logger: logger.child({ codec: 'abl800' }),
+      });
+    case 'alifax-roller':
+      // Alifax ROLLER 20LC ESR — STX…ETX frames over RS-232 via an NPort,
+      // results-only. See src/codec/roller/.
+      return new RollerLink(transport, {
+        verifyChecksum: analyzer.roller.verifyChecksum,
+        ack: analyzer.roller.ack,
+        answerQueries: analyzer.roller.answerQueries,
+        fileLowHematocrit: analyzer.roller.fileLowHematocrit,
+        shortIdPrefix: analyzer.roller.shortIdPrefix ?? null,
+        logger: logger.child({ codec: 'alifax-roller' }),
       });
     case 'kermit':
       // The VITROS 250/350 chemistry systems do NOT speak ASTM on this link —

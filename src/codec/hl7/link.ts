@@ -1,10 +1,12 @@
 import { EventEmitter } from 'node:events';
 import type { Transport } from '../../transport/types.js';
 import type { Logger } from '../../logger.js';
-import type { OrderDownload } from '../../types.js';
+import type { OrderDownload, ParsedMessage } from '../../types.js';
 import type { ProtocolLink } from '../types.js';
 import { MllpDecoder, wrapMllp } from './mllp.js';
 import {
+  component,
+  fieldOf,
   elideLongFields,
   hl7ToParsedMessage,
   hl7ToQueryMessage,
@@ -71,6 +73,15 @@ export interface Hl7LinkOptions {
   /** Answer inbound host queries with a worklist. When false, a query is only
    *  acknowledged and the link stays results-only. */
   hostQuery?: boolean;
+  /** How the analyzer asks for work. "standard" (default): QRY/QBP queries,
+   *  answered with ORM^O01. "mindray-orm": Mindray LabXpert (BC-6200) sends
+   *  ORM^O01 with ORC-1 "RF" and the barcode in ORC-3, and takes an ORR^O02
+   *  carrying the Test Mode back. Nothing changes for an analyzer left on
+   *  "standard". */
+  queryStyle?: 'standard' | 'mindray-orm';
+  /** mindray-orm only: Test Mode sent when HMIS has no order for the tube
+   *  ("CBC+DIFF", as the legacy interface did), or null to refuse (MSA AR). */
+  mindrayNoOrderTestMode?: string | null;
   /** Send orders unsolicited, each confirmed by the receiver's MSA. */
   orderPush?: {
     enabled: boolean;
@@ -104,6 +115,8 @@ interface QueryContext {
   /** The query's sender — becomes the receiver (MSH-5/6) on our reply. */
   replyToApp: string;
   replyToFacility: string;
+  /** The barcode the query asked about. */
+  barcode?: string;
 }
 
 export class Hl7Link extends EventEmitter implements ProtocolLink {
@@ -183,6 +196,11 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
           'HL7 sendOrders with no pending query context — a worklist can only be sent in reply to a query; ignoring',
         );
       }
+      return;
+    }
+
+    if (this.opts.queryStyle === 'mindray-orm') {
+      await this.sendMindrayReply(ctx, orders[0] ?? null);
       return;
     }
 
@@ -274,6 +292,12 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
     const ack = readAck(msg);
     if (ack && !msg.segments.some((s) => s.name === 'OBX')) {
       this.handleAck(ack, msg);
+      return;
+    }
+
+    // Mindray LabXpert asks for work with an ORM^O01 "RF" (opt-in style).
+    if (this.opts.queryStyle === 'mindray-orm' && isMindrayOrderQuery(msg)) {
+      this.handleQuery(msg, mindrayQueryMessage(msg));
       return;
     }
 
@@ -392,8 +416,8 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
   }
 
   // ---- host query -----------------------------------------------------------
-  private handleQuery(msg: Hl7Message): void {
-    const parsed = hl7ToQueryMessage(msg);
+  private handleQuery(msg: Hl7Message, preParsed?: ParsedMessage | null): void {
+    const parsed = preParsed !== undefined ? preParsed : hl7ToQueryMessage(msg);
     // Log the raw query verbatim: this is the first time we see this analyzer's
     // query shape, and it is what confirms the reply layout.
     this.opts.logger.info(
@@ -415,6 +439,7 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       charset: msg.charset,
       replyToApp: msg.sendingApp,
       replyToFacility: msg.sendingFacility,
+      barcode: parsed?.queries[0]?.sampleId ?? '',
     };
 
     if (!this.opts.hostQuery) {
@@ -498,6 +523,91 @@ export class Hl7Link extends EventEmitter implements ProtocolLink {
       segs.push(['OBR', String(setId), sid, sid, code, priority, now].join(f));
     }
     return segs.join('\r') + '\r';
+  }
+
+  /**
+   * Mindray LabXpert (BC-6200) reply to an ORM^O01 "RF" query: ORR^O02 with
+   * the Test Mode the tube is to run in. The PV1 / OBR / OBX layout is the one
+   * the legacy interface sent and LabXpert accepted for ~33 000 tubes
+   * (Aug–Nov 2026), template fields included:
+   *
+   *   MSH|^~\&|LIS||LabXpert|Mindray|<now>||ORR^O02|<ctl>|P|2.3.1||||||UNICODE
+   *   MSA|AA|<query ctl>
+   *   PID|1||<mrn>^^^^||^<name>|||Male
+   *   PV1|1|HM^001|||||||||||||||||
+   *   ORC|AF|<barcode>|||
+   *   OBR|1|<barcode>||||20060506||||TECH|||DiagnoseContent....|20060504||||||||20080821||HM||||Validator||||Operator
+   *   OBX|1|IS|08001^Take Mode^99MRC||A||||||F
+   *   OBX|2|IS|08002^Blood Mode^99MRC||W||||||F
+   *   OBX|3|IS|08003^Test Mode^99MRC||CBC+DIFF||||||F
+   *   OBX|4|IS|01002^Ref Group^99MRC||||||||F
+   *   OBX|5|NM|30525-0^Age^LN||36|yr|||||F
+   *   OBX|6|ST|01001^Remark^99MRC||||||||F
+   *
+   * Test Mode: CBC+DIFF when any differential parameter is pending for the
+   * tube, CBC when only the count is — the legacy interface's choice.
+   */
+  private async sendMindrayReply(ctx: QueryContext, order: OrderDownload | null): Promise<void> {
+    const f = ctx.encoding.field;
+    const cc = ctx.encoding.component;
+    const testMode = order ? mindrayTestMode(order.testCodes) : this.opts.mindrayNoOrderTestMode === undefined ? 'CBC+DIFF' : this.opts.mindrayNoOrderTestMode;
+    const charset = this.opts.charset ?? ctx.charset ?? '';
+    const msh = [
+      'MSH',
+      cc + ctx.encoding.repeat + ctx.encoding.escape + ctx.encoding.subcomponent,
+      this.opts.sendingApp ?? 'LIS',
+      this.opts.sendingFacility ?? '',
+      ctx.replyToApp || '',
+      ctx.replyToFacility || '',
+      hl7Now(),
+      '',
+      `ORR${cc}O02`,
+      ctx.controlId || hl7Now(),
+      ctx.processingId,
+      ctx.version,
+      '',
+      '',
+      '',
+      '',
+      '',
+      charset,
+    ].join(f);
+    const sid = order?.sampleId ?? ctx.barcode ?? '';
+
+    if (!testMode) {
+      const text = `${msh}\r${['MSA', 'AR', ctx.controlId].join(f)}\r`;
+      this.emit('wire', { direction: 'OUT', text: printable(text) });
+      await this.transport.write(wrapMllp(text, this.encoding)).catch((e) => this.emit('error', e instanceof Error ? e : new Error(String(e))));
+      this.opts.logger.info({ controlId: ctx.controlId }, 'Mindray query had no pending order — refused (MSA AR)');
+      return;
+    }
+
+    const p = order?.patient ?? null;
+    const name = p ? [p.lastName, p.firstName, p.middleName].filter((x) => x && x.trim()).join(' ') : '';
+    const sex = p?.sex === 'M' ? 'Male' : p?.sex === 'F' ? 'Female' : '';
+    const age = ageInYears(p?.birthDate ?? null);
+    const segs = [
+      msh,
+      ['MSA', 'AA', ctx.controlId].join(f),
+      ['PID', '1', '', `${p?.patientId ?? ''}^^^^`, '', `^${name}`, '', '', sex].join(f),
+      'PV1|1|HM^001|||||||||||||||||',
+      ['ORC', 'AF', sid, '', '', ''].join(f),
+      `OBR|1|${sid}||||20060506||||TECH|||DiagnoseContent....|20060504||||||||20080821||HM||||Validator||||Operator`,
+      'OBX|1|IS|08001^Take Mode^99MRC||A||||||F',
+      'OBX|2|IS|08002^Blood Mode^99MRC||W||||||F',
+      `OBX|3|IS|08003^Test Mode^99MRC||${testMode}||||||F`,
+      'OBX|4|IS|01002^Ref Group^99MRC||||||||F',
+      `OBX|5|NM|30525-0^Age^LN||${age}|yr|||||F`,
+      'OBX|6|ST|01001^Remark^99MRC||||||||F',
+    ];
+    const text = segs.join('\r') + '\r';
+    this.emit('wire', { direction: 'OUT', text: printable(text) });
+    try {
+      await this.transport.write(wrapMllp(text, this.encoding));
+      this.opts.logger.info({ barcode: sid || null, testMode, controlId: ctx.controlId, ordered: !!order }, 'Mindray order reply (ORR^O02) sent');
+    } catch (e) {
+      this.emit('error', e instanceof Error ? e : new Error(String(e)));
+    }
   }
 
   /** Acknowledge a query we are not answering with a worklist (no order found,
@@ -597,6 +707,39 @@ function isKeepAlive(chunk: Buffer): boolean {
   if (chunk.length === 0 || chunk.length > 8) return false;
   for (const b of chunk) if (b >= 0x20 || b === 0x0b || b === 0x1c) return false;
   return true;
+}
+
+// ---- Mindray LabXpert (queryStyle "mindray-orm") ---------------------------
+
+/** ORM^O01 whose ORC-1 is "RF": LabXpert asking what to run on a tube. */
+export function isMindrayOrderQuery(msg: Hl7Message): boolean {
+  if (!/^ORM\^O01/i.test(msg.messageType.replace(msg.encoding.component, '^'))) return false;
+  const orc = msg.segments.find((s) => s.name === 'ORC');
+  return !!orc && fieldOf(orc, 1).toUpperCase() === 'RF';
+}
+
+/** The query as a ParsedMessage: the barcode is ORC-3. */
+export function mindrayQueryMessage(msg: Hl7Message): ParsedMessage | null {
+  const orc = msg.segments.find((s) => s.name === 'ORC');
+  const sampleId = orc ? component(fieldOf(orc, 3), 1, msg.encoding) : '';
+  if (!sampleId) return null;
+  return { protocol: 'hl7', sender: msg.sendingApp || null, patient: null, queries: [{ sampleId, testCodes: [] }], results: [], raw: msg.raw };
+}
+
+/** Differential parameters: any of these pending means the tube needs DIFF. */
+const MINDRAY_DIFF_CODES = new Set(['NEU#', 'NEU%', 'LYM#', 'LYM%', 'MON#', 'MON%', 'EOS#', 'EOS%', 'BAS#', 'BAS%']);
+
+export function mindrayTestMode(codes: readonly string[]): string {
+  return codes.some((c) => MINDRAY_DIFF_CODES.has(c.trim().toUpperCase())) ? 'CBC+DIFF' : 'CBC';
+}
+
+/** Whole years from a YYYYMMDD birth date, '' when unknown. */
+function ageInYears(birth: string | null, now = new Date()): string {
+  const m = /^(\d{4})(\d{2})(\d{2})/.exec((birth ?? '').replace(/\D/g, ''));
+  if (!m) return '';
+  let age = now.getFullYear() - Number(m[1]);
+  if (now.getMonth() + 1 < Number(m[2]) || (now.getMonth() + 1 === Number(m[2]) && now.getDate() < Number(m[3]))) age--;
+  return age >= 0 && age < 150 ? String(age) : '';
 }
 
 /** Segment separators as visible newlines for the admin wire log. */

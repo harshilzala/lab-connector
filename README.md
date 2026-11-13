@@ -139,7 +139,7 @@ Edit `config.json`:
 - One entry per analyzer under `analyzers[]`:
   - `profile` — the instrument **model**, from the machine profile library in
     `src/profiles/index.ts` (`mindray-bc5150`, `mindray-bc6000`, `erba-h360`,
-    `lifotronic-gh900plus`, `vitros-eciq`, `vitros-250`, `snibe-maglumi`,
+    `lifotronic-gh900plus`, `lifotronic-h100`, `alifax-roller20lc`, `radiometer-abl800`, `sysmex-cs2500`, `mindray-bc6200`, `vitros-eciq`, `vitros-250`, `snibe-maglumi`,
     `sysmex-uf4000`, `sysmex-uc3500`, `sysmex-uwam`
     …). The profile supplies every model-level default — protocol, transport
     type/mode/port, ACK conventions, the analytes the instrument reports, the

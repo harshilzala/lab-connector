@@ -157,6 +157,12 @@ const Hl7Options = z.object({
   /** Safety net for a peer that omits the MLLP end block: parse whatever has
    *  buffered after this idle gap. 0 disables (strict MLLP only). */
   idleFlushMs: z.number().int().nonnegative().default(0),
+  /** How the analyzer asks for work: "standard" QRY/QBP → ORM^O01 (default),
+   *  or "mindray-orm" — Mindray LabXpert (BC-6200) ORM^O01 "RF" → ORR^O02. */
+  queryStyle: z.enum(['standard', 'mindray-orm']).default('standard'),
+  /** mindray-orm only: Test Mode when HMIS has no order for the tube; null
+   *  refuses the query (MSA AR) instead. */
+  mindrayNoOrderTestMode: z.string().nullable().default('CBC+DIFF'),
   /** Send orders UNSOLICITED, for a receiver that listens for them instead of
    *  asking — IM, the instrument middleware. The orders come from the same
    *  HMIS poll as every other analyzer's (`orderPoll`), go out one ORM^O01
@@ -189,6 +195,35 @@ const Gh900Options = z.object({
    *  much). Off by default: a mis-sampled run is not a result; it is logged
    *  and dropped, and the rerun files. */
   fileOnSamplingError: z.boolean().default(false),
+});
+
+/** Lifotronic H100 HbA1c analyzer — see src/codec/h100. */
+const H100Options = z.object({
+  /** File a run whose test error code is E1/E2 (sampling too little / too
+   *  much). Off by default: logged and dropped, the rerun files. */
+  fileOnSamplingError: z.boolean().default(false),
+});
+
+/** Radiometer ABL800 FLEX blood gas — see src/codec/abl800. */
+const Abl800Options = z.object({
+  /** ACK envelope: "mllp" as the legacy interface sent, "soh-eot" the
+   *  analyzer's own, "none" for no ACK. */
+  ackFraming: z.enum(['mllp', 'soh-eot', 'none']).default('mllp'),
+});
+
+/** Alifax ROLLER 20LC ESR analyzer — see src/codec/roller. */
+const RollerOptions = z.object({
+  /** Drop a frame whose XOR checksum does not match. */
+  verifyChecksum: z.boolean().default(true),
+  /** Send ACK after each result (ignored by the analyzer when its ACK option is 0). */
+  ack: z.boolean().default(true),
+  /** Answer a BCI query "run this tube?" with yes. */
+  answerQueries: z.boolean().default(true),
+  /** File an ESR flagged "*" (very low haematocrit). Off: logged, not filed. */
+  fileLowHematocrit: z.boolean().default(false),
+  /** Short numeric Roller id (1–6 digits) → <prefix><YYMMDD><id>, e.g. "HE".
+   *  Null: file the id as sent. See src/codec/roller/link.ts. */
+  shortIdPrefix: z.string().nullable().default(null),
 });
 
 /** True for null/undefined or a string that compiles as a RegExp. */
@@ -258,7 +293,7 @@ const AnalyzerSchema = z.object({
   /** Reported in the acknowledge body; derived from a TCP transport when unset. */
   ipAddress: z.string().optional(),
   portNo: z.string().optional(),
-  protocol: z.enum(['astm', 'abl9', 'hl7', 'kermit', 'advia2120i', 'clinitek-advantus', 'gh900']).default('astm'),
+  protocol: z.enum(['astm', 'abl9', 'hl7', 'kermit', 'advia2120i', 'clinitek-advantus', 'gh900', 'h100', 'alifax-roller', 'abl800']).default('astm'),
   transport: TransportSchema,
   /** A SECOND link for the same machine, results only.
    *
@@ -600,6 +635,9 @@ const AnalyzerSchema = z.object({
   kermit: KermitOptions.prefault({}),
   hl7: Hl7Options.prefault({}),
   gh900: Gh900Options.prefault({}),
+  h100: H100Options.prefault({}),
+  roller: RollerOptions.prefault({}),
+  abl800: Abl800Options.prefault({}),
 });
 
 // Oracle ids are NUMBER columns. Only digits are accepted, because every one of

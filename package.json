@@ -18,6 +18,7 @@
     "simulator": "tsx test/analyzer-simulator.ts",
     "dialects": "tsx test/dialects-check.ts",
     "sniff": "tsx test/serial-sniff.ts",
+    "roller-probe": "tsx test/roller-probe.ts",
     "ping": "tsx test/ping-server.ts",
     "install-service": "node dist/index.js --install-service",
     "uninstall-service": "node dist/index.js --uninstall-service",

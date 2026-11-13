@@ -177,6 +177,42 @@ const MINDRAY_BC6000: AnalyzerProfile = {
   },
 };
 
+// ---- Mindray BC-6200 (via LabXpert) — haematology, HL7 v2.3.1 over MLLP ----
+//
+// Taken over from the legacy Lab Integration.exe at Ahmedabad (MachineName
+// BC6200, listening on 3010; LabXpert dials in). Results are ORU^R01 in the
+// BC-6000 layout (barcode OBR-3, code OBX-3.2), answered ACK^R01. Unlike the
+// BC-6000 it ASKS per tube: ORM^O01 with ORC-1 "RF" and the barcode in ORC-3,
+// answered ORR^O02 with the Test Mode (hl7.queryStyle "mindray-orm"). In the
+// legacy capture (Aug–Nov 2026) every one of 33 341 queries was answered AA,
+// 33 207 with CBC+DIFF and 134 with CBC.
+const MINDRAY_BC6200: AnalyzerProfile = {
+  description: 'Mindray BC-6200 haematology analyzer via LabXpert, HL7 v2.3.1 over MLLP; dials the LIS and queries each tube (ORM^O01 → ORR^O02)',
+  defaults: {
+    protocol: 'hl7',
+    transport: { type: 'tcp', mode: 'server', host: '0.0.0.0', port: 3010 },
+    sendDemographics: true,
+    hostQuery: true,
+    orderPoll: { enabled: true, download: false },
+    filing: { mode: 'staged' },
+    fillMissingOrderRows: true,
+    qc: { sampleIdPrefixes: ['QC', 'QC-', 'CTRL', 'CONTROL', '$'] },
+    ignoreTestCodes: [],
+    testCodeScale: {},
+    hl7: {
+      sendingApp: 'LIS',
+      sendingFacility: '',
+      charset: 'UNICODE',
+      ack: true,
+      valueTypes: ['NM'],
+      encoding: 'utf8',
+      idleFlushMs: 0,
+      queryStyle: 'mindray-orm',
+      mindrayNoOrderTestMode: 'CBC+DIFF',
+    },
+  },
+};
+
 // ---- Erba H360 — 3-part haematology, HL7 v2.3.1 over MLLP -----------------
 //
 // Source: the production wire log of the legacy middleware
@@ -290,6 +326,116 @@ const LIFOTRONIC_GH900PLUS: AnalyzerProfile = {
     ignoreTestCodes: [],
     testCodeScale: {},
     gh900: { fileOnSamplingError: false },
+  },
+};
+
+// ---- Lifotronic H100 — HbA1c (HPLC), proprietary block over TCP -----------
+//
+// Its own profile AND its own codec (protocol 'h100', src/codec/h100/), so no
+// H100 change can reach another machine. The analyzer dials in and sends one
+// STX 'S' … ETX block per test, results-only (Lifotronic Appendix-B layout).
+//
+// NOT YET VERIFIED against an H100 wire capture. The codec checks the block
+// length exactly; if the H100's block differs, its runs are logged as
+// "unparseable H100 sample block" and nothing is filed. Confirm on the first
+// live sample (logs/wire-<id>-*.log) and adjust src/codec/h100/parser.ts.
+//
+// Default port 2032: the port assigned to the first H100 install
+// (10.11.16.123 → LIS 10.11.103.21:2032, 2026-11-12). A site block's
+// transport.port still wins.
+const LIFOTRONIC_H100: AnalyzerProfile = {
+  description: 'Lifotronic H100 HbA1c analyzer, fixed-width block over TCP; analyzer dials the LIS (PC is server, default port 2032)',
+  defaults: {
+    protocol: 'h100',
+    transport: { type: 'tcp', mode: 'server', host: '0.0.0.0', port: 2032 },
+    sendDemographics: false,
+    hostQuery: false,
+    orderPoll: { enabled: true, download: false },
+    filing: { mode: 'staged' },
+    qc: { sampleIdPrefixes: ['QC', 'QC-', 'CTRL', 'CONTROL', 'CAL'] },
+    // HMIS registers only these two rows for the H100 (EC024, 2026-11-12);
+    // IFCC, eAG mmol/L and HbF are parsed but never filed.
+    allowTestCodes: ['HBA1C', 'EAG-MGDL'],
+    ignoreTestCodes: [],
+    testCodeScale: {},
+    h100: { fileOnSamplingError: false },
+  },
+};
+
+// ---- Sysmex CS-2500 — coagulation, ASTM E1381/E1394 over TCP, host query --
+//
+// Taken over from the legacy Lab Integration.exe (MachineName SYSMEX_CS_2500,
+// listening on 2300; the analyzer dials in). The CS-2500 asks per tube
+// (Q record) and runs what the reply orders, so this is host-query mode:
+// nothing is pushed unasked. Layouts, codes and the barcode position are in
+// the 'sysmex-cs' ASTM dialect (src/codec/astm/dialects.ts).
+const SYSMEX_CS2500: AnalyzerProfile = {
+  description: 'Sysmex CS-2500 coagulation analyzer, ASTM E1381/E1394 over TCP; analyzer dials the LIS and host-queries each tube',
+  defaults: {
+    protocol: 'astm',
+    transport: { type: 'tcp', mode: 'server', host: '0.0.0.0', port: 2300 },
+    sendDemographics: true,
+    hostQuery: true,
+    orderPoll: { enabled: true, download: false },
+    filing: { mode: 'staged' },
+    qc: { sampleIdPrefixes: ['QC', 'CTRL', 'CONTROL'], upload: false },
+    ignoreTestCodes: [],
+    testCodeScale: {},
+    astm: {
+      ackTimeoutMs: 15000,
+      frameMaxData: 240,
+      senderId: '',
+      receiverId: '',
+      dialect: 'sysmex-cs',
+      sampleIdFrom: 'order',
+    },
+  },
+};
+
+// ---- Radiometer ABL800 FLEX (ABL835) — blood gas, HL7 in SOH…EOT ---------
+//
+// Taken over from the legacy Lab Integration.exe (MachineName ABL800,
+// listening on 6001; the analyzer dials in). Results only — the legacy logs
+// hold no query. Every value the analyzer sends is offered; only those HMIS
+// raised a pending row for are filed. See src/codec/abl800.
+const RADIOMETER_ABL800: AnalyzerProfile = {
+  description: 'Radiometer ABL800 FLEX blood gas analyzer, HL7 v2.5 ORU^R31 in SOH/EOT frames over TCP; analyzer dials the LIS',
+  defaults: {
+    protocol: 'abl800',
+    transport: { type: 'tcp', mode: 'server', host: '0.0.0.0', port: 6001 },
+    sendDemographics: false,
+    hostQuery: false,
+    orderPoll: { enabled: true, download: false },
+    filing: { mode: 'staged' },
+    qc: { sampleIdPrefixes: ['QC', 'BIOQC', 'CTRL', 'CONTROL'], upload: false },
+    ignoreTestCodes: [],
+    testCodeScale: {},
+    abl800: { ackFraming: 'mllp' },
+  },
+};
+
+// ---- Alifax ROLLER 20LC — ESR, proprietary STX…ETX frames over RS-232 -----
+//
+// Source: ROLLER 20LC Technical Manual rev 1.3, ch. 24 (pp. 77–82). Serial
+// port 2 at 9600 8-N-1, reached through a Moxa NPort in TCP-server mode that
+// the connector dials (site block gives the NPort's host/port). One 'R' frame
+// per tube carrying a single ESR value in mm/h; results-only. With BCI (query)
+// on, the analyzer asks per tube and is told "run it". Latex control runs
+// (sample id LATEX…) are QC.
+const ALIFAX_ROLLER20LC: AnalyzerProfile = {
+  description: 'Alifax ROLLER 20LC ESR analyzer, STX/ETX frames over RS-232 (9600 8-N-1); reached through a Moxa NPort the connector dials',
+  defaults: {
+    protocol: 'alifax-roller',
+    transport: { type: 'tcp', mode: 'client' },
+    sendDemographics: false,
+    hostQuery: false,
+    orderPoll: { enabled: true, download: false },
+    filing: { mode: 'staged' },
+    qc: { sampleIdPrefixes: ['LATEX', 'QC', 'QC-', 'CTRL', 'CONTROL'] },
+    allowTestCodes: ['ESR'],
+    ignoreTestCodes: [],
+    testCodeScale: {},
+    roller: { verifyChecksum: true, ack: true, answerQueries: true, fileLowHematocrit: false },
   },
 };
 
@@ -796,8 +942,13 @@ export const PROFILE_LIBRARY = {
   /** Same protocol document and defaults as the BC-5150. */
   'mindray-bc5000': MINDRAY_BC5150,
   'mindray-bc6000': MINDRAY_BC6000,
+  'mindray-bc6200': MINDRAY_BC6200,
   'erba-h360': ERBA_H360,
   'lifotronic-gh900plus': LIFOTRONIC_GH900PLUS,
+  'lifotronic-h100': LIFOTRONIC_H100,
+  'alifax-roller20lc': ALIFAX_ROLLER20LC,
+  'sysmex-cs2500': SYSMEX_CS2500,
+  'radiometer-abl800': RADIOMETER_ABL800,
   'vitros-eciq': VITROS_ECIQ,
   /** Same host interface and dialect as the ECiQ. */
   'vitros-eci': VITROS_ECIQ,
