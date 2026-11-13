@@ -8,8 +8,9 @@
 // Steps, stopping at the first failure so a broken build never reaches the lab:
 //   1. typecheck the sources
 //   2. wait until no analyzer has been on the wire for a few seconds
-//   3. npm run dist into the deployment folder (its config.json, .env, spool\
-//      and logs\ are kept — see make-dist.mjs)
+//   3. npm run dist into the deployment folder (config.json is replaced by the
+//      root's, the old one backed up as config.json.bak-<timestamp>; .env,
+//      spool\ and logs\ are kept — see make-dist.mjs)
 //   4. re-seal it, when it was sealed before (or with --seal)
 //   5. restart Lab-Interface under that folder's own PM2 home (.pm2\), or
 //      start it when PM2 does not know it yet, and save the process list

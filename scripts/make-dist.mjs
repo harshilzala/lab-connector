@@ -145,12 +145,35 @@ cpSync(join(ROOT, 'magic'), join(OUT, 'magic'), { recursive: true });
 console.log('  [3/5] ecosystem.config.cjs + magic\\ copied verbatim');
 
 // ---- 4. this site's configuration -------------------------------------------
-// Copied, never generated: the live config.json is the only record of how this
-// site is wired. An existing one in the target is left alone — a site may have
-// edited it since the last build, and overwriting that would be destroying the
-// thing hardest to reconstruct.
+// Copied, never generated.
+//
+// config.json: the root checkout's copy is the source of truth and ALWAYS
+// replaces the target's, so a build ships the latest wiring. The target's old
+// one may hold edits made at the site, so when it differs it is first saved as
+// config.json.bak-<timestamp> beside it — never silently destroyed.
+//
+// .env and admin-auth.json: an existing one in the target is left alone. They
+// hold this site's secrets and dashboard credential, not shared wiring.
 const carried = [];
-for (const f of ['config.json', '.env', 'admin-auth.json']) {
+const CONFIG = 'config.json';
+if (existsSync(join(ROOT, CONFIG))) {
+  const src = readFileSync(join(ROOT, CONFIG));
+  const dest = join(OUT, CONFIG);
+  if (existsSync(dest) && !readFileSync(dest).equals(src)) {
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    const backup = `${CONFIG}.bak-${stamp}`;
+    cpSync(dest, join(OUT, backup));
+    carried.push(`${CONFIG} (replaced from the root — previous saved as ${backup})`);
+  } else if (existsSync(dest)) {
+    carried.push(`${CONFIG} (already identical to the root)`);
+  } else {
+    carried.push(CONFIG);
+  }
+  writeFileSync(dest, src);
+} else {
+  carried.push(`${CONFIG} (none in the root — target's left as it is)`);
+}
+for (const f of ['.env', 'admin-auth.json']) {
   if (!existsSync(join(ROOT, f))) continue;
   // A sealed folder keeps its secrets in .env.enc and has deleted .env on
   // purpose; copying the source checkout's plaintext back in would undo that.
@@ -261,7 +284,10 @@ From the source checkout, not here:
 
     npm run dist -- <path-to-this-folder>
 
-\`config.json\`, \`.env\`, \`logs\\\` and \`spool\\\` are left untouched by a rebuild.
+A rebuild REPLACES \`config.json\` with the source checkout's copy; if the one
+here differed, it is kept beside it as \`config.json.bak-<timestamp>\`. So make
+lasting config changes in the source checkout, not here. \`.env\`,
+\`admin-auth.json\`, \`logs\\\` and \`spool\\\` are left untouched by a rebuild.
 
 ## Sealing: binding this folder to this PC
 
