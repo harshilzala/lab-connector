@@ -240,10 +240,16 @@ function validRegex(v: string | null | undefined): boolean {
 /** `mode` / `use` — at the top of `hmis` and per analyzer. "mirth" is
  *  accepted for `use` as hinai's older name. */
 const HmisMode = z.enum(['single', 'both']);
-const HmisUse = z.enum(['hinai', 'genx', 'mirth']).transform((v) => (v === 'mirth' ? 'hinai' : v) as 'hinai' | 'genx');
+const HmisUse = z.enum(['hinai', 'genx', 'tatva', 'mirth']).transform((v) => (v === 'mirth' ? 'hinai' : v) as 'hinai' | 'genx' | 'tatva');
+/** Both mode: exactly two DIFFERENT lanes out of hinai / genx / tatva. */
+const HmisBoth = z
+  .array(HmisUse)
+  .length(2, 'hmis "both" names exactly two lanes, e.g. ["hinai", "genx"], ["hinai", "tatva"] or ["genx", "tatva"]')
+  .refine((v) => v[0] !== v[1], 'hmis "both" must name two different lanes');
 const HmisLaneSetting = z.object({
   mode: HmisMode.optional(),
   use: HmisUse.optional(),
+  both: HmisBoth.optional(),
 });
 
 const AnalyzerSchema = z.object({
@@ -582,6 +588,16 @@ const AnalyzerSchema = z.object({
        *  directly (a per-sample pending query) no more often than this — the
        *  order poll covers the normal case, this is the safety net. */
       recheckMs: z.number().int().min(30_000).default(5 * 60_000),
+      /** Staged: a value an HMIS REFUSED (GenX / Tatva answered it
+       *  unmatched, out of range or "filed 0") is sent again no sooner than
+       *  this after the last refusal — instead of on every pass. Null = the
+       *  same as recheckMs, the cadence HINAI's waiting samples are re-asked. */
+      refusedRetryMs: z.number().int().min(30_000).nullable().default(null),
+      /** Staged: once this long has passed since a value was FIRST refused, it
+       *  is no longer retried automatically: the sample is held with a message
+       *  for staff, and "File now" sends it again. 0 = keep retrying until
+       *  retention.days removes it. */
+      refusedGiveUpMs: z.number().int().min(0).default(24 * 60 * 60_000),
       /** Staged: a fully filed sample stays visible on the console for this
        *  many days, then its file is dropped. */
       keepFiledDays: z.number().int().min(0).max(30).default(2),
@@ -763,6 +779,11 @@ const ConfigSchema = z.object({
     resultsPath: z.string().default('/mirth/results'),
     timeoutMs: z.number().int().positive().default(15000),
     tlsRejectUnauthorized: z.boolean().default(true),
+    /** Host name -> IPv4 address, resolved by the connector itself — a hosts
+     *  file entry for this process only (no admin rights needed). The URL keeps
+     *  the NAME, so TLS is still verified against the certificate:
+     *  { "genxuat.zhhrpl.in": "43.205.50.17" }. Empty = normal DNS for all. */
+    hosts: z.record(z.string(), z.string().regex(/^\d{1,3}(\.\d{1,3}){3}$/, 'an IPv4 address')).default({}),
     /** Line-delimited JSON record of every gateway call: the query for a
      *  sample and whether orders came back, and each result upload with the
      *  request payload and the response it got. This is the BASE name: entries
@@ -786,10 +807,13 @@ const ConfigSchema = z.object({
      *  always did. Wins over `api` when both are given; an analyzer's own
      *  `hmis` block overrides it. New code reads lanes through lanesFor(). */
     mode: HmisMode.optional(),
-    /** Single mode only: "hinai" | "genx". Ignored in both mode. */
+    /** Single mode only: "hinai" | "genx" | "tatva". Ignored in both mode. */
     use: HmisUse.optional(),
-    /** Both mode: hold a sample whose patient id differs between HINAI and
-     *  GenX (addendum C2). Switch off only after checking real rows — HINAI
+    /** Both mode only: WHICH two lanes, e.g. ["hinai", "tatva"]. Absent =
+     *  ["hinai", "genx"] (the pair both mode always meant). */
+    both: HmisBoth.optional(),
+    /** Both mode: hold a sample whose patient id differs between its two
+     *  lanes (addendum C2). Switch off only after checking real rows — HINAI
      *  may give an MRN where GenX gives a UHID numbered differently, which
      *  would hold every sample. */
     patientCheck: z.boolean().default(true),
@@ -835,16 +859,53 @@ const ConfigSchema = z.object({
          *  it as a JSON body `{ <autoCertifyParam>: <lineId> }`. */
         autoCertifyMethod: z.enum(['GET', 'POST']).default('GET'),
         autoCertifyParam: z.string().min(1).default('labresultid'),
+        /** Which GenX contract to speak:
+         *    "integration-v1" — the integration-service gateway
+         *       (/integration-service/external/v1/lab/equipment/*, OAuth), the
+         *       settings above (src/hmis/genx.ts);
+         *    "lims-node" — lims-node's own connector routes
+         *       ({lims.apiPrefix}/connector/orders|acknowledge|results), login
+         *       token + module-code header (src/hmis/genx-lims.ts). Uses
+         *       baseUrl, apiKey, serviceTests, pendingLineStatuses, batchDays
+         *       from above and the `lims` block below. */
+        profile: z.enum(['integration-v1', 'lims-node']).default('integration-v1'),
+        lims: z
+          .object({
+            /** auth-node host for the login; empty = baseUrl. */
+            authBaseUrl: z.union([z.string().url(), z.literal('')]).default(''),
+            /** "login" = POST {loginPath} userName/password (the collection's
+             *  way); "oauth" = client_credentials on tokenPath with clientId. */
+            auth: z.enum(['login', 'oauth']).default('login'),
+            loginPath: z.string().default('/api/auth/login'),
+            /** Env GENX_USERNAME / GENX_PASSWORD win. */
+            username: z.string().default(''),
+            password: z.string().default(''),
+            moduleCode: z.string().default('DS'),
+            apiPrefix: z.string().default('/api/v1/lab'),
+            /** Empty = {apiPrefix}/connector/orders | acknowledge | results,
+             *  {apiPrefix}/lines/auto-certify. */
+            ordersPath: z.string().default(''),
+            acknowledgePath: z.string().default(''),
+            resultsPath: z.string().default(''),
+            autoCertifyPath: z.string().default(''),
+            /** The tube field the analyzer reads as its barcode. */
+            barcodeField: z.enum(['barcode', 'sampleNumber', 'accessionNumber']).default('barcode'),
+            /** Sent as reliabilityPct on results when set. */
+            reliabilityPct: z.number().min(0).max(100).nullable().default(null),
+          })
+          .prefault({}),
       })
       .prefault({}),
-    /** Tatva v1 — the ZyHos HMIS partner Lab Middleware API (contract v3.1).
-     *  POST-ONLY for now: with `enabled`, every analyzer on the HINAI lane
-     *  (single or both mode) keeps taking its orders from HINAI and posts its
-     *  RESULTS here instead of /mirth/results. Built on the GenX library —
-     *  see src/hmis/tatva.ts. */
+    /** Tatva v1 — the ZyHos HMIS partner Lab Middleware API (contract v3.1),
+     *  its own lane: used by every analyzer whose lanes include "tatva"
+     *  (`use: "tatva"`, or "tatva" in `both`). Never used by default. Built on
+     *  the GenX library — see src/hmis/tatva.ts. */
     tatva: z
       .object({
-        enabled: z.boolean().default(false),
+        /** REMOVED — Tatva is a lane now. Kept only so an old config that
+         *  still says `enabled: true` is refused with a pointer to `use` /
+         *  `both` instead of silently changing where results go. */
+        enabled: z.boolean().optional(),
         /** API profile. Only "tatva-v1" exists today. */
         profile: z.literal('tatva-v1').default('tatva-v1'),
         /** "oauth" = partner API, one client_id/secret for the connector;
@@ -852,8 +913,16 @@ const ConfigSchema = z.object({
          *  X-Equipment-ID / X-Equipment-Secret (analyzers[].tatva). Never
          *  both on one instrument. */
         auth: z.enum(['oauth', 'equipment']).default('oauth'),
-        /** API origin — NOT the /app staff portal. */
-        baseUrl: z.union([z.string().url(), z.literal('')]).default('https://hmispreprod.zydushospitals.com'),
+        /** Where the Tatva lane's ORDERS come from:
+         *    "hinai" — HINAI's /mirth/pending (the two share a synced database),
+         *              results posted to Tatva. Needs the hinai block. Works
+         *              with either auth.
+         *    "tatva" — Tatva's own worklist ({apiPrefix}/lab/equipment/worklist),
+         *              mapped like GenX with serviceTests / equipmentServices.
+         *              Needs auth "oauth". */
+        orders: z.enum(['hinai', 'tatva']).default('hinai'),
+        /** API origin — NOT the /app staff portal. No default: set it. */
+        baseUrl: z.union([z.string().url(), z.literal('')]).default(''),
         /** "/external/v1" or the alternate "/integration-service/external/v1". */
         apiPrefix: z.string().default('/external/v1'),
         tokenPath: z.string().default('/oauth/token'),
@@ -897,8 +966,19 @@ const ConfigSchema = z.object({
          *  as the accessionNumber, no lookup. */
         barcodeField: z.enum(['sampleNumber', 'accessionNumber']).default('sampleNumber'),
         accessionCacheFile: z.string().nullable().default('./spool/tatva-accessions.json'),
-        /** After a post: acknowledge in the system the orders came from
-         *  ("orders" = HINAI, unchanged), in Tatva v1 ("tatva"), or not at all. */
+        /** orders "tatva" only — the same order mapping as hmis.genx:
+         *  serviceCode → analyzer assay codes, equipmentCode → serviceCodes
+         *  (unlisted = all), the line statuses that count as pending, and the
+         *  order-poll batch window. */
+        serviceTests: z.record(z.string(), z.array(z.string())).default({}),
+        equipmentServices: z.record(z.string(), z.array(z.string())).default({}),
+        pendingLineStatuses: z.array(z.string()).default(['PENDING']),
+        batchDays: z.number().int().nonnegative().default(1),
+        batchPageSize: z.number().int().positive().max(500).default(100),
+        /** orders "hinai": after a post, acknowledge in HINAI ("orders"), in
+         *  Tatva v1 ("tatva"), or not at all. In both mode with HINAI as the
+         *  other lane, "orders" is skipped — the HINAI lane acknowledges.
+         *  orders "tatva": the acknowledge always goes to Tatva ("off" = none). */
         acknowledge: z.enum(['orders', 'tatva', 'off']).default('orders'),
         /** Tatva v1's own transaction log (hmis-tatva-YYYY-MM-DD.log); null = off. */
         auditLog: z.string().nullable().default('./logs/hmis-tatva.log'),
@@ -965,7 +1045,19 @@ const ConfigSchema = z.object({
   // one block (IM) may file into both while the rest stay on one.
   const lanes = c.analyzers.map((a) => lanesFor(a, c));
   const anyGenx = lanes.some((l) => l.includes('genx'));
-  const anyHinai = lanes.some((l) => l.includes('hinai'));
+  const anyTatva = lanes.some((l) => l.includes('tatva'));
+  // HINAI's gateway is needed for the HINAI lane, and for a Tatva lane that
+  // takes its orders from HINAI.
+  const anyHinai = lanes.some((l) => l.includes('hinai')) || (anyTatva && c.hmis.tatva.orders === 'hinai');
+  if (c.hmis.tatva.enabled !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['hmis', 'tatva', 'enabled'],
+      message:
+        'hmis.tatva.enabled was removed — Tatva is its own HMIS lane now. Delete "enabled" and pick it with ' +
+        'hmis "use": "tatva" (single) or "both": ["hinai", "tatva"] (both mode); "tatva.orders": "hinai" keeps the orders coming from HINAI',
+    });
+  }
   if (anyGenx) {
     if (!c.hmis.genx.baseUrl) {
       ctx.addIssue({
@@ -985,6 +1077,8 @@ const ConfigSchema = z.object({
     const listed = new Set(Object.keys(c.hmis.genx.equipmentServices).map((k) => k.trim().toUpperCase()));
     c.analyzers.forEach((a, i) => {
       if (!lanes[i]!.includes('genx')) return;
+      // lims-node filters connector/orders by equipmentCode on the server.
+      if (c.hmis.genx.profile === 'lims-node') return;
       const pushes = a.protocol === 'hl7' && a.hl7.orderPush.enabled && a.orderPoll.enabled && a.orderPoll.download;
       if (!pushes) return;
       const codes = [a.equipmentCode, ...a.extraEquipmentCodes];
@@ -998,19 +1092,49 @@ const ConfigSchema = z.object({
       });
     });
   }
-  if (anyHinai && c.hmis.tatva.enabled) {
+  if (anyTatva) {
     const t = c.hmis.tatva;
     if (!t.baseUrl) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'tatva', 'baseUrl'], message: 'required when hmis.tatva.enabled is true' });
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['hmis', 'tatva', 'baseUrl'],
+        message: 'required when hmis "use" is "tatva" or an analyzer\'s HMIS lanes include tatva',
+      });
+    }
+    if (t.orders === 'tatva' && t.auth !== 'oauth') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['hmis', 'tatva', 'orders'],
+        message: 'tatva.orders "tatva" reads the Tatva worklist, which needs auth "oauth" — use orders "hinai" with auth "equipment"',
+      });
     }
     if (!!t.tls.certFile !== !!t.tls.keyFile) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['hmis', 'tatva', 'tls'], message: 'mTLS needs both certFile and keyFile' });
+    }
+    // orders "tatva" reads a GenX-style worklist: the same rule as GenX for a
+    // machine that PUSHES orders (see the genx block above).
+    if (t.orders === 'tatva') {
+      const listed = new Set(Object.keys(t.equipmentServices).map((k) => k.trim().toUpperCase()));
+      c.analyzers.forEach((a, i) => {
+        if (!lanes[i]!.includes('tatva')) return;
+        const pushes = a.protocol === 'hl7' && a.hl7.orderPush.enabled && a.orderPoll.enabled && a.orderPoll.download;
+        if (!pushes) return;
+        const codes = [a.equipmentCode, ...a.extraEquipmentCodes];
+        if (codes.some((code) => listed.has(code.trim().toUpperCase()))) return;
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['analyzers', i, 'equipmentCode'],
+          message:
+            `analyzer "${a.id}" pushes orders (hl7.orderPush) but hmis.tatva.equipmentServices has no entry for ` +
+            `${codes.join(' / ')} — Tatva would hand it every service on every tube. List the serviceCodes this machine runs there.`,
+        });
+      });
     }
     // Equipment auth: every machine whose results go to Tatva v1 needs its
     // own credential — without one its results would have nowhere to go.
     if (t.auth === 'equipment') {
       c.analyzers.forEach((a, i) => {
-        if (!lanes[i]!.includes('hinai')) return;
+        if (!lanes[i]!.includes('tatva')) return;
         if (a.tatva?.equipmentId && a.tatva.equipmentSecret) return;
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -1154,6 +1278,15 @@ function applyEnvOverrides(raw: any): any {
     if (process.env.GENX_API_KEY) g.apiKey = process.env.GENX_API_KEY;
     cfg.hmis = { ...h, genx: g };
   }
+  // lims-node login (hmis.genx.lims): keep the user/password out of config.json.
+  if (process.env.GENX_USERNAME || process.env.GENX_PASSWORD) {
+    const h = cfg.hmis ?? {};
+    const g = { ...(h.genx ?? {}) };
+    const l = { ...(g.lims ?? {}) };
+    if (process.env.GENX_USERNAME) l.username = process.env.GENX_USERNAME;
+    if (process.env.GENX_PASSWORD) l.password = process.env.GENX_PASSWORD;
+    cfg.hmis = { ...h, genx: { ...g, lims: l } };
+  }
   applyTatvaEnv(cfg);
   if (process.env.ADMIN_AUTH_FILE) cfg.admin = { ...cfg.admin, authFile: process.env.ADMIN_AUTH_FILE };
   if (process.env.AUTOCERTIFY_ORACLE_PASSWORD) {
@@ -1165,8 +1298,10 @@ function applyEnvOverrides(raw: any): any {
 
 /** TATVA_* environment variables → hmis.tatva and analyzers[].tatva. */
 const TATVA_ENV: Record<string, string> = {
-  TATVA_ENABLED: 'enabled',
+  // TATVA_ENABLED is gone with hmis.tatva.enabled: the lane is chosen with
+  // hmis "use" / "both" in config.json, never from the environment.
   TATVA_AUTH: 'auth',
+  TATVA_ORDERS: 'orders',
   TATVA_BASE_URL: 'baseUrl',
   TATVA_API_PREFIX: 'apiPrefix',
   TATVA_CLIENT_ID: 'clientId',
@@ -1184,7 +1319,7 @@ function applyTatvaEnv(cfg: any): void {
   for (const [name, field] of Object.entries(TATVA_ENV)) {
     const v = env[name];
     if (v === undefined || v === '') continue;
-    t[field] = field === 'enabled' ? v.trim().toLowerCase() === 'true' : v;
+    t[field] = v;
     touched = true;
   }
   const tls: Record<string, unknown> = { ...((t.tls as object) ?? {}) };

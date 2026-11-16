@@ -26,9 +26,10 @@
     "includeSpoolPending": true
   },
 
-  // HMIS — the system(s) orders come from and results are filed into. Two
+  // HMIS — the system(s) orders come from and results are filed into. Three
   // exist, called LANES: "hinai" (the Zydus HIMS /mirth/* gateway, the keys at
-  // the top of this block) and "genx" (GenX LIMS, the "genx" block below).
+  // the top of this block), "genx" (GenX LIMS, the "genx" block below) and
+  // "tatva" (Tatva v1, the "tatva" block; used only when a lane names it).
   //
   // HINAI: the three /mirth/* endpoints. UNAUTHENTICATED — the analyzer is
   // identified only by the `eqCode` query parameter, so keep the connector on
@@ -51,18 +52,21 @@
     // decides ("mirth"/"hinai" = single on HINAI, "genx" = single on GenX), so
     // a config written before these keys reads exactly as before. "mode" and
     // "use" win over "api" when both are written.
-    //   "mode": "single", "use": "hinai"   one system: HINAI (the keys above)
-    //   "mode": "single", "use": "genx"    one system: GenX (the "genx" block)
-    //   "mode": "both"                     HINAI AND GenX ("use" is ignored)
+    //   "mode": "single", "use": "hinai"   one lane: HINAI (the keys above)
+    //   "mode": "single", "use": "genx"    one lane: GenX (the "genx" block)
+    //   "mode": "single", "use": "tatva"   one lane: Tatva v1 (the "tatva" block)
+    //   "mode": "both", "both": ["hinai", "genx"]   two different lanes ("use" is ignored)
     // An analyzer block (or the "im" block) may carry its own
-    // "hmis": { "mode": ..., "use": ... }, which wins for that machine alone.
+    // "hmis": { "mode": ..., "use": ..., "both": [...] }, which wins for that machine alone.
     // Each lane any analyzer uses needs its base URL (baseUrl above,
     // genx.baseUrl below). Both mode always files through the staged store and
     // HOLDS a tube that only one system lists — see "HMIS: single or both" in
     // the README. UPGRADING: start the new version in the mode the site already
     // runs, and change mode only after that first start (README, "Upgrading").
     // "mode": "single",
-    // "use": "hinai",
+    // "use": "hinai",                    // "hinai" | "genx" | "tatva"
+    // "both": ["hinai", "genx"],         // with "mode": "both": exactly two different lanes, one of
+    //                                    // ["hinai","genx"], ["hinai","tatva"], ["genx","tatva"]
 
     // Both mode only: before filing, compare the patient id HINAI and GenX give
     // for the barcode, and HOLD the sample (nothing filed, File now and Force
@@ -99,15 +103,14 @@
     // },
 
     // Tatva v1 — ZyHos HMIS partner Lab Middleware API (contract v3.1), built
-    // on the GenX library. POST-ONLY rollout: with "enabled": true, every
-    // analyzer on the HINAI lane (single AND both/twin mode) keeps taking its
-    // orders from HINAI and posts its RESULTS here instead of /mirth/labresult.
-    // GenX is untouched. "enabled": false puts results back on HINAI.
-    // Paths default to {apiPrefix}/lab/equipment/{worklist,acknowledge,results}.
+    // on the GenX library. A THIRD lane, "tatva", beside "hinai" and "genx":
+    // an analyzer uses it only when its lanes name it (hmis.use or hmis.both).
+    // Never used by default. Its baseUrl has no default and is required only
+    // when some analyzer's lanes include tatva. Paths default to
+    // {apiPrefix}/lab/equipment/{worklist,acknowledge,results}.
     // "tatva": {
-    //   "enabled": true,
     //   "profile": "tatva-v1",
-    //   "baseUrl": "https://hmispreprod.zydushospitals.com",   // API origin, NOT /app
+    //   "baseUrl": "",                     // required when a lane uses tatva — no default
     //   "apiPrefix": "/external/v1",       // or "/integration-service/external/v1"
     //   "tokenPath": "/oauth/token",
     //   "clientId": "",                    // better via env TATVA_CLIENT_ID
@@ -115,10 +118,11 @@
     //   "clientAuth": "body",              // client_id/secret as form fields
     //   "scope": "lab.equipment.worklist.read lab.equipment.acknowledge lab.equipment.result.publish",
     //   "apiKey": "",                      // PROD when issued; env TATVA_API_KEY
+    //   "orders": "hinai",                 // "hinai" = HINAI's pending list; "tatva" = Tatva's worklist (needs auth "oauth")
     //   // Tube barcode = sampleNumber: the accessionNumber is looked up once
     //   // on the worklist (?barcode=) and cached. "accessionNumber" = no lookup.
     //   "barcodeField": "sampleNumber",
-    //   // After filing, acknowledge in HINAI ("orders", unchanged), "tatva", or "off".
+    //   // Acknowledge after filing: "orders" (the source of the orders), "tatva", or "off".
     //   "acknowledge": "orders",
     //   "auditLog": "./logs/hmis-tatva.log"
     // },

@@ -10,13 +10,18 @@ import type { TatvaEquipmentOptions } from './tatva-equipment.js';
 // Tatva v1 — ZyHos HMIS "Lab Middleware API" (contract v3.1,
 // ZyHos-Preprod-Lab-Middleware.postman_collection.json, 2026-11).
 //
-// ROLLOUT (2026-11): POST-ONLY. The new system and HINAI share one (synced)
-// database, so the orders the analyzers already get from HINAI are the same
-// tubes. With `hmis.tatva.enabled`, the HINAI lane keeps its order side
-// (pending poll, download, joins) and only the RESULT POST goes to Tatva v1 —
-// HINAI's /mirth results endpoint is no longer called. Applies in single AND
-// both (twin) mode; the GenX lane is untouched. `enabled: false` = back to
-// HINAI with no other change.
+// A LANE OF ITS OWN (2026-11-17): "tatva" sits beside "hinai" and "genx"
+// (src/hmis/lanes.ts) and is picked like them — hmis "use": "tatva" (single)
+// or "tatva" in hmis "both" (with HINAI or GenX). Nothing uses it by default.
+//
+// Where the lane's ORDERS come from is `hmis.tatva.orders`:
+//   "hinai" (default) — the new system and HINAI share one synced database,
+//            so the lane reads HINAI's pending rows (ResultRoutedGateway) and
+//            posts its results to Tatva v1. In both mode with HINAI the HINAI
+//            lane files to /mirth as before and the Tatva lane files the same
+//            tubes to Tatva v1.
+//   "tatva"  — the lane reads Tatva's own worklist (auth "oauth" only),
+//            mapped like GenX (serviceTests / equipmentServices).
 //
 // TWO WAYS TO AUTHENTICATE (`hmis.tatva.auth`). The contract forbids mixing
 // them on one instrument.
@@ -67,6 +72,14 @@ export interface TatvaSettings {
   organizationId?: string;
   sendUnitAndFlag?: boolean;
   tls?: { certFile: string; keyFile: string; caFile: string; passphrase: string } | null;
+  /** Where the Tatva lane's orders come from (see hmis.tatva.orders). */
+  orders?: 'hinai' | 'tatva';
+  /** orders "tatva": the GenX-style order mapping. */
+  serviceTests?: Record<string, string[]>;
+  equipmentServices?: Record<string, string[]>;
+  pendingLineStatuses?: string[];
+  batchDays?: number;
+  batchPageSize?: number;
 }
 
 interface Common {
@@ -117,13 +130,18 @@ export function tatvaClientOptions(s: TatvaSettings, common: Common): GenxClient
     apiKey: s.apiKey || undefined,
     apiKeyHeader: s.apiKeyHeader,
     barcodeField: s.barcodeField,
-    // Post-only: the worklist is read only to turn a tube barcode into its
-    // accessionNumber, so no service expansion is configured.
-    serviceTests: {},
-    equipmentServices: {},
-    pendingLineStatuses: ['PENDING'],
-    batchDays: 0,
-    batchPageSize: 100,
+    // Orders from HINAI: the worklist is read only to turn a tube barcode
+    // into its accessionNumber, so no service expansion is configured.
+    // Orders from Tatva: the worklist IS the order source, mapped like GenX.
+    ...(s.orders === 'tatva'
+      ? {
+          serviceTests: s.serviceTests ?? {},
+          equipmentServices: s.equipmentServices ?? {},
+          pendingLineStatuses: s.pendingLineStatuses ?? ['PENDING'],
+          batchDays: s.batchDays ?? 1,
+          batchPageSize: s.batchPageSize ?? 100,
+        }
+      : { serviceTests: {}, equipmentServices: {}, pendingLineStatuses: ['PENDING'], batchDays: 0, batchPageSize: 100 }),
     accessionCacheFile: s.accessionCacheFile ?? undefined,
     extraHeaders: tatvaHeaders(s),
     tls: tatvaTls(s),
@@ -180,6 +198,9 @@ export class ResultRoutedGateway implements HmisGateway {
   }
   get ignoresPollFilters(): boolean | undefined {
     return this.orders.ignoresPollFilters;
+  }
+  get rowStyle(): 'genx' | 'hinai' | undefined {
+    return this.orders.rowStyle;
   }
 
   getPending(q: PendingQuery): Promise<unknown> {

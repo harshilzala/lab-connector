@@ -296,9 +296,9 @@ try {
   console.log('✓ results: filed and acknowledged in both lanes; GenX lines 310001 and 310002 certified (GET ?labresultid=)');
 
   await sendResult(K2, { HIVC: 'Non Reactive' });
-  await until('K2 to be held', () => /only in hinai/i.test(stored(K2)?.lastError ?? ''));
-  assert.equal(hinaiPosted.filter((r) => r.sampleId === K2).length, 0, 'held: nothing posted to HINAI');
-  console.log('✓ a tube only HINAI lists is held');
+  await until('K2 filed in HINAI (no cross-lane hold)', () => hinaiPosted.filter((r) => r.sampleId === K2).length >= 1);
+  await until('K2 says GenX has no order', () => /GenX has no order/i.test(stored(K2)?.lastError ?? ''));
+  console.log('✓ a tube only HINAI lists is filed to HINAI at once');
 
   await wait(6000); // a filing pass and a poll
   assert.equal(certifiedLines().join(), '310001,310002', 'no line certified twice');
@@ -339,9 +339,10 @@ try {
     const certError = [...deepFind(ch, /certif.*error|error.*certif/i), ...certTrees.flatMap((t) => deepFind(t, /error/i))];
     assert.ok(certError.length > 0, `a last certify error field is present (${text.slice(0, 600)})`);
     const held = deepFind(ch, /held/i).map((x) => ({ ...x, n: countOf(x.value) }));
-    assert.ok(held.some((x) => x.n === 1), `held count 1 (${JSON.stringify(held)})`);
+    // K2 (only in HINAI) filed there at once — no cross-lane hold, so nothing is held.
+    assert.ok(held.some((x) => x.n === 0), `held count 0 (${JSON.stringify(held)})`);
     const filed = deepFind(ch, /filed/i).map((x) => ({ ...x, n: countOf(x.value) }));
-    assert.ok(filed.filter((x) => x.n === 3).length >= 2, `per-lane values filed: 3 in HINAI and 3 in GenX (${JSON.stringify(filed)})`);
+    assert.ok(filed.filter((x) => x.n >= 3).length >= 2, `per-lane values filed: 3 in HINAI and 3 in GenX (${JSON.stringify(filed)})`);
     console.log('✓ Auto Certify API: mode, lanes, per-lane filed, held, GenX certified/failed counts present');
 
     const all = JSON.stringify(data);

@@ -1,9 +1,12 @@
 import { loadConfig } from './config.js';
 import { logger } from './logger.js';
 import { Connector } from './connector.js';
+import { installHostPins } from './hmis/hosts.js';
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
+  // Before any gateway client exists: their first lookup must already see it.
+  installHostPins(cfg.hmis.hosts, logger);
   const connector = new Connector(cfg, logger);
   await connector.start();
 

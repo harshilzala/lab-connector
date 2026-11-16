@@ -312,9 +312,9 @@ try {
     assert.equal(genxFor(F13).length, g);
   });
 
-  await check('Force on a sample held (tube only in HINAI) sends nothing to GenX', async () => {
+  await check('Force on a tube only in HINAI sends nothing to GenX', async () => {
     await sendResult(H14, { TSH3: '9.9' });
-    await until('H14 held', () => /only in HINAI/.test(stored(H14)?.lastError ?? ''));
+    await until('H14 filed in HINAI (no cross-lane hold)', () => hinaiFor(H14).length >= 1);
     const res = await post(`/api/analyzers/im/staged/${H14}/force`, { password: 'force-me' });
     assert.equal(res.status, 200, await res.text());
     assert.equal(genxFor(H14).length, 0, 'GenX has no row for it: nothing sent');
@@ -344,7 +344,7 @@ try {
   });
 
   // ---- 13) the page scripts against the live both-mode API ----------------------
-  await check('dashboard script: cards say "HINAI + GenX (both)", Results tab shows lane counts and the hold', async () => {
+  await check('dashboard script: cards say "HINAI + GenX (both)", Results tab shows lane counts and no lane hold', async () => {
     const html = renderDashboard({ username: 'tester' } as never);
     const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
     const nodes: Record<string, ReturnType<typeof element>> = {};
@@ -366,7 +366,7 @@ try {
     assert.ok(nodes.cards!.innerHTML.includes('HINAI + GenX (both)'), 'the card names both lanes');
     const el = element('staged');
     await ctx.renderStaged('im', el);
-    assert.ok(el.innerHTML.includes('held: only in HINAI'), 'the Results tab shows the hold');
+    assert.ok(!el.innerHTML.includes('held: only in'), 'a tube in one lane is not shown as held');
     assert.ok(/HINAI \d+\/\d+/.test(el.innerHTML) && /GenX \d+\/\d+/.test(el.innerHTML), 'and per-lane counts');
   });
 

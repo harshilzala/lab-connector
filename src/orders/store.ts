@@ -119,7 +119,13 @@ export class OrderStore {
     barcode: string,
     pending: PendingOrders,
     source: OrderSource,
-    opts: { neverDownload?: ReadonlySet<string> } = {},
+    opts: {
+      neverDownload?: ReadonlySet<string>;
+      /** Both HMIS mode: how two lanes' spellings of one assay are folded
+       *  together, so a RE-ORDER in either lane clears every spelling of it
+       *  from `downloaded` and the instrument runs it again. */
+      sameAssay?: (identifier: string) => string;
+    } = {},
   ): UpsertResult {
     const key = canonicalBarcode(barcode);
     const now = new Date().toISOString();
@@ -177,6 +183,10 @@ export class OrderStore {
       if (have && have.labResultId !== row.labResultId) {
         // Re-ordered: the instrument must run it again.
         downloaded.delete(codeKey(row.identifier));
+        if (opts.sameAssay) {
+          const k = opts.sameAssay(row.identifier);
+          for (const c of order.downloaded) if (opts.sameAssay(c) === k) downloaded.delete(codeKey(c));
+        }
       }
       byCode.set(k, row);
       changed = true;
@@ -199,6 +209,35 @@ export class OrderStore {
     if (order.priority === 'R' && pending.priority === 'S') {
       order.priority = 'S';
       changed = true;
+    }
+
+    // LOCAL-PATCH-ABG (2026-11-15, ported from the live bundle). Radiometer
+    // ABL800, ABG service 2211 (BIO0000265): HMIS lists the six gas rows on
+    // EC013 for under a minute and then drops them, so the 60 s poll often
+    // missed them and the gas values stayed unfiled. HMIS still accepts posts
+    // for those parameters under the order's labResultId, so any ABL800 order
+    // that has 2211 rows gets the missing gas rows, cloned from a 2211 row.
+    try {
+      if (/radiometer-abl800/.test(String(this.dir))) {
+        const gas: Array<[string, number]> = [['pH', 1332], ['pCO2', 1333], ['pO2', 1334], ['HCO3-', 1336], ['ABE', 1337], ['sO2', 1339]];
+        const rows = [...byCode.values()];
+        const ids = new Set(rows.map((r) => String(r.identifier || '').toLowerCase()));
+        const pids = new Set(rows.filter((r) => Number(r.labServiceId) === 2211).map((r) => r.parameterId));
+        const template = rows.find((r) => Number(r.labServiceId) === 2211 && r.resultType === 'PARAMETER' && !r.quarantined);
+        if (template) {
+          for (const [identifier, parameterId] of gas) {
+            if (ids.has(identifier.toLowerCase()) || pids.has(parameterId as never)) continue;
+            const row = { ...template, identifier, parameterId, localPatch: 'ABG' } as unknown as MirthAcknowledgeItem;
+            const k = rowKey(row, this.defaultLane);
+            if (k && !byCode.has(k)) {
+              byCode.set(k, row);
+              changed = true;
+            }
+          }
+        }
+      }
+    } catch {
+      /* a patch failure must never stop the order being stored */
     }
 
     order.rows = [...byCode.values()];

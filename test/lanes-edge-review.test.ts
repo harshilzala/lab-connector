@@ -450,7 +450,7 @@ await check('D6 Force during a pass waits for it: never two posts in flight', as
 });
 
 await check('D6 File now during a running pass still runs as the operator', async () => {
-  const B = 'D6N'; // only in HINAI: held unless the operator pushes it
+  const B = 'D6N'; // only in HINAI: filed there at once; File now closes GenX
   const X = 'D6X'; // keeps the pass busy
   gx.tubes.push(gtube(X, [[903, 'TSHONLY']]));
   const { rt, inner, H } = build('d6n');
@@ -458,7 +458,8 @@ await check('D6 File now during a running pass still runs as the operator', asyn
   H.add(X, 'TSH3', 93002);
   stage(inner, B, { TSH3: '5.0' });
   await pass(inner);
-  assert.match(inner.staged.get(B)!.lastError ?? '', /only in HINAI/);
+  assert.equal(H.postedFor(B).length, 1, 'filed to HINAI on the first pass — no cross-lane hold');
+  assert.match(inner.staged.get(B)!.lastError ?? '', /GenX has no order/);
   stage(inner, X, { TSH3: '6.0' });
   H.hold();
   const running = pass(inner);

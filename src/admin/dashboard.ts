@@ -395,7 +395,7 @@ function statusPill(a) {
 }
 // HMIS lanes (both mode files into HINAI and GenX). The API sends lane names
 // only; the page spells them.
-function laneName(l) { return l === 'genx' ? 'GenX' : l === 'hinai' ? 'HINAI' : String(l || ''); }
+function laneName(l) { return l === 'genx' ? 'GenX' : l === 'hinai' ? 'HINAI' : l === 'tatva' ? 'Tatva' : String(l || ''); }
 function hmisLine(a) {
   const lanes = a.lanes || [];
   if (!lanes.length) return '&mdash;';

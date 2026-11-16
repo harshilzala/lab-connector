@@ -32,6 +32,21 @@ export class HmisUnavailableError extends Error {
   }
 }
 
+/**
+ * The gateway answered, and filed NONE of the values sent (GenX "filed 0",
+ * every code unmatched / out of range, Tatva v1 "filed 0"). A verdict on
+ * those values — an unmapped parameter, a value outside the reportable range
+ * — not an outage. `refused` names the identifiers (upper-cased) it refused;
+ * the staged filer then retries them only at the recheck cadence and gives
+ * up after filing.refusedGiveUpMs instead of re-posting on every pass.
+ */
+export class HmisRefusedError extends Error {
+  constructor(message: string, readonly refused: string[]) {
+    super(message);
+    this.name = 'HmisRefusedError';
+  }
+}
+
 export interface HmisClientOptions {
   baseUrl: string;
   pendingPath: string;
@@ -80,6 +95,12 @@ export interface HmisGateway {
    *  once per code x site x day — before 2026-10 GenX was fetched
    *  lookbackDays+1 times every tick for the same answer. */
   readonly ignoresPollFilters?: boolean;
+  /** "genx" when the order rows come from a GenX-style worklist (GenX, or
+   *  Tatva reading its own worklist): one row per result line, placed by
+   *  machineTestCode, never rebuilt from the HINAI parameter catalogue.
+   *  Absent = HINAI-style /mirth rows. Decides the filing rules, so a lane
+   *  is handled by what its gateway IS, not by its name. */
+  readonly rowStyle?: 'genx' | 'hinai';
   /** GenX only: certify one result line (analyzer genxAutoCertify). */
   autoCertify?(lineId: number, eqCode?: string, barcode?: string): Promise<void>;
 }

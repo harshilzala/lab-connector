@@ -147,7 +147,7 @@ export interface MirthAcknowledgeItem {
    *  body. A row stored before lanes existed has none until the one-time
    *  migration at the first start (src/orders/store.ts migrateLanes); null =
    *  quarantined there, lane unknown. */
-  source?: 'hinai' | 'genx' | null;
+  source?: 'hinai' | 'genx' | 'tatva' | null;
   /** Tagged by that migration, not by a gateway response — never backs a
    *  GenX auto-certify. */
   migrated?: boolean;
@@ -172,7 +172,7 @@ export interface PendingOrders {
   ackItems: MirthAcknowledgeItem[];
   /** The patient each HMIS lane gives for the tube (both mode compares
    *  them). Set only when the rows were fetched for a named lane. */
-  patients?: Partial<Record<'hinai' | 'genx', PatientDemographics | null>>;
+  patients?: Partial<Record<'hinai' | 'genx' | 'tatva', PatientDemographics | null>>;
 }
 
 // POST {resultsPath}

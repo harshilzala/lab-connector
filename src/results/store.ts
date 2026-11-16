@@ -71,6 +71,14 @@ export interface LaneFiling {
   /** Filed against a row the C1 migration attributed — its line is never
    *  auto-certified. */
   migrated?: boolean;
+  /** NOT filed: this lane's HMIS answered and refused the value (GenX /
+   *  Tatva `unmatched`, out of range, "filed 0"). First and latest refusal
+   *  and how many — the filer retries it only every filing.recheckMs and
+   *  stops after filing.refusedGiveUpMs (src/results/filer.ts). Cleared by a
+   *  successful filing; a rerun replaces the value and starts it afresh. */
+  refusedFirstAt?: string;
+  refusedLastAt?: string;
+  refusals?: number;
 }
 
 /** One value just filed, as the filer reports it to the store. */
@@ -165,7 +173,7 @@ export interface StagedSummary {
   /** Both HMIS mode only: the sample is held because its tube is in only
    *  some lanes (`in`), waiting for the rest — lane names, which the page
    *  spells ("held: only in HINAI"). Null when it is not held. */
-  held?: { in: Lane[]; waitingFor: Lane[] } | { mismatch: { hinai: string; genx: string } } | null;
+  held?: { in: Lane[]; waitingFor: Lane[] } | { mismatch: Partial<Record<Lane, string>> } | null;
   /** The interfaced parameters of this sample, in the order received — what
    *  the console lists under the barcode. Values the interface is not scoped
    *  to (dropped as "ignored") are left out; a void placeholder is shown so
@@ -581,6 +589,38 @@ export class ResultStore {
         v.labResultId = first?.labResultId ?? null;
       }
     }
+    s.updatedAt = at;
+    this.write(s);
+  }
+
+  /**
+   * These values were sent to `lane` and its HMIS refused them. Recorded on
+   * the value's lane entry (filedAt stays null — the value keeps waiting) so
+   * the filer can pace the retries. A value replaced since the upload is not
+   * touched: the new value has not been refused.
+   */
+  markRefused(barcode: string, lane: Lane, testCodes: string[], at = new Date().toISOString(), expect?: UploadSnapshot): void {
+    const s = this.get(barcode);
+    if (!s || !testCodes.length) return;
+    let changed = false;
+    for (const code of testCodes) {
+      const v = s.values[code];
+      if (!v || v.filedAt !== null || v.lanes?.[lane]?.filedAt || !unchangedSince(v, expect)) continue;
+      const prev = v.lanes?.[lane];
+      v.lanes = {
+        ...(v.lanes ?? {}),
+        [lane]: {
+          filedAt: null,
+          identifier: prev?.identifier ?? null,
+          labResultId: prev?.labResultId ?? null,
+          refusedFirstAt: prev?.refusedFirstAt ?? at,
+          refusedLastAt: at,
+          refusals: (prev?.refusals ?? 0) + 1,
+        },
+      };
+      changed = true;
+    }
+    if (!changed) return;
     s.updatedAt = at;
     this.write(s);
   }

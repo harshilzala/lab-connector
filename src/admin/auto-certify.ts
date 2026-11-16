@@ -318,7 +318,7 @@ function orderCard(m) {
 }
 // Where IM's results are filed: HINAI, GenX, or both side by side. The API
 // sends lane names only ("hinai" / "genx"); they are spelled here.
-function laneName(l) { return l === 'genx' ? 'GenX' : l === 'hinai' ? 'HINAI' : String(l || ''); }
+function laneName(l) { return l === 'genx' ? 'GenX' : l === 'hinai' ? 'HINAI' : l === 'tatva' ? 'Tatva' : String(l || ''); }
 function hmisRows(m) {
   const h = m && m.hmis;
   if (!h) return '';
@@ -332,7 +332,7 @@ function hmisRows(m) {
     if (!l.ok) out += kv(esc(laneName(l.lane)) + ' order poll', '<span class="chan-err">' + esc(l.lastError) + '</span>');
   }
   if (h.mode === 'both') {
-    out += kv('Held &mdash; order in one HMIS only', h.held ? '<span style="color:var(--warn)">' + esc(h.held) + '</span>' : '0');
+    out += kv('Held &mdash; patient differs between HMIS',h.held ? '<span style="color:var(--warn)">' + esc(h.held) + '</span>' : '0');
   }
   const c = h.certify;
   if (c && c.enabled) {

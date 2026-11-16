@@ -338,7 +338,7 @@ export function mergePending(parts: PendingOrders[]): PendingOrders {
     }
     if (!merged.patient && p.patient) merged.patient = p.patient;
     // Per lane: the first part of that lane that names a patient.
-    for (const [lane, pt] of Object.entries(p.patients ?? {}) as Array<['hinai' | 'genx', PatientDemographics | null]>) {
+    for (const [lane, pt] of Object.entries(p.patients ?? {}) as Array<['hinai' | 'genx' | 'tatva', PatientDemographics | null]>) {
       merged.patients ??= {};
       if (!merged.patients[lane]) merged.patients[lane] = pt;
     }

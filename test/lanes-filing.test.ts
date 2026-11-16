@@ -335,42 +335,39 @@ try {
   await until('D acknowledged in GenX', () => genxAcked.includes(acc(D)));
   console.log('✓ lane failure: HINAI filed, GenX retried on the next pass, HINAI not re-posted');
 
-  // ---- 5) hold: a tube in one lane only ---------------------------------------
+  // ---- 5) no cross-lane hold: a tube in one lane only -------------------------
   await sendResult(B, { B12: '500' });
-  await until('B to be held', () => /only in hinai/i.test(stored(B)?.lastError ?? ''));
+  await until('B filed in HINAI straight away', () => hinaiFor(B).length >= 1);
   {
-    const why = stored(B)!.lastError!;
-    assert.match(why, /order only in hinai\b.*waiting for genx/i, why);
-    assert.match(why, /File now/);
-    assert.equal(hinaiFor(B).length, 0, 'nothing posted to HINAI');
-    assert.equal(genxFor(B).length + genxResultCalls.filter((a) => a === acc(B)).length, 0, 'nothing posted to GenX');
-    assert.ok(/only in hinai/i.test(JSON.stringify(summaryOf(B))), 'the console summary carries the held reason');
-    assert.equal(summaryOf(B)?.complete, false);
+    assert.equal(genxFor(B).length + genxResultCalls.filter((a) => a === acc(B)).length, 0, 'nothing posted to GenX — it has no order');
+    const v = stored(B)!.values.B12!;
+    assert.equal(v.lanes?.hinai?.labResultId, 93100021);
+    assert.ok(!v.lanes?.genx?.filedAt, 'GenX still pending');
+    await until('B says GenX has no order', () => /GenX has no order/i.test(stored(B)?.lastError ?? ''));
+    assert.doesNotMatch(JSON.stringify(summaryOf(B)), /"held"\s*:\s*\{/, 'no held block');
   }
   await sendResult(F, { TSH3: '1.00' });
-  await until('F to be held', () => /neither/i.test(stored(F)?.lastError ?? ''));
+  await until('F waiting in neither', () => /no order row yet in/i.test(stored(F)?.lastError ?? ''));
   assert.equal(hinaiFor(F).length, 0);
   assert.equal(genxResultCalls.filter((a) => a === acc(F)).length, 0);
-  console.log('✓ hold: a tube in one lane, or in neither, is held — nothing posted anywhere');
+  console.log('✓ no hold: a tube in one lane files there at once; a tube in neither waits');
 
-  // The tube appears in GenX: the next poll brings it, and it files to both.
+  // The tube appears in GenX later: it files there too, HINAI not re-posted.
   genxTubes.push(gtube(B, [[191021, 'VITB12']]));
   await until('B filed in GenX once GenX lists it', () => genxFor(B).length >= 1, 15000);
-  await until('B filed in HINAI too', () => hinaiFor(B).length >= 1);
   await until('B done', () => !!stored(B)?.values.B12?.filedAt);
   {
     const v = stored(B)!.values.B12!;
-    assert.equal(v.lanes?.hinai?.labResultId, 93100021);
     assert.equal(v.lanes?.genx?.labResultId, 191021);
-    // Cleared at the end of the same pass, after the acknowledge — wait for it.
-    await until('the hold reason is cleared', () => !stored(B)?.lastError);
+    assert.equal(hinaiFor(B).length, 1, 'HINAI was not posted B again');
+    await until('the waiting reason is cleared', () => !stored(B)?.lastError);
   }
-  console.log('✓ hold: files to both lanes automatically the moment the other lane lists the tube');
+  console.log('✓ no hold: the other lane files on its own when it lists the tube later');
 
-  // "File now" on a tube held because only GenX has it.
+  // A tube only GenX has: files to GenX at once; "File now" then closes HINAI.
   await sendResult(E, { B12: '250' });
-  await until('E to be held', () => /only in genx/i.test(stored(E)?.lastError ?? ''));
-  assert.equal(genxFor(E).length, 0, 'held: nothing posted to GenX yet');
+  await until('E filed in GenX straight away', () => genxFor(E).length >= 1);
+  assert.equal(hinaiFor(E).length, 0, 'nothing to HINAI — it has no order');
   const warnsBefore = warns.length;
   const ok = await connector.fileNow('im', E);
   assert.equal(ok, true);
@@ -386,7 +383,7 @@ try {
     const said = warns.slice(warnsBefore).join('\n');
     assert.ok(said.includes(E) && /hinai/i.test(said) && said.includes('B12'), `a warning names the barcode, the lane and the values:\n${said}`);
   }
-  console.log('✓ "File now" while held: posted to GenX only, HINAI marked skipped by the operator, sample complete');
+  console.log('✓ tube only in GenX: filed to GenX at once; "File now" marks HINAI skipped by the operator, sample complete');
 
   // ---- 7) rerun after filed in both ------------------------------------------
   const hA = hinaiFor(A).length;

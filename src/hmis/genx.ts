@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 import type { Logger } from '../logger.js';
 import type { HmisResultUploadResponse, LisInboundResultRow, MirthAcknowledgeItem, MirthPendingRow } from '../types.js';
 import type { HmisAudit, HmisAuditKind, HmisAuditOutcome } from './audit.js';
-import { HmisUnavailableError, type HmisGateway, type PendingQuery } from './client.js';
+import { HmisRefusedError, HmisUnavailableError, type HmisGateway, type PendingQuery } from './client.js';
 import { httpSend, type ClientTls } from './http.js';
 
 // =============================================================================
@@ -130,6 +130,8 @@ export class GenxHmisClient implements HmisGateway {
   /** The batch worklist call ignores site and date (eqCode only narrows the
    *  rows afterwards, in toRows) — see HmisGateway. */
   readonly ignoresPollFilters = true;
+  /** Worklist rows: one per result line, placed by machineTestCode. */
+  readonly rowStyle = 'genx' as const;
 
   private token: { value: string; expiresAt: number } | null = null;
   private tokenInFlight: Promise<string> | null = null;
@@ -387,6 +389,7 @@ export class GenxHmisClient implements HmisGateway {
           throw new NoneMatched(
             `${this.label} ${path} filed 0 of ${results.length} value(s) for ${barcode}` +
               (unmatched.size ? ` — unmatched: ${[...unmatched].join(', ')}` : ''),
+            unmatched.size ? [...unmatched] : tubeRows.map((r) => key(r.identifier)),
           );
         }
         for (const c of unmatched) unplaced.add(c);
@@ -628,7 +631,8 @@ export class GenxHmisClient implements HmisGateway {
   }
 }
 
-class NoneMatched extends Error {}
+/** Filed nothing: a verdict on the values sent, not an outage. */
+class NoneMatched extends HmisRefusedError {}
 
 /** `unmatched` / `outOfRange` list either bare codes or objects naming one. */
 function codeOfEntry(c: unknown): string {

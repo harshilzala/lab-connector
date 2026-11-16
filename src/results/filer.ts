@@ -1,9 +1,10 @@
 import type { Logger } from '../logger.js';
 import type { HmisResultUpload, LisInboundResultRow, MirthAcknowledgeItem } from '../types.js';
 import type { toLisResultRows } from '../mapping/mapper.js';
-import { ResultStore, isLaneHold, isPatientHold, snapshotOf, summarize, uncertifiedGenxLines, type FiledValue, type StagedSample } from './store.js';
+import { ResultStore, isLaneHold, isPatientHold, snapshotOf, summarize, uncertifiedGenxLines, type FiledValue, type StagedSample, type UploadSnapshot } from './store.js';
 import { pairingVerdict, wasHeld, type PairingRule } from './pairing.js';
 import { laneLabel, type Lane } from '../hmis/lanes.js';
+import { HmisRefusedError } from '../hmis/client.js';
 
 // =============================================================================
 // StagedFiler — the filing pass for `filing.mode: "staged"`.
@@ -54,8 +55,19 @@ export interface FilerDeps {
    *  files (StagedValue.lanes) beside filedAt. */
   lane?: Lane;
   /** Both HMIS mode: one gateway per lane. Present = the sample is filed lane
-   *  by lane, under the hold rule (see fileLanes). */
+   *  by lane, each lane as soon as it has the order (see fileLanes). */
   lanes?: LaneFilerDeps;
+  /** Are this lane's order rows GenX-style (GenX, or Tatva reading its own
+   *  worklist)? Absent = only the "genx" lane is. */
+  genxRows?: (lane: Lane) => boolean;
+  /** A value the lane's HMIS REFUSED (GenX/Tatva unmatched, "filed 0") is
+   *  sent again no sooner than this after the last refusal. Absent =
+   *  recheckMs, the cadence HINAI's waiting samples are re-asked at. */
+  refusedRetryMs?: number;
+  /** ...and not automatically at all once this long has passed since the
+   *  FIRST refusal: the sample is held for staff ("File now" still sends it).
+   *  0 = never stop. Absent = 24 h. */
+  refusedGiveUpMs?: number;
   /** GenX auto-certify of one result line (analyzer genxAutoCertify, with
    *  genx among its lanes). Throws when GenX refuses or is down. */
   certify?: (lineId: number, barcode: string) => Promise<void>;
@@ -98,6 +110,11 @@ export type SampleOutcome = 'filed' | 'partial' | 'waiting' | 'held' | 'error' |
 
 /** Gateway failures in a row before the pass gives up until the next tick. */
 const MAX_CONSECUTIVE_ERRORS = 3;
+
+/** Both mode: how long after a tube's first result a lane with NO order for
+ *  it is still asked per barcode (at recheckMs). After that only that lane's
+ *  order poll can bring the order in. */
+const MISSING_LANE_LOOKUP_MS = 6 * 60 * 60_000;
 
 export class StagedFiler {
   private running = false;
@@ -287,7 +304,7 @@ export class StagedFiler {
         }
       }
 
-      // Both HMIS mode: filed lane by lane, under the hold rule.
+      // Both HMIS mode: filed lane by lane, each as soon as it has the order.
       if (this.deps.lanes) return await this.fileLanes(sample, reason, forced, this.deps.lanes);
 
       let rows = await this.deps.orderRows(barcode, { refresh: false });
@@ -334,14 +351,26 @@ export class StagedFiler {
         }
       }
 
+      // A value this HMIS refused is retried at the recheck cadence, not on
+      // every pass, and held for staff once refusedGiveUpMs has passed.
+      const refusal = this.holdRefused(joined, sample, this.deps.lane, reason === 'operator');
+      joined = refusal.joined;
+
       if (joined.rows.length > 0) {
-        const res = await this.deps.postResults(joined.rows);
+        let res: Awaited<ReturnType<FilerDeps['postResults']>>;
+        try {
+          res = await this.deps.postResults(joined.rows);
+        } catch (err) {
+          if (err instanceof HmisRefusedError) this.recordRefused(store, barcode, this.deps.lane, joined, err.refused, snapshotOf(sample));
+          throw err;
+        }
+        this.recordRefused(store, barcode, this.deps.lane, joined, res.unmatched, snapshotOf(sample));
         // GenX: only what it placed is filed (D2), each with its line's code
         // list (D1). HINAI never reports `unmatched`: its rows go as before. A
         // value replaced while the post was in flight stays pending (D6).
         // Tatva v1 posting for the HINAI lane answers `unmatched` the same
         // way, so whenever the gateway names unplaced codes they stay pending.
-        const filed = this.deps.lane === 'genx' || res.unmatched?.length ? genxFiled(joined.filedCodes, rows, res.unmatched) : joined.filedCodes;
+        const filed = this.genxRows(this.deps.lane) || res.unmatched?.length ? genxFiled(joined.filedCodes, rows, res.unmatched) : joined.filedCodes;
         store.markFiled(barcode, filed as typeof joined.filedCodes, undefined, this.deps.lane, snapshotOf(sample));
         log.info(
           { barcode, filed: res.filed, sent: joined.rows.length, stillWaiting: joined.unmatched, message: res.message, reason },
@@ -372,7 +401,12 @@ export class StagedFiler {
 
       // Still waiting for order rows. Not an error — say so once per change
       // of state rather than on every pass.
-      const why = certifiedHold ?? `no order row yet for: ${after.waitingCodes.join(', ')}`;
+      const held = new Set(refusal.held);
+      const noRow = after.waitingCodes.filter((c) => !held.has(c));
+      const why =
+        certifiedHold ??
+        ([refusal.note, noRow.length ? `no order row yet for: ${noRow.join(', ')}` : ''].filter(Boolean).join('; ') ||
+          `no order row yet for: ${after.waitingCodes.join(', ')}`);
       if (sample.lastError !== why) {
         log.info(
           { barcode, waiting: after.waitingCodes, filed: after.filed, known: rows.map((r) => r.identifier), checkedHmis: checked },
@@ -392,14 +426,14 @@ export class StagedFiler {
   /**
    * Both HMIS mode: file one sample into HINAI and GenX, each independently.
    *
-   * THE HOLD RULE (the lab's requirement, 2026-10): a sample is never filed to
-   * one system only on the connector's own initiative. While either lane has
-   * no order row at all for the tube, nothing is posted anywhere and the
-   * sample says which lane has it; it is re-checked every pass and files the
-   * moment both do. There is no timer. Only the operator's "File now" sends
-   * it to the lane(s) that have it, marking the values skipped in the other.
+   * NO CROSS-LANE HOLD (the lab's rule since 2026-11-17, replacing the
+   * October "both systems must have the order" hold): whichever lane has the
+   * order for the tube is filed straight away. A lane with no order yet keeps
+   * the values pending for it and files them when it lists the tube (re-checked
+   * every pass); a lane that is down is retried. The operator's "File now"
+   * closes the sample, marking values skipped in a lane that has no order.
    *
-   * Once both lanes have the tube, each lane joins its OWN rows (its own
+   * Each lane joins its OWN rows (its own
    * labResultIds), posts, is marked and acknowledged on its own. A lane that
    * fails is retried next pass; the other lane's filing is never undone and,
    * because each value remembers the lanes it is filed in, never repeated.
@@ -457,9 +491,15 @@ export class StagedFiler {
 
     // 1. Each lane's rows: the cache, then a live lookup at the recheck
     //    cadence (or straight away on a first look / for the operator).
+    //    A lane that still has no order for a tube older than
+    //    MISSING_LANE_LOOKUP_MS is not asked per barcode any more: with no
+    //    cross-lane hold most such tubes are simply not ordered there, and
+    //    the lane's order poll still brings a late order into the cache
+    //    (every poll re-runs this pass). Nothing is filed or skipped by this.
+    const young = Date.now() - Date.parse(sample.firstReceivedAt) < MISSING_LANE_LOOKUP_MS;
     for (const lane of names) {
       await lookup(lane, false);
-      if (!errors.has(lane) && !deferred.has(lane) && (rows.get(lane) ?? []).length === 0 && may) await lookup(lane, true);
+      if (!errors.has(lane) && !deferred.has(lane) && (rows.get(lane) ?? []).length === 0 && may && (young || forced)) await lookup(lane, true);
     }
 
     // 2a. Patient cross-check (C2): the two systems must name the same
@@ -479,32 +519,35 @@ export class StagedFiler {
     const has = (lane: Lane) => (rows.get(lane) ?? []).length > 0;
     const missing = names.filter((l) => !has(l) && !errors.has(l) && !deferred.has(l));
     const unknown = names.filter((l) => !has(l) && (errors.has(l) || deferred.has(l)));
+    const present = names.filter(has);
 
-    // 2b. The hold rule.
-    if (missing.length || unknown.length) {
-      if (unknown.length && !operator) {
-        // A lane could not be asked and its cache knows nothing about the
-        // tube: whether it has it is not known, so the hold rule cannot be
-        // judged — try again next pass.
+    // 2b. NO cross-lane hold (lab rule, 2026-11-17). A lane that has the
+    //     order for the tube is filed now, whether or not the other lane has
+    //     it too. A lane with no order yet keeps its values pending and files
+    //     them the moment that lane lists the tube; a lane that cannot be
+    //     asked is retried on the next pass. Neither ever holds the other back.
+    if (present.length === 0) {
+      if (unknown.length) {
         const message = unknown.map((l) => errors.get(l) ?? downNote(l)).join('; ');
         store.recordAttempt(barcode, { error: message, checkedHmis: checked });
         log.warn({ barcode, err: message, reason }, 'filing failed for this sample — an HMIS lane could not be asked; will retry on the next pass');
         return 'error';
       }
-      const present = names.filter(has);
-      if (!operator || present.length === 0) {
-        const why = present.length
-          ? `order only in ${present.map(laneLabel).join(' + ')} — waiting for ${missing.map(laneLabel).join(' + ')}; "File now" sends it to ${present.map(laneLabel).join(' + ')} only`
-          : `order in neither ${names.map(laneLabel).join(' nor ')} yet — waiting for both`;
-        if (sample.lastError !== why) {
-          log.info(
-            { barcode, in: present, waitingFor: missing, values: store.pendingUpload(sample, '').results.length, checkedHmis: checked },
-            'holding this sample — both HMIS systems must have the order before it is filed to either',
-          );
-        }
-        store.recordAttempt(barcode, { error: why, checkedHmis: checked });
-        return 'held';
+      const why = `no order row yet in ${names.map(laneLabel).join(' or ')} — files to whichever lists the tube first`;
+      if (sample.lastError !== why) {
+        log.info(
+          { barcode, lanes: names, values: store.pendingUpload(sample, '').results.length, checkedHmis: checked },
+          'results waiting for their HMIS order — will file when the order appears',
+        );
       }
+      store.recordAttempt(barcode, { error: why, checkedHmis: checked });
+      return 'waiting';
+    }
+    if (missing.length || unknown.length) {
+      log.debug(
+        { barcode, filingTo: present, noOrderIn: missing, unreachable: unknown },
+        'filing to the HMIS lane(s) that have the order — the other lane files when it lists the tube',
+      );
     }
 
     // 3. File each lane that has the tube, on its own rows.
@@ -512,6 +555,8 @@ export class StagedFiler {
     let notedDrops = false;
     let postedGenx = false;
     let certifiedHold: string | null = null;
+    const refusalNotes: string[] = [];
+    const refusedHeld = new Map<Lane, Set<string>>();
     for (const lane of names) {
       let laneRows = rows.get(lane) ?? [];
       if (!laneRows.length) continue;
@@ -547,6 +592,13 @@ export class StagedFiler {
           if (sample.lastError !== certifiedHold) log.warn({ barcode, lines: split.blocked, codes: split.codes }, certifiedHold);
         }
       }
+      // Refused by this lane recently / given up on: not re-sent this pass.
+      const refusal = this.holdRefused(joined, current, lane, operator);
+      joined = refusal.joined;
+      if (refusal.note) {
+        refusalNotes.push(refusal.note);
+        refusedHeld.set(lane, new Set(refusal.held));
+      }
       if (!joined.rows.length) continue;
       if (deferred.has(lane) || this.laneDown(lane)) {
         deferred.add(lane); // D4: left pending, not an error by itself
@@ -561,7 +613,14 @@ export class StagedFiler {
         res = await lanes.postResults(lane, joined.rows);
         this.laneFailures.set(lane, 0);
       } catch (err) {
-        this.laneFailed(lane);
+        if (err instanceof HmisRefusedError) {
+          // A verdict on these values, not an outage: the lane is fine, the
+          // values wait for the recheck cadence (see holdRefused).
+          this.laneFailures.set(lane, 0);
+          this.recordRefused(store, barcode, lane, joined, err.refused, snapshot);
+        } else {
+          this.laneFailed(lane);
+        }
         errors.set(lane, `${laneLabel(lane)}: ${errText(err)}`);
         log.warn(
           { barcode, lane, err: errText(err), reason },
@@ -569,8 +628,9 @@ export class StagedFiler {
         );
         continue;
       }
-      const filed = lane === 'genx' || res.unmatched?.length ? genxFiled(joined.filedCodes, laneRows, res.unmatched) : joined.filedCodes;
+      const filed = this.genxRows(lane) || res.unmatched?.length ? genxFiled(joined.filedCodes, laneRows, res.unmatched) : joined.filedCodes;
       store.markLaneFiled(barcode, lane, filed, names, undefined, { expect: snapshot });
+      this.recordRefused(store, barcode, lane, joined, res.unmatched, snapshot);
       filedAny = true;
       log.info(
         { barcode, lane, filed: res.filed, sent: joined.rows.length, stillWaiting: joined.unmatched, unplaced: res.unmatched?.length ? res.unmatched : undefined, message: res.message, reason },
@@ -604,7 +664,7 @@ export class StagedFiler {
     //    (its row excluded in config) or an ambiguous one (two candidate rows)
     //    keeps waiting, as in single mode. A lane that failed this pass is
     //    left alone — it is retried, not skipped. (A tube in neither lane
-    //    stayed held above.)
+    //    returned 'waiting' above: nothing is posted or skipped.)
     if (operator) {
       for (const lane of names) {
         if (errors.has(lane) || deferred.has(lane)) continue;
@@ -638,12 +698,12 @@ export class StagedFiler {
     const now = store.get(barcode) ?? sample;
     const perLane = names
       .filter((l) => !deferred.has(l))
-      .map((l) => [l, store.pendingUploadFor(now, '', l).results.map((r) => r.testCode)] as const)
+      .map((l) => [l, store.pendingUploadFor(now, '', l).results.map((r) => r.testCode).filter((c) => !refusedHeld.get(l)?.has(c))] as const)
       .filter(([, codes]) => codes.length)
-      .map(([l, codes]) => `${codes.join(', ')} (${laneLabel(l)})`);
+      .map(([l, codes]) => (has(l) ? `${codes.join(', ')} (${laneLabel(l)})` : `${laneLabel(l)} has no order for this tube (${codes.length} value${codes.length === 1 ? '' : 's'})`));
     const why =
       certifiedHold ??
-      [perLane.length ? `no order row yet for: ${perLane.join('; ')}` : '', ...[...deferred].map(downNote)].filter(Boolean).join('; ');
+      [...refusalNotes, perLane.length ? `no order row yet for: ${perLane.join('; ')}` : '', ...[...deferred].map(downNote)].filter(Boolean).join('; ');
     if (sample.lastError !== why) {
       log.info(
         { barcode, waiting: after.waitingCodes, filed: after.filed, deferred: [...deferred], checkedHmis: checked },
@@ -736,6 +796,78 @@ export class StagedFiler {
     }
   }
 
+  /** Take out of `joined` the values this lane's HMIS refused recently (or
+   *  gave up on), so they are not re-posted on every pass. "File now"
+   *  (operator) sends everything. Returns the codes held, and a note. */
+  private holdRefused(
+    joined: JoinResult,
+    sample: StagedSample,
+    lane: Lane | undefined,
+    operator: boolean,
+  ): { joined: JoinResult; held: string[]; note: string | null } {
+    if (!lane || operator) return { joined, held: [], note: null };
+    const retryMs = this.deps.refusedRetryMs ?? this.deps.recheckMs;
+    const giveUpMs = this.deps.refusedGiveUpMs ?? 24 * 60 * 60_000;
+    const now = Date.now();
+    const waiting: string[] = [];
+    const gaveUp: string[] = [];
+    const keep = joined.filedCodes.map((f) => {
+      const e = sample.values[f.testCode]?.lanes?.[lane];
+      if (!e || e.filedAt || !e.refusedLastAt) return true;
+      const first = Date.parse(e.refusedFirstAt ?? e.refusedLastAt);
+      if (giveUpMs > 0 && now - first >= giveUpMs) {
+        gaveUp.push(f.testCode);
+        return false;
+      }
+      if (now - Date.parse(e.refusedLastAt) < retryMs) {
+        waiting.push(f.testCode);
+        return false;
+      }
+      return true;
+    });
+    if (keep.every(Boolean)) return { joined, held: [], note: null };
+    const keptIds = new Set(joined.rows.filter((_, i) => keep[i]).map((r) => codeOf(r.identifier)));
+    const heldIds = new Set(joined.rows.filter((_, i) => !keep[i]).map((r) => codeOf(r.identifier)));
+    const label = laneLabel(lane);
+    const notes: string[] = [];
+    if (gaveUp.length) {
+      notes.push(
+        `${label} did not accept ${gaveUp.join(', ')} for ${span(giveUpMs)} — automatic retries stopped; ` +
+          `fix the parameter mapping in ${label}, then 'File now'`,
+      );
+    }
+    if (waiting.length) notes.push(`${label} did not accept ${waiting.join(', ')} — retried every ${span(retryMs)}`);
+    return {
+      joined: {
+        ...joined,
+        rows: joined.rows.filter((_, i) => keep[i]),
+        filedCodes: joined.filedCodes.filter((_, i) => keep[i]),
+        matched: joined.matched.filter((m) => !heldIds.has(codeOf(m.identifier)) || keptIds.has(codeOf(m.identifier))),
+      },
+      held: [...gaveUp, ...waiting],
+      note: notes.join('; '),
+    };
+  }
+
+  /** Record what the lane refused: from the answer's `unmatched`, or from a
+   *  refusal error (nothing filed at all). */
+  private recordRefused(store: ResultStore, barcode: string, lane: Lane | undefined, joined: JoinResult, refusedCodes: string[] | undefined, expect?: UploadSnapshot): void {
+    if (!lane || !refusedCodes?.length) return;
+    const refused = new Set(refusedCodes.map(codeOf));
+    const codes = joined.filedCodes.filter((f) => refused.has(codeOf(f.identifier))).map((f) => f.testCode);
+    if (!codes.length) return;
+    store.markRefused(barcode, lane, codes, undefined, expect);
+    this.deps.log.warn(
+      { barcode, lane, refused: codes, retryEveryMs: this.deps.refusedRetryMs ?? this.deps.recheckMs },
+      `${laneLabel(lane)} refused these values — not re-sent on every pass; retried at the recheck cadence`,
+    );
+  }
+
+  private genxRows(lane: Lane | undefined): boolean {
+    if (!lane) return false;
+    return this.deps.genxRows ? this.deps.genxRows(lane) : lane === 'genx';
+  }
+
   private laneDown(lane: Lane): boolean {
     return (this.laneFailures.get(lane) ?? 0) >= MAX_CONSECUTIVE_ERRORS;
   }
@@ -760,6 +892,13 @@ function errText(err: unknown): string {
 }
 
 const codeOf = (v: string | null | undefined) => (v ?? '').trim().toUpperCase();
+
+/** 300000 → "5 min", 86400000 → "24 h", 20000 → "20 s". */
+function span(ms: number): string {
+  if (ms >= 3_600_000 && ms % 3_600_000 === 0) return `${ms / 3_600_000} h`;
+  if (ms >= 60_000) return `${Math.round(ms / 60_000)} min`;
+  return `${Math.max(1, Math.round(ms / 1000))} s`;
+}
 
 /**
  * What the GenX lane may mark filed after a post (D2): not the codes GenX

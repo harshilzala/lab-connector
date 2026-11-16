@@ -481,6 +481,10 @@ export class AnalyzerRuntime {
         acknowledge: (rows) => this.hmis.acknowledge(rows, this.cfg.equipmentCode),
         log: this.log,
         recheckMs: cfg.filing.recheckMs,
+        // Optional-chained like pairing below: hand-built test configs may not
+        // carry these, and the filer's defaults then apply.
+        refusedRetryMs: cfg.filing.refusedRetryMs ?? undefined,
+        refusedGiveUpMs: cfg.filing.refusedGiveUpMs,
         completeBarcode: cfg.barcodeCompletion ? compileCompletion(cfg.barcodeCompletion) : undefined,
         // Optional-chained: the schema always fills this in, but the test
         // harnesses build an analyzer config by hand and must not have to
@@ -495,6 +499,7 @@ export class AnalyzerRuntime {
               acknowledge: (lane, rows) => this.gateway(lane).acknowledge(rows, this.cfg.equipmentCode),
             }
           : undefined,
+        genxRows: (lane) => this.genxRows(lane),
         certify: this.genxCertifier(),
         hasRowFor: (rows, code) => this.hasRowFor(rows, code),
         patientMismatch: (barcode) => {
@@ -589,14 +594,16 @@ export class AnalyzerRuntime {
    * patient in one of them. Compared on the patient id each lane last gave,
    * ignoring case and spaces; no check while either side has none.
    */
-  private patientMismatch(barcode: string): { hinai: string; genx: string } | null {
+  private patientMismatch(barcode: string): Partial<Record<Lane, string>> | null {
     if (!this.both || !this.patientCheck) return null;
     const p = this.orders.get(barcode)?.patients;
-    const hinai = (p?.hinai?.patientId ?? '').trim();
-    const genx = (p?.genx?.patientId ?? '').trim();
-    if (!hinai || !genx) return null;
+    // Whichever two lanes this analyzer uses (HINAI + GenX, HINAI + Tatva,
+    // GenX + Tatva).
+    const ids = this.lanes.map((l) => [l, (p?.[l]?.patientId ?? '').trim()] as const);
+    if (ids.length < 2 || ids.some(([, v]) => !v)) return null;
     const norm = (v: string) => v.replace(/\s+/g, '').toUpperCase();
-    return norm(hinai) === norm(genx) ? null : { hinai, genx };
+    const first = norm(ids[0]![1]);
+    return ids.every(([, v]) => norm(v) === first) ? null : (Object.fromEntries(ids) as Partial<Record<Lane, string>>);
   }
 
   /** Does any of these rows answer to this analyzer code — its own spelling
@@ -610,8 +617,15 @@ export class AnalyzerRuntime {
     return rows.some((r) => names.has(key(r.identifier)));
   }
 
-  private static mismatchMessage(m: { hinai: string; genx: string }): string {
-    return `patient differs between HINAI (${m.hinai}) and GenX (${m.genx}) for this barcode — not filed; correct it in HMIS`;
+  private static mismatchMessage(m: Partial<Record<Lane, string>>): string {
+    const named = LANES.filter((l) => m[l] !== undefined).map((l) => `${laneLabel(l)} (${m[l]})`);
+    return `patient differs between ${named.join(' and ')} for this barcode — not filed; correct it in HMIS`;
+  }
+
+  /** True when this lane's order rows are GenX-style (GenX, or Tatva reading
+   *  its own worklist) — see HmisGateway.rowStyle. */
+  private genxRows(lane: Lane | undefined): boolean {
+    return !!lane && this.gateways[lane]?.rowStyle === 'genx';
   }
 
   /**
@@ -1029,7 +1043,7 @@ export class AnalyzerRuntime {
                   // so a result can still be joined, but the code must not come back
                   // as waiting to be programmed. Leaving it off is what put the
                   // derived values into the VITROS 250's sample program.
-                  const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll', { neverDownload });
+                  const { order, newCodes } = this.orders.upsert(pending.sampleId, pending, 'poll', { neverDownload, sameAssay: this.foldAssays() });
                   if (collected) {
                     // The LAST upsert of a tube sees every lane's rows, so its
                     // newCodes are the union still to be sent.
@@ -1087,6 +1101,32 @@ export class AnalyzerRuntime {
       downloadPrefixes.length === 0 ||
       downloadPrefixes.some((p) => barcode.toUpperCase().startsWith(p.toUpperCase()));
     if (!download || newCodes.length === 0) return;
+    // Both HMIS mode: a tube ordered in HINAI and in GenX is run ONCE.
+    //   * A code that is another lane's spelling of an assay ALREADY
+    //     programmed (it is in `downloaded`, which only ever holds codes that
+    //     really went down, or their spellings) is recorded as downloaded
+    //     and not sent.
+    //   * Two spellings new in this same delta: one is sent; the other is
+    //     marked downloaded only AFTER that send succeeds (`alsoDone`), so a
+    //     failed or skipped download never loses the assay.
+    const alsoDone: string[] = [];
+    if (this.both) {
+      const key = this.sameAssayKey();
+      const programmed = new Set(order.downloaded.map(key));
+      const ofProgrammed = newCodes.filter((c) => programmed.has(key(c)));
+      if (ofProgrammed.length) {
+        this.orders.markDownloaded(order.sampleId, ofProgrammed);
+        this.log.info(
+          { barcode: order.sampleId, alreadyOrdered: ofProgrammed },
+          'same assay ordered in both HMIS systems — already programmed, not sent again',
+        );
+      }
+      const fresh = newCodes.filter((c) => !programmed.has(key(c)));
+      const unique = this.oneRunPerAssay(fresh);
+      alsoDone.push(...fresh.filter((c) => !unique.includes(c)));
+      newCodes = unique;
+      if (newCodes.length === 0) return;
+    }
     if (!downloadable(order.sampleId)) {
       // The gateway lists this barcode under our eqCode, but the
       // analyzer does not run it (see orderPoll.downloadPrefixes). The
@@ -1110,7 +1150,11 @@ export class AnalyzerRuntime {
     // KermitLink.downloadReplacesProgram) must be given the whole
     // panel every time — a delta of the newly seen tests would wipe
     // the ones it already had. Everything else takes just the delta.
-    const codes = this.link.downloadReplacesProgram ? this.programmable(order.testCodes) : newCodes;
+    const panel = this.programmable(order.testCodes);
+    const codes = this.link.downloadReplacesProgram ? (this.both ? this.oneRunPerAssay(panel) : panel) : newCodes;
+    // Replace-program link in both mode: the spellings folded out of the
+    // panel are done once the panel is down.
+    if (this.link.downloadReplacesProgram && this.both) alsoDone.push(...panel.filter((c) => !codes.includes(c)));
     if ((this.refusedUntil.get(order.barcode) ?? 0) > Date.now()) return; // refused a moment ago
     this.refusedUntil.delete(order.barcode);
     try {
@@ -1126,7 +1170,13 @@ export class AnalyzerRuntime {
           specimenType: order.specimenType,
         },
       ]);
-      this.orders.markDownloaded(order.sampleId, codes);
+      this.orders.markDownloaded(order.sampleId, [...codes, ...alsoDone]);
+      if (alsoDone.length) {
+        this.log.info(
+          { barcode: order.sampleId, sent: codes, sameAssay: alsoDone },
+          'same assay ordered in both HMIS systems — the analyzer was asked for it once',
+        );
+      }
       this.downloadedCount++;
       tally.pushed++;
       this.pushStats.sent++;
@@ -1344,11 +1394,12 @@ export class AnalyzerRuntime {
       );
     }
     const source: ResendReport['source'] = pending?.found ? 'hmis' : 'store';
-    const stored = pending?.found ? this.orders.upsert(lookup, pending, 'resend').order : this.orders.get(lookup);
+    const stored = pending?.found ? this.orders.upsert(lookup, pending, 'resend', { sameAssay: this.foldAssays() }).order : this.orders.get(lookup);
     if (!stored) return null;
     const order: OrderDownload = {
       sampleId: stored.sampleId,
-      testCodes: this.programmable(stored.testCodes),
+      // Both mode: each assay once, however many lanes ordered it.
+      testCodes: this.both ? this.oneRunPerAssay(this.programmable(stored.testCodes)) : this.programmable(stored.testCodes),
       priority: stored.priority,
       patient: this.cfg.sendDemographics ? stored.patient : null,
       specimenType: stored.specimenType,
@@ -1367,7 +1418,7 @@ export class AnalyzerRuntime {
       this.log.error({ barcode: lookup, tests: order.testCodes, err: message }, 're-send failed — the analyzer did not take the order');
       throw new Error(`the analyzer did not accept the order: ${message}`);
     }
-    this.orders.markDownloaded(lookup, order.testCodes);
+    this.orders.markDownloaded(lookup, this.both ? this.programmable(stored.testCodes) : order.testCodes);
     this.downloadedCount++;
     this.pushStats.sent++;
     this.pushStats.lastSentAt = new Date().toISOString();
@@ -1538,7 +1589,7 @@ export class AnalyzerRuntime {
     report.message = res.message;
     // GenX marks only what it placed (D2); a value replaced meanwhile stays
     // pending (D6).
-    const filed = this.lanes[0] === 'genx' ? genxFiled(joined.filedCodes, cached, res.unmatched) : joined.filedCodes;
+    const filed = this.genxRows(this.lanes[0]) ? genxFiled(joined.filedCodes, cached, res.unmatched) : joined.filedCodes;
     this.staged.markFiled(s.barcode, filed as typeof joined.filedCodes, undefined, this.lanes[0], snapshotOf(s));
     try {
       await this.hmis.acknowledge(joined.matched, this.cfg.equipmentCode);
@@ -1602,7 +1653,7 @@ export class AnalyzerRuntime {
         this.log.error({ barcode: s.barcode, lane, err: entry.message }, 'FORCE push failed in this HMIS lane');
         continue;
       }
-      const filed = lane === 'genx' ? genxFiled(joined.filedCodes, cached, unplaced) : joined.filedCodes;
+      const filed = this.genxRows(lane) ? genxFiled(joined.filedCodes, cached, unplaced) : joined.filedCodes;
       store.markLaneFiled(s.barcode, lane, filed, this.lanes, undefined, { expect: snapshotOf(s) });
       try {
         await gw.acknowledge(joined.matched, this.cfg.equipmentCode);
@@ -1689,7 +1740,7 @@ export class AnalyzerRuntime {
     if ((!this.cfg.fillMissingOrderRows && !opts.force) || joined.unmatched.length === 0) return joined;
     // Never for GenX rows in both mode: the catalogue holds HINAI's parameter
     // ids, and a GenX line is not a HINAI panel.
-    if (opts.lane === 'genx') return joined;
+    if (this.genxRows(opts.lane)) return joined;
 
     // Every value here is one HMIS is not currently offering a row for. If the
     // catalogue has seen the parameter on this service before, the row can be
@@ -2007,6 +2058,45 @@ export class AnalyzerRuntime {
     return (identifier) => codeKey(canonical ? canonical(identifier) : identifier);
   }
 
+  /**
+   * ONE RUN PER ASSAY. In both HMIS mode the same tube can be ordered in HINAI
+   * and in GenX, and the two may spell one assay differently — HINAI by its
+   * eqIdntifier (the HMIS side of testCodeAliases, "FO2Hb"), GenX by the
+   * machine test code ("O2Hb"). This key folds both onto the analyzer's code,
+   * so the instrument is asked for the assay once, never once per lane.
+   */
+  private sameAssayKey(): (identifier: string) => string {
+    const base = this.assayJoinKey();
+    const toAnalyzer = new Map<string, string>();
+    for (const [code, alias] of Object.entries(this.cfg.testCodeAliases ?? {})) {
+      if (typeof alias === 'string' && alias.trim()) toAnalyzer.set(base(alias), base(code));
+    }
+    return (identifier) => {
+      const k = base(identifier);
+      return toAnalyzer.get(k) ?? k;
+    };
+  }
+
+  /** Both mode: the same-assay fold for the order store; undefined in single mode (unchanged). */
+  private foldAssays(): ((identifier: string) => string) | undefined {
+    return this.both ? this.sameAssayKey() : undefined;
+  }
+
+  /** `codes` with every later spelling of an assay already in the list (or in
+   *  `already`) dropped. The first spelling seen is the one kept. */
+  private oneRunPerAssay(codes: readonly string[], already: readonly string[] = []): string[] {
+    const key = this.sameAssayKey();
+    const seen = new Set(already.map(key));
+    const out: string[] = [];
+    for (const c of codes) {
+      const k = key(c);
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(c);
+    }
+    return out;
+  }
+
   /** Whether this assay code can physically go down this link. The VITROS 250
    *  carries a code as ONE byte, so anything outside 1–126 is dropped by the
    *  codec before the transfer (see unencodableTestCodes) — it was ordered in
@@ -2044,7 +2134,7 @@ export class AnalyzerRuntime {
 
       // Remember the rows: the result comes back in a LATER message and needs
       // their labResultId to be filable.
-      if (pending.ackItems.length) this.orders.upsert(lookup, pending, 'query', { neverDownload: this.neverDownload() });
+      if (pending.ackItems.length) this.orders.upsert(lookup, pending, 'query', { neverDownload: this.neverDownload(), sameAssay: this.foldAssays() });
 
       // HMIS drops a sample's rows from the pending list and offers them
       // again later. LB2609180027, 2026-09-17: 21 rows on the 18:42Z poll,
@@ -2055,12 +2145,40 @@ export class AnalyzerRuntime {
       // from there — the rule resolveOrderRows already applies when filing.
       // Only a barcode neither side knows gets the empty download.
       const stored = pending.found ? null : this.orders.get(lookup);
-      const source = pending.found ? pending : stored?.rows.length ? stored : null;
+      let source = pending.found ? pending : stored?.rows.length ? stored : null;
+
+      // LOCAL-PATCH-APTT (2026-11-14, ported from the live bundle). HMIS lists a
+      // new APTT order under EC026 (APTT-FS) for only seconds, then moves it to
+      // another equipment code, so the CS-2500 host query no longer saw it.
+      // Add a saved APTT-FS row (order first seen < 24 h ago) to the reply.
+      // Risk: a cancelled APTT still gets run.
+      if (source && pending.found && this.cfg.id === 'sysmex-cs2500') {
+        try {
+          const saved = this.orders.get(lookup);
+          const keep = ['APTT-FS'];
+          const firstSeen = saved ? Date.parse(saved.firstSeenAt) : NaN;
+          if (saved && firstSeen && Date.now() - firstSeen < 864e5) {
+            const have = new Set((source.testCodes || []).map((x) => String(x).toLowerCase()));
+            const add = [...new Set((saved.rows || []).map((x) => x.identifier).filter((x) => keep.includes(x) && !have.has(String(x).toLowerCase())))];
+            if (add.length) {
+              source = { ...source, testCodes: [...(source.testCodes || []), ...add] };
+              this.log.warn({ barcode: lookup, added: add }, 'LOCAL PATCH: APTT added from the saved order — HMIS no longer lists it for EC026');
+            }
+          }
+        } catch (err) {
+          this.log.warn({ err: String(err) }, 'LOCAL PATCH APTT failed');
+        }
+      }
+
       if (!source) {
         this.log.info({ barcode, lookup }, 'no pending orders — sending empty download');
         await this.link.sendOrders([]); // header + terminator = "no work"
         return;
       }
+
+      // Both HMIS mode: the reply carries each assay once, however many lanes
+      // ordered it and however each spells it.
+      if (this.both) source = { ...source, testCodes: this.oneRunPerAssay(source.testCodes) };
 
       const order: OrderDownload = {
         // Reply with the barcode the analyzer sent so it matches its own sample.
@@ -2219,7 +2337,7 @@ export class AnalyzerRuntime {
     // rows after a previous upload already acknowledged them.
     const pending = await this.fetchPending(lookup, true, [lane]);
     if (pending.ackItems.length) {
-      return this.rowsOfLane(this.orders.upsert(lookup, pending, 'result').order.rows, lane);
+      return this.rowsOfLane(this.orders.upsert(lookup, pending, 'result', { sameAssay: this.foldAssays() }).order.rows, lane);
     }
     return mine;
   }

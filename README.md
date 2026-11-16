@@ -473,7 +473,7 @@ site.
 | `equipmentCode` | **Required.** The `eqCode` HMIS raises IM's orders under. |
 | `equipmentId` | HMIS equipment id. Fallback in the acknowledge and upload bodies. Required when `autoCertify.hinai` is on. |
 | `siteIds` | HINAI sites polled for IM's orders. GenX ignores them because its worklist comes as one batch. |
-| `hmis` | IM's own lanes: `{ "mode": "single", "use": "hinai" }`, `{ "mode": "single", "use": "genx" }` or `{ "mode": "both" }`. Absent means the top-level `hmis` setting. |
+| `hmis` | IM's own lanes: `{ "mode": "single", "use": "hinai" }` (or `"genx"`, or `"tatva"`), or `{ "mode": "both", "both": ["hinai", "genx"] }` naming two different lanes (`both` left out means hinai and genx). Absent means the top-level `hmis` setting. |
 | `orders.host` / `orders.port` | ORDER channel (`transport`): the address the connector dials to send IM its work. The host is required; the port defaults to 10011. |
 | `results.host` / `results.port` | RESULT channel (`resultTransport`): where the connector listens for IM's results. Defaults to `0.0.0.0`, port 10012. |
 | `autoCertify.hinai` | Adds `equipmentId` to the existing Oracle certify job (see below). Default `false`. |
@@ -631,25 +631,30 @@ connects.
 
 ## HMIS: single or both
 
-The connector can talk to two HMIS systems. Each one is called a **lane**.
+The connector can talk to three HMIS systems. Each one is called a **lane**.
 `hinai` is the Zydus HIMS `/mirth/*` gateway (the keys at the top of `hmis`, or
-inside `hmis.hinai`). `genx` is GenX LIMS (`hmis.genx`). JSON (status, API and
-spool files) uses the names `hinai` and `genx`. The pages show them as HINAI
-and GenX.
+inside `hmis.hinai`). `genx` is GenX LIMS (`hmis.genx`). `tatva` is the ZyHos
+Tatva v1 partner API (`hmis.tatva`, see [Tatva v1: the third HMIS lane](#tatva-v1-the-third-hmis-lane)).
+JSON (status, API and spool files) uses the names `hinai`, `genx` and `tatva`.
+The pages show HINAI and GenX by those names.
 
-- **single** means one lane. Every analyzer behaves exactly as before,
-  including its choice of `filing.mode`.
-- **both** means HINAI and GenX side by side. It was added for IM, which the
-  lab runs against both while GenX is brought in.
+- **single** means one lane: `hinai`, `genx` or `tatva`. Every analyzer behaves
+  exactly as before, including its choice of `filing.mode`.
+- **both** means two different lanes side by side, named by `hmis.both`: any one
+  of `["hinai","genx"]` (the default when `both` is left out), `["hinai","tatva"]`
+  or `["genx","tatva"]`. It was added for IM, which the lab runs against both
+  while GenX is brought in.
 
-`hmis.mode` (`"single"` | `"both"`) and `hmis.use` (`"hinai"` | `"genx"`,
-single mode only) set this for every analyzer. Any analyzer block, or
-`im.hmis`, may carry its own `{ "mode", "use" }` that wins for that machine
+`hmis.mode` (`"single"` | `"both"`), `hmis.use` (`"hinai"` | `"genx"` | `"tatva"`,
+single mode only) and `hmis.both` (the two lanes, both mode only) set this for
+every analyzer. Any analyzer block, or
+`im.hmis`, may carry its own `{ "mode", "use", "both" }` that wins for that machine
 alone. Without `mode`, the legacy `hmis.api` decides: `"genx"` means single on
 GenX, and anything else means single on HINAI. So a config written before
 these keys is read unchanged. `mode`/`use` win over `api` when both are
 written. Each lane that any analyzer uses needs its base URL (`hmis.baseUrl`,
-`hmis.genx.baseUrl`).
+`hmis.genx.baseUrl`, `hmis.tatva.baseUrl`). Tatva is never used by default; see
+[Tatva v1: the third HMIS lane](#tatva-v1-the-third-hmis-lane).
 
 **What both mode does with orders.** Every poll reads both systems. HINAI is
 read per site and per day as before. GenX is read once per tick, because its
@@ -697,8 +702,8 @@ mode, because skipping it would hide a problem someone has to look at. Apart
 from those values and a tube in neither system, File now leaves the sample
 complete.
 
-**Patient mismatch.** Before filing a sample to either system, the connector
-compares the patient id (UHID/MRN) each system gives for the barcode, trimmed
+**Patient mismatch.** Before filing a sample to either lane, the connector
+compares the patient id (UHID/MRN) each of the two lanes gives for the barcode, trimmed
 and ignoring case. If both give one and they differ, the sample is held and
 **nothing is filed anywhere**. The sample's error reads `patient differs
 between HINAI (<id>) and GenX (<id>) for this barcode — not filed; correct it
@@ -712,7 +717,7 @@ system gives no id, there is nothing to compare and no check is made. The
 machine order still goes out, so the tube still runs.
 
 **`hmis.patientCheck`** (default `true`) switches this check on or off. The
-two systems may number patients differently: HINAI may give an MRN where GenX
+two lanes may number patients differently: HINAI may give an MRN where GenX
 gives a UHID. If they do, every both-mode sample would be held as a mismatch.
 Before going live in both mode, compare the ids on a few real tubes in the two
 transaction logs. Set `"patientCheck": false` only if the numbering really
@@ -722,7 +727,8 @@ HINAI and GenX name different patients for its barcode`.
 
 **When one system fails.** A system that is down or refuses a post does not
 stop the other one. Its error is recorded per lane and shown on the dashboard,
-whose HMIS line reads `HINAI + GenX (both)` with each lane's state. That
+whose HMIS line reads the pair, for example `HINAI + GenX (both)`, with each
+lane's state. That
 system is retried on the next pass. Whatever the other system already took is
 not undone and is never posted to it again. A GenX outage never slows or
 stops HINAI filing. While a system is marked down, the connector skips only
@@ -738,12 +744,13 @@ rows, and reports one entry per system. It refuses a patient mismatch.
 (`logs/hmis-YYYY-MM-DD.log`). When HINAI is also in use by any analyzer, GenX
 writes its own `hmis.genx.auditLog` (`logs/hmis-genx-YYYY-MM-DD.log`), so the
 two systems' evidence trails stay apart. When GenX is the only lane any
-analyzer uses, it keeps writing to `hmis.auditLog` as before. This is decided
+analyzer uses, it keeps writing to `hmis.auditLog` as before. Tatva calls go to
+`logs/hmis-tatva-YYYY-MM-DD.log`. This is decided
 by the lanes the analyzers actually use, not by which blocks are filled in. To
 trace a tube in both mode, search both families:
 
 ```
-findstr <barcode> logs\hmis-2*.log logs\hmis-genx-*.log
+findstr <barcode> logs\hmis-2*.log logs\hmis-genx-*.log logs\hmis-tatva-*.log
 ```
 
 ### Upgrading
@@ -789,62 +796,57 @@ system's tests go out later as a delta, once it answers again. A tube known so
 far only to the system that is up is held for filing until the other one lists
 it (see the hold rule).
 
-## Tatva v1: results to the ZyHos partner API (post-only)
+## Tatva v1: the third HMIS lane
 
-`hmis.tatva` configures the ZyHos HMIS partner Lab Middleware API (contract
-v3.1, the `ZyHos-Preprod-Lab-Middleware` Postman collection). It uses the GenX
-library (`src/hmis/genx.ts`), because the wire contract is the same: OAuth
-`client_credentials`, the `{ success, data: { data } }` envelope,
-`Idempotency-Key`, and `machineTestCode` results answered with `filed` and
-`unmatched`. Only the defaults differ (`/oauth/token`, credentials in the form
-body, `/external/v1`, `X-Api-Key`). Also, codes listed under `outOfRange` count
-as **not filed**.
+Tatva v1 is the ZyHos HMIS partner Lab Middleware API (contract v3.1, the `ZyHos-Preprod-Lab-Middleware` Postman collection). It is a lane of its own, `tatva`, next to `hinai` and `genx`, configured in `hmis.tatva`. It uses the GenX library (`src/hmis/genx.ts`), because the wire contract is the same: OAuth `client_credentials`, the `{ success, data: { data } }` envelope, `Idempotency-Key`, and `machineTestCode` results answered with `filed` and `unmatched`. Only the defaults differ (`/oauth/token`, credentials in the form body, `/external/v1`, `X-Api-Key`). Also, codes listed under `outOfRange` count as **not filed**.
 
-For now the integration is **post-only**. The new system and HINAI share a synced
-database, so with `"enabled": true`:
+### Choosing the lane
 
-- every analyzer on the **HINAI lane** keeps getting its orders from HINAI
-  (pending poll, downloads, joins, labResultIds), and that applies in single
-  mode and in both (twin) mode alike;
-- its **result POST** goes to `{apiPrefix}/lab/equipment/results` instead of
-  `/mirth/labresult`, so HINAI's results endpoint is no longer called;
-- the acknowledge after filing stays on HINAI (`"acknowledge": "orders"`).
-  It can be moved to Tatva v1 (`"tatva"`) or switched `"off"`;
-- the GenX lane is untouched. In both mode the hold rule still requires the
-  order in HINAI and GenX before a tube is filed to either.
+Tatva is never used by default. An analyzer uses it only when its lanes name it:
 
-The tube barcode is taken as the new system's `sampleNumber`. Its
-`accessionNumber` is looked up once on the worklist (`?barcode=`), which needs
-`lab.equipment.worklist.read`, and cached in `spool/tatva-accessions.json`. Set
-`"barcodeField": "accessionNumber"` to send the barcode as-is with no lookup.
-A value that Tatva v1 lists as `unmatched` or `outOfRange` stays pending
-and is retried, just like GenX. Every call is logged in
-`logs/hmis-tatva-YYYY-MM-DD.log`. To go back, set `"enabled": false` and
-restart. Results return to `/mirth/labresult` and nothing else changes.
+- **single:** `"hmis": { "mode": "single", "use": "tatva" }` files that analyzer to Tatva alone.
+- **both:** `"hmis": { "mode": "both", "both": ["hinai", "tatva"] }` or `["genx", "tatva"]` files it to the two lanes named. `both` names exactly two different lanes: any one of `["hinai","genx"]`, `["hinai","tatva"]` or `["genx","tatva"]`. Left out, it is `["hinai","genx"]`, the old meaning.
 
-**Two ways to authenticate** (`hmis.tatva.auth`). Use one per machine; the
-contract does not allow mixing them.
+These go at the top level of `hmis`, or per analyzer and in `im.hmis`, as for the other lanes (see [HMIS: single or both](#hmis-single-or-both)). Any analyzer, whatever its protocol, follows them, so a newly added machine needs no extra wiring.
 
-- `"oauth"`: the partner API. One `clientId`/`clientSecret` for the whole
-  connector, results to `{apiPrefix}/lab/equipment/results`, as described above.
-- `"equipment"`: the Mirth-compatibility API. Each machine has its own
-  `X-Equipment-ID` / `X-Equipment-Secret` pair, issued once under Analyser
-  Interface → rotate key and written in that analyzer's `"tatva": {
-  "equipmentId", "equipmentSecret" }` block. Results go to
-  `/diagnostic-service/mirth/labresult` with the tube barcode as `sampleId`,
-  so no lookup is needed. A `status: "success"` reply is not taken on trust:
-  `filed` is compared with the number of values sent, and any code the message
-  names as `unmapped` or `Outside the reportable range` stays pending. Start-up
-  is refused if a machine on the HINAI lane has no credential.
+The old `hmis.tatva.enabled` switch is **removed**. A config that still has it is refused at start, with a message pointing to `use` and `both`. The env var `TATVA_ENABLED` is removed too; `TATVA_ORDERS` is new. `hmis.tatva.baseUrl` has **no default** any more. It is required only when some analyzer's lanes include `tatva`.
 
-Both modes send each value's unit and abnormal flag (`sendUnitAndFlag`). They
-can also send the optional `X-Facility-ID` / `X-Organization-ID` headers and
-present a client certificate (`tls.certFile` / `keyFile`) if mTLS is switched
-on. Every setting can be overridden from the environment with `TATVA_*`
-variables, listed in `.env.example`. Per-machine credentials use
-`TATVA_EQUIPMENT_ID_<ID>` / `TATVA_EQUIPMENT_SECRET_<ID>`.
+### Where the orders come from: `hmis.tatva.orders`
+
+Tatva takes results only: the lane posts results to Tatva. `orders` sets where its orders come from.
+
+- **`"hinai"`** (default). The lane reads its orders from HINAI's `/mirth/pending`, because the two systems share a synced database, and posts results to Tatva. Works with auth `"oauth"` or `"equipment"`.
+- **`"tatva"`**. The lane reads Tatva's own worklist (`{apiPrefix}/lab/equipment/worklist`), mapped like GenX, with `serviceTests`, `equipmentServices`, `pendingLineStatuses`, `batchDays` (default 1) and `batchPageSize` (default 100). Requires auth `"oauth"`.
+
+In a both-mode pair the hold rule still applies (see [HMIS: single or both](#hmis-single-or-both)): a tube is filed to either lane only once the order is in both lanes of the pair.
+
+### Acknowledge: `hmis.tatva.acknowledge`
+
+`"orders"` (default), `"tatva"` or `"off"`.
+
+- With orders `"hinai"`, `"orders"` acknowledges in HINAI. In both mode with HINAI as the other lane it is **skipped**, because the HINAI lane already acknowledges.
+- With orders `"tatva"`, the acknowledge goes to Tatva. `"off"` sends no acknowledge in either case.
+
+### Two ways to authenticate
+
+`hmis.tatva.auth`. Use one per machine; the contract does not allow mixing them.
+
+- `"oauth"`: the partner API. One `clientId`/`clientSecret` for the whole connector, results to `{apiPrefix}/lab/equipment/results`. This is the only auth that works with `orders: "tatva"`.
+- `"equipment"`: the Mirth-compatibility API. Each machine has its own `X-Equipment-ID` / `X-Equipment-Secret` pair, issued once under Analyser Interface → rotate key and written in that analyzer's `"tatva": {
+  "equipmentId", "equipmentSecret" }` block. Results go to `/diagnostic-service/mirth/labresult` with the tube barcode as `sampleId`, so no lookup is needed. A `status: "success"` reply is not taken on trust: `filed` is compared with the number of values sent, and any code the message names as `unmapped` or `Outside the reportable range` stays pending. Start-up is refused if a machine that uses Tatva has no credential.
+
+### Barcodes and retries
+
+The tube barcode is taken as the new system's `sampleNumber`. Its `accessionNumber` is looked up once on the worklist (`?barcode=`), which needs `lab.equipment.worklist.read`, and cached in `spool/tatva-accessions.json`. Set `"barcodeField": "accessionNumber"` to send the barcode as-is with no lookup. A value that Tatva v1 lists as `unmatched` or `outOfRange` stays pending and is retried, just like GenX.
+
+Both auth modes send each value's unit and abnormal flag (`sendUnitAndFlag`). They can also send the optional `X-Facility-ID` / `X-Organization-ID` headers and present a client certificate (`tls.certFile` / `keyFile`) if mTLS is switched on. Every setting can be overridden from the environment with `TATVA_*` variables, listed in `.env.example`. Per-machine credentials use `TATVA_EQUIPMENT_ID_<ID>` / `TATVA_EQUIPMENT_SECRET_<ID>`.
+
+### Logs and rollback
+
+Every Tatva call is logged in `logs/hmis-tatva-YYYY-MM-DD.log` (`hmis.tatva.auditLog`). To take Tatva out, change the analyzer's lanes back (for example `"use": "hinai"`) and restart. Results return to `/mirth/labresult` and nothing else changes.
 
 Run `npm run tatva` for the stub-server test.
+
 
 ## Result filing: queue or staged
 

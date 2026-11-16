@@ -186,6 +186,7 @@ type Inner = {
   orders: { get(b: string): { rows: Array<{ identifier: string; labResultId: number | null; source?: Lane }> } | null };
   onMessage(msg: unknown, opts?: unknown): Promise<void>;
   answerQuery(q: HostQuery): Promise<void>;
+  pollOrders(): Promise<void>;
   link: { sendOrders(o: unknown[]): Promise<void> };
 };
 function runtime(spool: string, mode: Mode, H: FakeLane, G: FakeLane, extra: Record<string, unknown> = {}, port?: number) {
@@ -438,7 +439,7 @@ await check('B1 console: a sample complete before the switch shows nothing waiti
 // =============================================================================
 console.log('\n— B3: both -> single');
 
-await check('B3 a sample held for a missing GenX lane files after a restart in single hinai', async () => {
+await check('B3 a sample waiting for a missing GenX lane is complete after a restart in single hinai, not re-posted', async () => {
   const spool = newSpool('b3');
   const H = new FakeLane('hinai');
   const G = new FakeLane('genx');
@@ -446,11 +447,11 @@ await check('B3 a sample held for a missing GenX lane files after a restart in s
   const a = runtime(spool, 'both', H, G).inner;
   stage(a, 'S3', { TSH3: '3.3' });
   await pass(a);
-  assert.match(a.staged.get('S3')!.lastError ?? '', /only in HINAI/);
-  assert.equal(H.posted.length, 0);
+  assert.match(a.staged.get('S3')!.lastError ?? '', /GenX has no order/);
+  assert.deepEqual(H.postedFor('S3').map((r) => `${r.identifier}@${r.labResultId}`), ['TSH3@3001'], 'filed to HINAI at once');
   const b = runtime(spool, 'hinai', H, G).inner;
   await pass(b);
-  assert.deepEqual(H.postedFor('S3').map((r) => `${r.identifier}@${r.labResultId}`), ['TSH3@3001']);
+  assert.equal(H.postedFor('S3').length, 1, 'not re-posted after the switch');
   assert.ok(complete(b.staged.get('S3')));
 });
 
@@ -524,7 +525,7 @@ await check('B2 TSH3 only in HINAI rows: files to HINAI, waits for GenX; File no
 // =============================================================================
 console.log('\n— lookup failure vs hold; File now in neither lane');
 
-await check('a lane whose lookup fails while it has no rows: error, retried, not held', async () => {
+await check('a lane whose lookup fails while it has no rows: the other lane still files; the failing one is retried', async () => {
   const spool = newSpool('lookup-fail');
   const H = new FakeLane('hinai');
   const G = new FakeLane('genx');
@@ -538,26 +539,27 @@ await check('a lane whose lookup fails while it has no rows: error, retried, not
   assert.match(s.lastError ?? '', /503/, 'the lookup error is recorded');
   const sum = (rt.stagedSummaries() ?? []).find((x) => x.barcode === 'T5') as unknown as { held?: unknown };
   assert.ok(!sum.held, 'no held block in the summary');
-  assert.equal(H.posted.length + G.posted.length, 0, 'nothing posted while GenX cannot be asked');
+  assert.equal(H.postedFor('T5').length, 1, 'HINAI filed although GenX cannot be asked');
+  assert.equal(G.posted.length, 0);
   G.failLookup = false;
   G.add('T5', 'TSH3', 9101);
   await pass(inner);
-  assert.equal(H.postedFor('T5').length, 1);
+  assert.equal(H.postedFor('T5').length, 1, 'HINAI not re-posted');
   assert.equal(G.postedFor('T5').length, 1);
   assert.ok(complete(inner.staged.get('T5')));
 });
 
-await check('File now with the tube in neither lane: stays held, nothing posted, nothing skipped', async () => {
+await check('File now with the tube in neither lane: stays waiting, nothing posted, nothing skipped', async () => {
   const spool = newSpool('neither');
   const H = new FakeLane('hinai');
   const G = new FakeLane('genx');
   const { rt, inner } = runtime(spool, 'both', H, G);
   stage(inner, 'T5N', { TSH3: '1.1' });
   await pass(inner);
-  assert.match(inner.staged.get('T5N')!.lastError ?? '', /neither/);
+  assert.match(inner.staged.get('T5N')!.lastError ?? '', /no order row yet in/);
   await rt.stagedFileNow('T5N');
   const s = inner.staged.get('T5N')!;
-  assert.match(s.lastError ?? '', /neither/);
+  assert.match(s.lastError ?? '', /no order row yet in/);
   assert.equal(H.posted.length + G.posted.length, 0);
   assert.equal(s.values.TSH3!.lanes, undefined, 'no lane marked');
   assert.ok(!complete(s));
@@ -591,7 +593,7 @@ await check('certified GenX lines are not certified again after a restart; a fai
   assert.equal(G.posted.length, 2, 'nothing re-posted while retrying the certify');
 });
 
-await check('a held sample is still held after a restart; an operator skip stays skipped', async () => {
+await check('a one-lane tube files at once and is not re-posted after a restart; an operator skip stays skipped', async () => {
   const spool = newSpool('held-restart');
   const H = new FakeLane('hinai');
   const G = new FakeLane('genx');
@@ -601,14 +603,16 @@ await check('a held sample is still held after a restart; an operator skip stays
   stage(a.inner, 'H6', { TSH3: '1.0' });
   stage(a.inner, 'K6', { B12: '200' });
   await pass(a.inner);
+  assert.equal(H.postedFor('H6').length, 1, 'H6 filed to HINAI at once — no cross-lane hold');
+  assert.equal(G.postedFor('K6').length, 1, 'K6 filed to GenX at once');
   await a.rt.stagedFileNow('K6');
   assert.equal(a.inner.staged.get('K6')!.values.B12!.lanes?.hinai?.skipped, 'operator');
   const b = runtime(spool, 'both', H, G).inner;
   H.add('K6', 'B12', 6901); // HINAI now lists the skipped tube
   await pass(b);
   await pass(b);
-  assert.match(b.staged.get('H6')!.lastError ?? '', /only in HINAI/, 'still held');
-  assert.equal(H.postedFor('H6').length, 0);
+  assert.match(b.staged.get('H6')!.lastError ?? '', /GenX has no order/, 'still waiting for GenX');
+  assert.equal(H.postedFor('H6').length, 1, 'H6 not re-posted after the restart');
   assert.equal(H.postedFor('K6').length, 0, 'the operator skip in HINAI is not undone by a restart');
   assert.ok(complete(b.staged.get('K6')));
 });
@@ -686,7 +690,7 @@ await check('a QC sample in both mode is posted to neither lane', async () => {
   assert.equal(G.postedFor('PT1001').length, 1, 'and to GenX');
 });
 
-await check('U-WAM pairing + both mode: pairing hold first, then the lane hold, then files to both', async () => {
+await check('U-WAM pairing + both mode: pairing hold first, then HINAI files, then GenX when it lists the tube', async () => {
   const spool = newSpool('pairing');
   const H = new FakeLane('hinai');
   const G = new FakeLane('genx');
@@ -701,8 +705,8 @@ await check('U-WAM pairing + both mode: pairing hold first, then the lane hold, 
   assert.equal(H.posted.length + G.posted.length, 0);
   stage(inner, 'U10', { RBC: '2' }, 'UF-4000');
   await pass(inner);
-  assert.match(inner.staged.get('U10')!.lastError ?? '', /only in HINAI/, 'then the lane hold');
-  assert.equal(H.posted.length + G.posted.length, 0);
+  assert.deepEqual(sorted(H.postedFor('U10').map((r) => r.identifier)), ['GLU', 'RBC'], 'both halves in: HINAI files the whole panel at once');
+  assert.equal(G.posted.length, 0, 'GenX has no order yet');
   G.add('U10', 'GLU', 2001);
   G.add('U10', 'RBC', 2001);
   await pass(inner);
@@ -735,6 +739,52 @@ await check('ASTM host query in both mode: one reply carrying the union', async 
   const reply = sent[0]![0] as { testCodes: string[] } | undefined;
   assert.ok(reply, 'with an order, not the empty download');
   assert.ok(['CREA', 'GLU'].every((c) => reply.testCodes.includes(c)), `HINAI's codes are in it (${JSON.stringify(reply.testCodes)})`);
+});
+
+await check('one run per assay: same tube in HINAI and GenX, two spellings of one assay -> the analyzer is asked once', async () => {
+  const H = new FakeLane('hinai');
+  const G = new FakeLane('genx');
+  // HINAI names the assay by its eqIdntifier "FO2Hb"; GenX by the machine code "O2Hb".
+  H.add('Q12', 'FO2Hb', 1);
+  H.add('Q12', 'GLU', 2);
+  G.add('Q12', 'O2Hb', 3);
+  G.add('Q12', 'GLU', 4);
+  const extra = { testCodeAliases: { O2Hb: 'FO2Hb' }, orderPoll: { enabled: true, download: true, intervalMs: 60000, lookbackDays: 0 } };
+  // Host query: one reply, each assay once.
+  {
+    const { inner } = runtime(newSpool('one-run-query'), 'both', H, G, extra);
+    const sent: unknown[][] = [];
+    inner.link.sendOrders = async (o) => {
+      sent.push(o);
+    };
+    await inner.answerQuery({ sampleId: 'Q12', testCodes: [], specimenIdField: 'Q12' } as HostQuery);
+    assert.equal(sent.length, 1, 'one reply');
+    assert.deepEqual(sorted((sent[0]![0] as { testCodes: string[] }).testCodes), ['FO2Hb', 'GLU'], 'O2Hb/FO2Hb sent once, GLU once');
+  }
+  // Order poll: HINAI first; GenX lists the same tube on a later poll — nothing new goes down.
+  {
+    const H2 = new FakeLane('hinai');
+    const G2 = new FakeLane('genx');
+    H2.add('P13', 'FO2Hb', 11);
+    H2.add('P13', 'GLU', 12);
+    const { inner } = runtime(newSpool('one-run-poll'), 'both', H2, G2, extra);
+    const pushes: string[][] = [];
+    inner.link.sendOrders = async (o) => {
+      for (const x of o as Array<{ testCodes: string[] }>) pushes.push(x.testCodes);
+    };
+    Object.defineProperty((inner as unknown as { transport: object }).transport, 'connected', { get: () => true });
+    await inner.pollOrders();
+    assert.deepEqual(pushes.map((p) => sorted(p)), [['FO2Hb', 'GLU']], 'first poll: HINAI order programmed');
+    G2.add('P13', 'O2Hb', 21);
+    G2.add('P13', 'GLU', 22);
+    await inner.pollOrders();
+    await inner.pollOrders();
+    assert.equal(pushes.length, 1, `GenX listing the same tube programs nothing again (${JSON.stringify(pushes)})`);
+    // A genuinely new assay from GenX still goes down — alone.
+    G2.add('P13', 'CREA', 23);
+    await inner.pollOrders();
+    assert.deepEqual(pushes.slice(1), [['CREA']], 'only the new assay is sent');
+  }
 });
 
 await check('genxAutoCertify off in both mode: no certify call ever', async () => {

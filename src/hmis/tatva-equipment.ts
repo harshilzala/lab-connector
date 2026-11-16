@@ -1,7 +1,7 @@
 import type { Logger } from '../logger.js';
 import type { HmisResultUploadResponse, LisInboundResultRow, MirthAcknowledgeItem } from '../types.js';
 import type { HmisAudit, HmisAuditOutcome } from './audit.js';
-import { HmisUnavailableError } from './client.js';
+import { HmisRefusedError, HmisUnavailableError } from './client.js';
 import { httpSend, type ClientTls } from './http.js';
 import type { ResultSink } from './tatva.js';
 
@@ -79,14 +79,15 @@ export class TatvaEquipmentClient implements ResultSink {
       const body = (answer.json ?? {}) as { status?: unknown; message?: unknown; filed?: unknown };
       const status = String(body.status ?? '').toLowerCase();
       const message = String(body.message ?? '');
+      const unmatched = refusedCodes(message, rows);
+      const refusedAll = unmatched.length ? unmatched : rows.map((r) => codeKey(r.identifier));
       if (status !== 'success') {
-        throw new NothingFiled(`Tatva v1 ${path} rejected the upload: ${message || 'status=' + status}`);
+        throw new NothingFiled(`Tatva v1 ${path} rejected the upload: ${message || 'status=' + status}`, refusedAll);
       }
 
-      const unmatched = refusedCodes(message, rows);
       const filed = Number.isFinite(Number(body.filed)) ? Number(body.filed) : rows.length - unmatched.length;
       if (!(filed > 0)) {
-        throw new NothingFiled(`Tatva v1 ${path} filed 0 of ${rows.length} value(s): ${message}`);
+        throw new NothingFiled(`Tatva v1 ${path} filed 0 of ${rows.length} value(s): ${message}`, refusedAll);
       }
       if (rows.length - filed > unmatched.length) {
         this.opts.logger.warn(
@@ -210,7 +211,8 @@ export class TatvaEquipmentClient implements ResultSink {
   }
 }
 
-class NothingFiled extends Error {}
+/** Filed nothing: a verdict on the values sent, not an outage. */
+class NothingFiled extends HmisRefusedError {}
 
 function codeKey(v: string): string {
   return v.trim().toUpperCase();
