@@ -74,6 +74,11 @@ const DOWNLOAD_BACKOFF_MAX_MS = 30 * 60_000; // ceiling on the doubling
  *  fills both logs. */
 const REFUSED_RETRY_MS = 10 * 60_000;
 
+/** Both mode, host query: how long the analyzer's reply waits for the second
+ *  lane (GenX UAT answers in 0.5–15 s). HINAI, the first lane, is always
+ *  waited for in full. */
+const HOST_QUERY_OTHER_LANE_MS = 5_000;
+
 /** How long the console's "tubes waiting" figure is reused before the order
  *  store is read again. */
 const WAITING_COUNT_TTL_MS = 15_000;
@@ -2130,7 +2135,8 @@ export class AnalyzerRuntime {
     try {
       // One row per pending test — collapse the rows for this barcode into a
       // single order, keeping each row so it can be acknowledged afterwards.
-      const pending = await this.fetchPending(lookup);
+      // The analyzer is waiting on the line: GenX gets HOST_QUERY_OTHER_LANE_MS.
+      const pending = await this.fetchPending(lookup, false, this.lanes, HOST_QUERY_OTHER_LANE_MS);
 
       // Remember the rows: the result comes back in a LATER message and needs
       // their labResultId to be filable.
@@ -2213,46 +2219,75 @@ export class AnalyzerRuntime {
    *  Re-send ask both systems in both mode). With more than one lane, a lane
    *  that fails is logged and the others still answer; it throws only when
    *  every lane failed. */
-  private async fetchPending(lookup: string, includeTransmitted = false, lanes: readonly Lane[] = this.lanes): Promise<PendingOrders> {
-    const parts: PendingOrders[] = [];
+  private async fetchPending(
+    lookup: string,
+    includeTransmitted = false,
+    lanes: readonly Lane[] = this.lanes,
+    /** Host query: lanes after the FIRST are waited for no longer than this,
+     *  so a slow GenX never makes the analyzer's reply late. The first lane
+     *  (HINAI) always gets its full gateway timeout. */
+    otherLaneDeadlineMs?: number,
+  ): Promise<PendingOrders> {
     let failure: unknown = null;
-    let answered = 0;
-    for (const lane of lanes) {
+    // One lane's rows, every equipment code of this machine.
+    const askLane = async (lane: Lane): Promise<PendingOrders[]> => {
       const gw = this.gateway(lane);
-      try {
-        for (const eqCode of this.equipmentCodes()) {
-          const body = await gw.getPending({
+      const out: PendingOrders[] = [];
+      for (const eqCode of this.equipmentCodes()) {
+        const body = await gw.getPending({
+          sampleId: lookup,
+          eqCode,
+          siteId: this.cfg.siteId,
+          showCulture: this.cfg.showCulture,
+          // Off by default: an order raised yesterday for a tube run today would
+          // otherwise not be found.
+          date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
+        });
+        out.push(
+          normalizePending(body, {
             sampleId: lookup,
             eqCode,
-            siteId: this.cfg.siteId,
-            showCulture: this.cfg.showCulture,
-            // Off by default: an order raised yesterday for a tube run today would
-            // otherwise not be found.
-            date: this.cfg.sendDate ? formatApiDate(new Date()) : undefined,
-          });
-          parts.push(
-            normalizePending(body, {
-              sampleId: lookup,
-              eqCode,
-              equipmentId: this.cfg.equipmentId ?? null,
-              ipAddress: this.ackIpAddress,
-              portNo: this.ackPortNo,
-              includeTransmitted,
-              source: lane,
-            }),
-          );
-        }
-        answered++;
-      } catch (err) {
-        if (lanes.length === 1) throw err;
-        failure = err;
-        this.log.warn(
-          { barcode: lookup, lane, err: err instanceof Error ? err.message : String(err) },
-          'HMIS lookup failed in this lane — answering from the other',
+            equipmentId: this.cfg.equipmentId ?? null,
+            ipAddress: this.ackIpAddress,
+            portNo: this.ackPortNo,
+            includeTransmitted,
+            source: lane,
+          }),
         );
       }
-    }
-    if (answered === 0 && failure) throw failure;
+      return out;
+    };
+    // Both lanes are asked AT THE SAME TIME (not one after the other).
+    const settled = await Promise.all(
+      lanes.map(async (lane, i) => {
+        const work = askLane(lane);
+        if (lanes.length === 1) return { lane, parts: await work };
+        const deadline = i > 0 && otherLaneDeadlineMs ? otherLaneDeadlineMs : 0;
+        try {
+          if (!deadline) return { lane, parts: await work };
+          let timer: NodeJS.Timeout | undefined;
+          const late = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`no answer within ${deadline} ms — the analyzer is answered without it`)), deadline);
+          });
+          work.catch(() => {}); // a late failure after the deadline is not unhandled
+          try {
+            return { lane, parts: await Promise.race([work, late]) };
+          } finally {
+            clearTimeout(timer);
+          }
+        } catch (err) {
+          failure = err;
+          this.log.warn(
+            { barcode: lookup, lane, err: err instanceof Error ? err.message : String(err) },
+            'HMIS lookup failed in this lane — answering from the other',
+          );
+          return { lane, parts: null };
+        }
+      }),
+    );
+    const answeredLanes = settled.filter((s) => s.parts !== null);
+    if (answeredLanes.length === 0 && failure) throw failure;
+    const parts = answeredLanes.flatMap((s) => s.parts!);
     // Same door as the poll: a row for a parameter this interface does not carry
     // is not stored, not waited for and not acknowledged, whichever path fetched
     // it. Filtering in both places is what keeps a host-query answer and a poll

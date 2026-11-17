@@ -38,6 +38,46 @@ import { httpSend } from './http.js';
 // order store, the staged filer and every analyzer are unchanged.
 // =============================================================================
 
+// ---- GenX request pacing ----------------------------------------------------
+// GenX allows 240 calls a minute per client ("IG-RATE-001 Rate limit exceeded:
+// 240/min"). Every analyzer's GenX lane shares ONE client id, so the pacing is
+// shared too (module level, per GenX host):
+//   * a budget of GENX_BUDGET_PER_MIN calls in any 60 s window, below the cap;
+//   * after an HTTP 429, every GenX call pauses for GENX_429_PAUSE_MS.
+// A call that is over budget or inside a pause is NOT sent and fails at once
+// as "unavailable", like a GenX outage: the other lane (HINAI) answers a host
+// query without waiting, and the filing pass / order poll retries it next time.
+export const GENX_BUDGET_PER_MIN = 200;
+export const GENX_429_PAUSE_MS = 30_000;
+
+class Pacer {
+  private stamps: number[] = [];
+  private pausedUntil = 0;
+  /** Why a call may not go now, or null. */
+  check(now: number): string | null {
+    if (now < this.pausedUntil) return `GenX rate limit — paused ${Math.ceil((this.pausedUntil - now) / 1000)} s more after HTTP 429`;
+    while (this.stamps.length && now - this.stamps[0]! >= 60_000) this.stamps.shift();
+    if (this.stamps.length >= GENX_BUDGET_PER_MIN) return `GenX request budget (${GENX_BUDGET_PER_MIN}/min) used — tried again on the next pass`;
+    return null;
+  }
+  sent(now: number): void {
+    this.stamps.push(now);
+  }
+  /** Record a 429; true when this starts a NEW pause (log once). */
+  limited(now: number): boolean {
+    const fresh = now >= this.pausedUntil;
+    this.pausedUntil = now + GENX_429_PAUSE_MS;
+    return fresh;
+  }
+}
+const pacers = new Map<string, Pacer>();
+function pacerFor(base: string): Pacer {
+  const k = base.replace(/\/$/, '').toLowerCase();
+  let p = pacers.get(k);
+  if (!p) pacers.set(k, (p = new Pacer()));
+  return p;
+}
+
 export interface GenxLimsOptions {
   baseUrl: string;
   /** Host of auth-node for auth "login"/"oauth"; empty = baseUrl. */
@@ -344,6 +384,11 @@ export class GenxLimsClient implements HmisGateway {
     return key(f === 'barcode' ? (t.barcode ?? t.sampleNumber) : t[f]);
   }
 
+  /** For tests: forget the shared rate-limit state. */
+  static resetPacing(): void {
+    pacers.clear();
+  }
+
   /** Authenticated call; returns `data` of the { success, message, data } envelope. */
   private async call(method: 'GET' | 'POST', path: string, body: unknown, idempotencyKey?: string, retried = false): Promise<unknown> {
     const token = await this.accessToken();
@@ -427,8 +472,19 @@ export class GenxLimsClient implements HmisGateway {
 
   private async send(base: string, method: 'GET' | 'POST', path: string, headers: Record<string, string>, body?: string): Promise<{ status: number; text: string }> {
     const url = base.replace(/\/$/, '') + path;
+    const pace = pacerFor(base);
+    const blocked = pace.check(Date.now());
+    if (blocked) throw new HmisUnavailableError(`GenX ${method} ${path} -> not sent: ${blocked}`);
+    pace.sent(Date.now());
     try {
-      return await httpSend(url, { method, headers, body, timeoutMs: this.opts.timeoutMs, tls: null });
+      const res = await httpSend(url, { method, headers, body, timeoutMs: this.opts.timeoutMs, tls: null });
+      if (res.status === 429 && pace.limited(Date.now())) {
+        this.opts.logger.warn(
+          { pauseMs: GENX_429_PAUSE_MS, budgetPerMin: GENX_BUDGET_PER_MIN, answer: res.text.slice(0, 200) },
+          'GenX rate limit hit (HTTP 429) — every GenX call from every machine pauses 30 s; HINAI is not affected',
+        );
+      }
+      return res;
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') throw new HmisUnavailableError(`GenX ${method} ${path} -> timed out after ${this.opts.timeoutMs}ms`);
       if (err instanceof TypeError) throw new HmisUnavailableError(`GenX ${method} ${path} -> ${(err.cause as Error | undefined)?.message ?? err.message}`);

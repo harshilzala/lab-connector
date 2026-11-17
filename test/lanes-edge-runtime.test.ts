@@ -97,6 +97,8 @@ class FakeLane {
   /** Every line id a certify was attempted for, successful or not. */
   certifyIds: number[] = [];
   failLookup = false;
+  /** Every lookup answers this late (a slow GenX UAT). */
+  delayMs = 0;
   failPost = false;
   failAck = false;
   failCertify = 0;
@@ -117,6 +119,7 @@ class FakeLane {
       siteId: null,
       defaultSiteIds: [undefined],
       async getPending(q: { sampleId?: string }) {
+        if (self.delayMs) await new Promise((r) => setTimeout(r, self.delayMs));
         if (self.failLookup) throw new HmisUnavailableError(`${self.lane} lookup -> HTTP 503`);
         if (q.sampleId) self.lookups.push(q.sampleId);
         const rows = q.sampleId ? self.rows.filter((r) => (r.SampleID ?? r.sampleID) === q.sampleId) : self.rows;
@@ -206,6 +209,9 @@ const upload = (barcode: string, values: Record<string, string>, instrument: str
 });
 const stage = (inner: Inner, barcode: string, values: Record<string, string>, instrument: string | null = null) => inner.staged.upsert(upload(barcode, values, instrument));
 const pass = (inner: Inner) => inner.filer.run('timer');
+const idle = async (inner: Inner) => {
+  for (let i = 0; i < 500 && inner.filer.running; i++) await new Promise((r) => setTimeout(r, 10));
+};
 const complete = (s: Sample | null) => !!s && Object.values(s.values).every((v) => v.filedAt);
 const newSpool = (name: string) => {
   const d = join(root, name);
@@ -543,6 +549,8 @@ await check('a lane whose lookup fails while it has no rows: the other lane stil
   assert.equal(G.posted.length, 0);
   G.failLookup = false;
   G.add('T5', 'TSH3', 9101);
+  await inner.pollOrders(); // GenX's batch order poll brings the late order into the cache
+  await idle(inner); // the poll starts its own filing pass — let it finish
   await pass(inner);
   assert.equal(H.postedFor('T5').length, 1, 'HINAI not re-posted');
   assert.equal(G.postedFor('T5').length, 1);
@@ -709,6 +717,8 @@ await check('U-WAM pairing + both mode: pairing hold first, then HINAI files, th
   assert.equal(G.posted.length, 0, 'GenX has no order yet');
   G.add('U10', 'GLU', 2001);
   G.add('U10', 'RBC', 2001);
+  await inner.pollOrders(); // GenX's batch order poll brings the late order into the cache
+  await idle(inner); // the poll starts its own filing pass — let it finish
   await pass(inner);
   assert.deepEqual(sorted(H.postedFor('U10').map((r) => r.identifier)), ['GLU', 'RBC']);
   assert.deepEqual(sorted(G.postedFor('U10').map((r) => r.identifier)), ['GLU', 'RBC']);
@@ -739,6 +749,31 @@ await check('ASTM host query in both mode: one reply carrying the union', async 
   const reply = sent[0]![0] as { testCodes: string[] } | undefined;
   assert.ok(reply, 'with an order, not the empty download');
   assert.ok(['CREA', 'GLU'].every((c) => reply.testCodes.includes(c)), `HINAI's codes are in it (${JSON.stringify(reply.testCodes)})`);
+});
+
+await check('host query with a slow GenX (8 s): the analyzer is answered within ~5 s from HINAI', async () => {
+  const H = new FakeLane('hinai');
+  const G = new FakeLane('genx');
+  H.add('Q14', 'GLU', 1);
+  H.add('Q14', 'CREA', 2);
+  G.add('Q14', 'UREA', 3);
+  G.delayMs = 8000;
+  const { inner } = runtime(newSpool('slow-genx-query'), 'both', H, G);
+  const sent: unknown[][] = [];
+  inner.link.sendOrders = async (o) => {
+    sent.push(o);
+  };
+  const t0 = Date.now();
+  await inner.answerQuery({ sampleId: 'Q14', testCodes: [], specimenIdField: 'Q14' } as HostQuery);
+  const took = Date.now() - t0;
+  assert.ok(took < 6500, `answered in ${took} ms`);
+  assert.equal(sent.length, 1, 'one reply');
+  assert.deepEqual(sorted((sent[0]![0] as { testCodes: string[] }).testCodes), ['CREA', 'GLU'], "HINAI's tests, not held up by GenX");
+  // Both lanes fast: asked side by side, the union as before.
+  G.delayMs = 0;
+  sent.length = 0;
+  await inner.answerQuery({ sampleId: 'Q14', testCodes: [], specimenIdField: 'Q14' } as HostQuery);
+  assert.deepEqual(sorted((sent[0]![0] as { testCodes: string[] }).testCodes), ['CREA', 'GLU', 'UREA']);
 });
 
 await check('one run per assay: same tube in HINAI and GenX, two spellings of one assay -> the analyzer is asked once', async () => {

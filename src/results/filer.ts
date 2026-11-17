@@ -111,9 +111,9 @@ export type SampleOutcome = 'filed' | 'partial' | 'waiting' | 'held' | 'error' |
 /** Gateway failures in a row before the pass gives up until the next tick. */
 const MAX_CONSECUTIVE_ERRORS = 3;
 
-/** Both mode: how long after a tube's first result a lane with NO order for
- *  it is still asked per barcode (at recheckMs). After that only that lane's
- *  order poll can bring the order in. */
+/** Both mode: how long after a tube's first result a lane other than the
+ *  first (GenX) with NO order for it is still asked per barcode (at
+ *  recheckMs). After that only that lane's order poll brings the order in. */
 const MISSING_LANE_LOOKUP_MS = 6 * 60 * 60_000;
 
 export class StagedFiler {
@@ -466,7 +466,11 @@ export class StagedFiler {
         return;
       }
       try {
-        rows.set(lane, await lanes.orderRows(lane, barcode, { refresh }));
+        // Not a refresh = the cache only. Without cachedOnly an empty cache
+        // fell through to a live lookup on EVERY pass (every 15 s, for every
+        // waiting sample) — GenX answered that with HTTP 429 (240/min).
+        // Live lookups happen only as `refresh`, at the recheck cadence.
+        rows.set(lane, await lanes.orderRows(lane, barcode, refresh ? { refresh: true } : { refresh: false, cachedOnly: true }));
         if (refresh) {
           refreshed.add(lane);
           checked = true;
@@ -496,10 +500,12 @@ export class StagedFiler {
     //    cross-lane hold most such tubes are simply not ordered there, and
     //    the lane's order poll still brings a late order into the cache
     //    (every poll re-runs this pass). Nothing is filed or skipped by this.
+    //    The FIRST lane (HINAI) keeps its recheck with no age limit: an
+    //    analyzer without a HINAI order poll (Maglumi) relies on it.
     const young = Date.now() - Date.parse(sample.firstReceivedAt) < MISSING_LANE_LOOKUP_MS;
     for (const lane of names) {
       await lookup(lane, false);
-      if (!errors.has(lane) && !deferred.has(lane) && (rows.get(lane) ?? []).length === 0 && may && (young || forced)) await lookup(lane, true);
+      if (!errors.has(lane) && !deferred.has(lane) && (rows.get(lane) ?? []).length === 0 && may && (young || forced || lane === names[0])) await lookup(lane, true);
     }
 
     // 2a. Patient cross-check (C2): the two systems must name the same
